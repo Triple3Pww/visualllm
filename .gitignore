@@ -1,0 +1,17 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.log
+models/
+checkpoints/
+*.wav
+*.mp4
+*.png
+*.jpg
+*.jpeg
+
+# Phase 3 — local MuseTalk (cloned upstream + multi-GB weights + caches)
+local_services/musetalk_server/vendor/
+local_services/musetalk_server/avatar_cache/

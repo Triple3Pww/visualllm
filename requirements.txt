@@ -1,0 +1,24 @@
+# --- Core orchestration ----------------------------------------------------
+# Pipecat is the real-time voice+video agent framework that wires every stage
+# together (VAD, STT, LLM, TTS, avatar) with streaming + barge-in built in.
+#
+# NOTE: Pipecat's import paths move between releases. Pin to whatever version
+# you actually install and verify with:
+#     python -c "import pipecat; print(pipecat.__version__)"
+# The extras below pull in the provider SDKs used by the Phase 1 prototype.
+pipecat-ai[silero,deepgram,azure,cartesia,openai,elevenlabs,simli,webrtc]>=0.0.70
+
+# Local WebRTC transport + dev client (serves the browser client for local dev).
+# The runner mounts pipecat_ai_prebuilt.frontend, so this is the package needed.
+pipecat-ai-prebuilt
+
+# --- Config / utils --------------------------------------------------------
+python-dotenv>=1.0.1
+loguru>=0.7.2
+
+# --- Phase 2/3 local models (install when you reach those phases) ----------
+# Uncomment as needed; these are heavy and GPU-specific.
+# faster-whisper>=1.0.0          # local English/zh STT
+# funasr>=1.1.0                  # streaming Mandarin STT (Paraformer)
+# cosyvoice                       # local zh-TW streaming TTS (install from source)
+# torch --index-url https://download.pytorch.org/whl/cu124   # match your CUDA

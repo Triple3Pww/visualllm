@@ -1,0 +1,9 @@
+# MuseTalk server. Install MuseTalk itself from source + download its weights:
+#   git clone https://github.com/TMElyralab/MuseTalk
+#   pip install -r MuseTalk/requirements.txt
+#   (follow its README to download whisper / VAE / UNet checkpoints)
+fastapi>=0.110
+uvicorn>=0.29
+websockets>=12
+numpy
+torch        # CUDA build matching your driver

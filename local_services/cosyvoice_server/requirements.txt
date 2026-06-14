@@ -1,0 +1,9 @@
+# CosyVoice2 server. Install CosyVoice itself from source first:
+#   git clone https://github.com/FunAudioLLM/CosyVoice
+#   pip install -r CosyVoice/requirements.txt
+#   modelscope download iic/CosyVoice2-0.5B --local_dir pretrained_models/CosyVoice2-0.5B
+fastapi>=0.110
+uvicorn>=0.29
+numpy
+torch        # CUDA build matching your driver
+torchaudio
