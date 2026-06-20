@@ -1,0 +1,36 @@
+# --- Third-party repo + large model weights (clone & download per README) ---
+# CosyVoice is a separate upstream repo (~5 GB incl. the CosyVoice2-0.5B model).
+# Teammates clone it and download the model themselves — see README.
+CosyVoice/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+
+# --- Generated audio outputs (keep the folder, ignore the files) ---
+outputs/*.wav
+outputs/*.mp3
+outputs/*.flac
+!outputs/.gitkeep
+
+# --- Secrets / environment ---
+.env
+*.key
+
+# --- OS / editor cruft ---
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# --- Logs ---
+*.log
