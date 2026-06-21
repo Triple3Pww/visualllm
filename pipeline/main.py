@@ -16,6 +16,7 @@ are isolated to the stage factories and the imports at the top here.
 from __future__ import annotations
 
 import asyncio
+import os
 
 from loguru import logger
 
@@ -24,60 +25,126 @@ from pipecat.pipeline.runner import PipelineRunner
 from pipecat.frames.frames import TTSSpeakFrame
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
-from pipecat.processors.aggregators.llm_response_universal import (
-    LLMContextAggregatorPair,
-    LLMUserAggregatorParams,
-)
-from pipecat.turns.user_mute import AlwaysUserMuteStrategy
+from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
 from pipecat.runner.types import RunnerArguments
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 
 from pipeline.config import config
 from pipeline.metrics import TtfoMeter
 from pipeline.stages import build_avatar, build_llm, build_stt, build_tts, build_vad_params
+from pipeline.stages.emotion_tagger import EmotionTagger
+
+
+def _make_debug_taps():
+    # Lazy: the debug package pulls in FastAPI/uvicorn, only needed when on.
+    from pipeline.debug.taps import make_taps
+
+    return make_taps()
+
+
+def _launch_debug_dashboard() -> None:
+    """Start the dashboard server at process startup (its own daemon thread), so
+    it's reachable before any client connects. Bus config that needs no session is
+    set here; the per-session avatar service ref is attached later in run_bot."""
+    from pipeline.debug import bus
+    from pipeline.debug.server import start_debug_server
+
+    avatar_enabled = not config.audio_only
+    bus.configure(
+        avatar_enabled=avatar_enabled,
+        fps_target=25,  # Ditto's locked native rate
+        ttfo_target_s=config.ttfo_target_s,
+        lang=config.language,
+    )
+    start_debug_server(
+        port=config.debug_port,
+        avatar_url=config.avatar_url,
+        avatar_enabled=avatar_enabled,
+    )
 
 
 async def run_bot(transport: BaseTransport) -> None:
+    # Pipecat's runner removes loguru sinks when main() starts, dropping the file
+    # sink added in __main__ -> logs/pipeline.log would miss all runtime logs. This
+    # runs after the runner has configured logging, so it re-asserts the file sink.
+    from log_setup import ensure_file_sink
+
+    ensure_file_sink("pipeline")
+
     logger.info(
-        f"Providers: stt={config.stt_provider} llm={config.llm_provider} "
-        f"tts={config.tts_provider} avatar={config.avatar_provider} "
-        f"lang={config.language}"
+        f"Pipeline: Deepgram STT -> OpenRouter LLM -> ElevenLabs TTS -> local avatar "
+        f"(lang={config.language})"
     )
 
     stt = build_stt(config)
     llm = build_llm(config)
     tts = build_tts(config)
-    avatar = build_avatar(config)
+    # Audio-only mode skips the server-side talking-head entirely: the client
+    # renders the 3D avatar locally from the audio track (the unit-economics path).
+    avatar = None if config.audio_only else build_avatar(config)
     meter = TtfoMeter(target_s=config.ttfo_target_s)
 
+    # In character mode the EmotionTagger (between LLM and TTS) extracts the LLM's
+    # leading [emotion] tag, pushes it to the client out-of-band (RTVIServerMessageFrame
+    # -> the runner's existing RTVI layer -> onServerMessage) to drive the VRM face,
+    # and strips it so it is never spoken. We do NOT add our own RTVIProcessor — a
+    # second one breaks the prebuilt runner's bot-ready handshake.
+    tagger = EmotionTagger() if config.character_mode else None
+
     context = LLMContext([{"role": "system", "content": config.system_prompt}])
-    # Mute the mic while the bot is speaking so it can't transcribe its own voice
-    # (acoustic echo when running on a loudspeaker). Trade-off: this disables
-    # barge-in -- the user can't interrupt the bot mid-sentence.
-    aggregator = LLMContextAggregatorPair(
-        context,
-        user_params=LLMUserAggregatorParams(
-            user_mute_strategies=[AlwaysUserMuteStrategy()],
-        ),
-    )
+    # Echo-guard: mute the mic while the bot is speaking (half-duplex) so the
+    # avatar's own voice leaking into the mic can't trigger a barge-in that wipes
+    # the in-flight render mid-turn (the self-interruption seen in the logs). Uses
+    # Pipecat's built-in AlwaysUserMuteStrategy. ECHO_GUARD=0 restores barge-in.
+    user_params = None
+    if config.echo_guard:
+        from pipecat.processors.aggregators.llm_response_universal import (
+            LLMUserAggregatorParams,
+        )
+        from pipecat.turns.user_mute import AlwaysUserMuteStrategy
 
-    pipeline = Pipeline(
-        [
-            transport.input(),      # mic in (+ VAD set in transport params)
-            stt,                    # speech -> text
-            aggregator.user(),      # add user turn to context
-            llm,                    # text -> streamed text
-            tts,                    # text -> streamed audio
-            avatar,                 # audio -> lip-synced video+audio
-            meter,                  # measure TTFO
-            transport.output(),     # -> browser
-            aggregator.assistant(), # add bot turn to context
-        ]
-    )
+        user_params = LLMUserAggregatorParams(
+            user_mute_strategies=[AlwaysUserMuteStrategy()]
+        )
+        logger.info("Echo-guard ON: mic muted while the bot speaks (half-duplex).")
+    aggregator = LLMContextAggregatorPair(context, user_params=user_params)
 
-    # VAD-based barge-in is available, but the AlwaysUserMuteStrategy above mutes
-    # the mic while the bot speaks, so interruptions are suppressed during bot
-    # speech (the echo-guard trade-off).
+    # Debug dashboard: one pass-through StageTap is interleaved after each stage so
+    # the dashboard can show per-stage health. Taps forward every frame unchanged
+    # (same contract as TtfoMeter) — when DEBUG_DASHBOARD=0 none are inserted and
+    # the pipeline is byte-for-byte the original.
+    debug_on = config.debug_dashboard
+    taps = _make_debug_taps() if debug_on else {}
+
+    def tap(key):
+        return [taps[key]] if debug_on else []
+
+    stages = [
+        transport.input(), *tap("vad"),   # mic in (+ VAD set in transport params)
+        stt, *tap("stt"),                 # speech -> text
+        aggregator.user(),                # add user turn to context
+        llm, *tap("llm"),                 # text -> streamed text
+    ]
+    if tagger is not None:
+        stages.append(tagger)             # strip + forward the leading [emotion] tag
+    stages += [tts, *tap("tts")]          # text -> streamed audio
+    if avatar is not None:
+        stages += [avatar, *tap("avatar")]  # audio -> lip-synced video+audio (server)
+    stages += [
+        *tap("out"),                      # catch BotStartedSpeaking (TTFO/'out' light)
+        meter,                            # measure TTFO
+        transport.output(),               # -> browser (audio, +video unless audio-only)
+        aggregator.assistant(),           # add bot turn to context
+    ]
+    pipeline = Pipeline(stages)
+
+    if debug_on and avatar is not None:
+        # Server already running (started in __main__); just hand the dashboard a
+        # reference to this session's avatar client so it can read live sync state.
+        from pipeline.debug import bus
+
+        bus.set_avatar_service(avatar)
+
     task = PipelineTask(
         pipeline,
         params=PipelineParams(
@@ -87,24 +154,32 @@ async def run_bot(transport: BaseTransport) -> None:
     )
 
     async def _warmup_llm():
-        # Open the HTTPS connection to the LLM now, so the transpacific TLS
-        # handshake is done before the user's first message (kills cold start).
+        # Open the HTTPS connection to the LLM now, so the TLS handshake is done
+        # before the user's first message (kills cold start). OpenRouter is
+        # OpenAI-compatible, so the chat.completions warmup applies.
+        model = getattr(getattr(llm, "_settings", None), "model", None)
         try:
             await llm._client.chat.completions.create(
-                model=llm._settings.model,
+                model=model,
                 messages=[{"role": "user", "content": "hi"}],
                 max_tokens=1,
                 stream=False,
             )
             logger.info("LLM connection pre-warmed.")
         except Exception as e:  # noqa: BLE001 — best-effort only
-            logger.debug(f"LLM warmup skipped: {e}")
+            logger.info(f"LLM warmup skipped: {e}")
 
     @transport.event_handler("on_client_connected")
     async def _on_connected(transport, client):
         logger.info("Client connected — warming LLM + sending greeting.")
         asyncio.create_task(_warmup_llm())   # warm the LLM in the background
-        greeting = "嗨，我準備好了，請說。" if config.is_mandarin else "Hi, I'm ready — go ahead."
+        if config.is_thai:
+            greeting = "สวัสดีค่ะ เราพร้อมแล้วนะ พูดได้เลยค่ะ" if config.character_mode \
+                else "สวัสดีค่ะ พร้อมแล้วค่ะ พูดได้เลย"
+        elif config.is_mandarin:
+            greeting = "嗨，我準備好了，請說。"
+        else:
+            greeting = "Hi, I'm ready — go ahead."
         # Speak a fixed greeting directly via TTS (no LLM round-trip needed).
         await task.queue_frames([TTSSpeakFrame(greeting)])
 
@@ -120,16 +195,223 @@ async def bot(runner_args: RunnerArguments) -> None:
     """Entrypoint the Pipecat dev runner calls with a configured transport."""
     from pipecat.runner.utils import create_transport
 
+    # Audio-only mode (client renders the 3D face) turns the server video stream
+    # off entirely; the Ditto path keeps the live 512x512 25fps video settings.
+    want_video = not config.audio_only
+
+    # A/V SYNC MODE -- this picks the transport's video clock, and the two modes are
+    # MUTUALLY EXCLUSIVE in pipecat 1.3.0 (verified in base_output.py):
+    #   * sync_with_audio  -> a tagged OutputImageRawFrame is routed through the AUDIO
+    #     queue and only displayed after its preceding audio (per-frame A/V pinning).
+    #     The transport renders it via `_video_images`, which is ONLY read when
+    #     video_out_is_live is FALSE (the non-live `_video_task_handler` branch).
+    #   * video_out_is_live -> frames go through an INDEPENDENT timed video queue on
+    #     their own wall-clock; `_video_images` (and thus every sync_with_audio frame)
+    #     is NEVER read. So with is_live=True the whole sync_with_audio mechanism is a
+    #     no-op -- video plays on a free-running clock and drifts vs the voice.
+    # DittoVideoService tags its turn frames sync_with_audio (DITTO_SYNC_WITH_AUDIO,
+    # default on) for true lip pinning, so the transport MUST be NON-live for that to
+    # work. We couple them off the same env: sync on -> is_live False (real sync);
+    # sync off -> is_live True (legacy free-running clock, animates but drifts). Idle
+    # frames are pushed untagged either way and animate via `_set_video_image`.
+    # BOTH local engines pin video to audio now: MuseTalk emits video_start/video_clock/
+    # video_end markers and its client (musetalk_video.py) buffers the voice + tags frames
+    # sync_with_audio, exactly like Ditto. So sync_av (-> non-live transport) is on whenever
+    # the active engine's sync toggle is on. Off -> is_live=True (legacy free-running desync).
+    sync_av = config.avatar_sync_with_audio
+
     transport_params = {
         "webrtc": lambda: TransportParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
-            video_out_enabled=True,       # required for the avatar video stream
+            video_out_enabled=want_video,  # off in audio-only (client renders the face)
+            # See the A/V SYNC MODE note above: non-live so sync_with_audio actually
+            # pins each frame to its audio. (is_live would silently disable the sync.)
+            video_out_is_live=want_video and not sync_av,
+            # Square portrait; MUST equal the avatar server's DITTO_SIZE and the
+            # service's image_size (config.avatar_size couples all three off DITTO_SIZE,
+            # same discipline as DITTO_FPS below). Smaller = far less WAN bandwidth.
+            video_out_width=config.avatar_size,
+            video_out_height=config.avatar_size,
+            # MUST equal the rate the avatar server PUSHES frames, or playout starves/
+            # piles up and the face drifts behind the audio (the "laggy/desynced" drift,
+            # then a freeze). The server pumps frames at config.avatar_fps (engine-aware:
+            # MuseTalk ~20, Ditto ~12 -- it frame-drops to that rate so a sub-realtime GPU
+            # stays realtime), so this MUST track the same value -- hardcoding 25 while the
+            # avatar runs slower was a mismatch = guaranteed desync. Coupled here (and in
+            # avatar.py) so they can never diverge again.
+            video_out_framerate=max(1, round(config.avatar_fps)),
             vad_analyzer=build_vad_params(),
         ),
     }
     transport = await create_transport(runner_args, transport_params)
     await run_bot(transport)
+
+
+def _configure_webrtc_video_bitrate() -> None:
+    """Bound aiortc's VP8 send bitrate so the video stream FITS a remote/WAN link and
+    can't starve it (the real cause of the "avatar trails the voice" stutter over the
+    Thailand->Taiwan path).
+
+    Why this is needed: pipecat's SmallWebRTCTransport hands raw frames to aiortc's VP8
+    encoder, whose module-level limits are DEFAULT=500k, MIN=250k, MAX=1.5M (aiortc/codecs/
+    vpx.py). It adapts DOWNWARD via REMB feedback, but (a) the 1.5M ceiling can overshoot a
+    jittery consumer link -> packets queue -> the video falls progressively behind, and (b)
+    the 250k floor can't absorb a worse dip -> loss -> freeze. pipecat's video_out_bitrate
+    param is deprecated and wired to nothing, so the only place to set this is the aiortc
+    module globals -- patched BEFORE the first encoder is created (it reads DEFAULT_BITRATE at
+    init and the target_bitrate setter clamps to MIN/MAX). This keeps REMB's downward
+    adaptation while capping the ceiling and lowering the floor (graceful degrade, no freeze).
+
+    Knobs (bits/sec): WEBRTC_VIDEO_BITRATE (start point), _MAX (ceiling), _MIN (floor).
+    Defaults suit a ~320px avatar over a multi-Mbps link; set _MAX=0 to leave aiortc as-is."""
+    try:
+        cap = int(os.getenv("WEBRTC_VIDEO_BITRATE_MAX", "600000") or "600000")
+    except ValueError:
+        cap = 600000
+    if cap <= 0:
+        return
+    try:
+        default = int(os.getenv("WEBRTC_VIDEO_BITRATE", "500000") or "500000")
+        floor = int(os.getenv("WEBRTC_VIDEO_BITRATE_MIN", "120000") or "120000")
+    except ValueError:
+        default, floor = 500000, 120000
+    try:
+        from aiortc.codecs import vpx
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"WebRTC video bitrate config skipped (aiortc import: {e!r}).")
+        return
+    # Order matters: clamp default into the new [floor, cap] band.
+    vpx.MIN_BITRATE = floor
+    vpx.MAX_BITRATE = cap
+    vpx.DEFAULT_BITRATE = max(floor, min(default, cap))
+    logger.info(
+        f"WebRTC VP8 bitrate bounded: min={floor} default={vpx.DEFAULT_BITRATE} max={cap} "
+        f"(WEBRTC_VIDEO_BITRATE_MAX=0 to disable)."
+    )
+
+
+def _install_client_jitter_buffer() -> None:
+    """Inject a receive-side WebRTC jitter buffer into the served /client page so EVERY
+    device that opens it absorbs network jitter (a smoother avatar over a remote/WAN/Tailscale
+    link) with no per-device console tweak.
+
+    Why this exists: over a remote link the lag is the NETWORK (jitter), not the render. The
+    standard fix is a bigger receive-side jitter buffer -- it holds a few hundred ms so late
+    packets still arrive in time (smoother, at the cost of that much added latency). The browser
+    has one but its default target is small; this raises it.
+
+    How: pure HTML injection -- the prebuilt bundle is untouched. A synchronous <script> in
+    <head> runs before the deferred ES-module bundle, so it patches window.RTCPeerConnection
+    first; every media receiver created then gets jitterBufferTarget (Chromium) / playoutDelayHint
+    (legacy) set. Configurable via CLIENT_JITTER_BUFFER_MS (default 400; 0 disables)."""
+    try:
+        ms = int(os.getenv("CLIENT_JITTER_BUFFER_MS", "400") or "400")
+    except ValueError:
+        ms = 400
+    if ms <= 0:
+        return
+    try:
+        from pathlib import Path as _Path
+
+        import pipecat_ai_prebuilt
+        from fastapi.responses import HTMLResponse
+
+        from pipecat.runner.run import app
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Client jitter-buffer inject skipped (import: {e!r}).")
+        return
+    index_path = _Path(pipecat_ai_prebuilt.__file__).parent / "client" / "dist" / "index.html"
+    if not index_path.is_file():
+        logger.warning(f"Client jitter-buffer inject skipped (no index.html at {index_path}).")
+        return
+    # Minified inline patch: wrap RTCPeerConnection so each receiver requests a `ms` buffer.
+    patch = (
+        "<script>(()=>{const T=" + str(ms) + ";const N=window.RTCPeerConnection;"
+        "if(!N||N.__jb)return;const P=function(...a){const pc=new N(...a);"
+        "pc.addEventListener('track',e=>{try{const r=e.receiver;"
+        "if('jitterBufferTarget' in r)r.jitterBufferTarget=T;"
+        "else if('playoutDelayHint' in r)r.playoutDelayHint=T/1000;}catch(_){}});"
+        "return pc;};P.prototype=N.prototype;P.__jb=1;window.RTCPeerConnection=P;"
+        "console.log('[jitter-buffer] receiver target '+T+'ms');})();</script>"
+    )
+
+    @app.middleware("http")
+    async def _inject_jitter_buffer(request, call_next):
+        # Only the index page (exact /client or /client/); assets pass through to the mount.
+        if request.method == "GET" and request.url.path in ("/client", "/client/"):
+            try:
+                html = index_path.read_text(encoding="utf-8").replace("<head>", "<head>" + patch, 1)
+                return HTMLResponse(html)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"Jitter-buffer inject failed; serving default page: {e!r}")
+        return await call_next(request)
+
+    logger.info(f"Client jitter buffer ENABLED: {ms}ms (CLIENT_JITTER_BUFFER_MS=0 to disable).")
+
+
+def _restrict_ice_to_subnet() -> None:
+    """Restrict WebRTC host candidates to ONE network (default: the Tailscale CGNAT range
+    100.64.0.0/10), so ICE only ever offers the interface that can actually reach a remote
+    tailnet viewer.
+
+    Why this is needed (root cause of the intermittent mic, 2026-06-21): this box has
+    several adapters -- Tailscale (100.x), Hyper-V (172.x), Radmin/Hamachi (26.x), LAN
+    (192.168.x) -- and aiortc/aioice gather a host candidate for EVERY one. ICE then checks
+    a large matrix of pairs, but only the Tailscale pair (100.x <-> the remote's 100.x) can
+    actually reach a remote tailnet peer; the rest are dead. Worse, a marginal pair can win
+    nomination and then drop ('Consent to send expired' in the logs) -> the audio track
+    errors ('Media stream error; clearing track' / recv None) -> the mic dies mid-call. That
+    is the "works sometimes, mostly not" symptom. The Tailscale pair is VERIFIED reachable in
+    the logs (State.IN), so pinning ICE to it makes the stable path win immediately -- no
+    relay/TURN needed.
+
+    Patches aioice.ice.get_host_addresses (the host-candidate source) BEFORE the runner
+    builds any peer connection, same module-global approach as the bitrate cap above. Safe by
+    construction: WEBRTC_ICE_SUBNET=0 (or empty) disables it, and if the filter would drop
+    EVERY address (e.g. Tailscale is down) it falls back to the full list so a local/LAN
+    connection still works. A local browser can still reach the 100.x interface, so same-box
+    testing is unaffected."""
+    import ipaddress
+
+    subnet_str = os.getenv("WEBRTC_ICE_SUBNET", "100.64.0.0/10")
+    if not subnet_str or subnet_str == "0":
+        return
+    try:
+        net = ipaddress.ip_network(subnet_str, strict=False)
+    except ValueError:
+        logger.warning(f"WEBRTC_ICE_SUBNET={subnet_str!r} invalid; ICE restriction skipped.")
+        return
+    try:
+        from aioice import ice as _ice
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"ICE interface restriction skipped (aioice import: {e!r}).")
+        return
+
+    _orig = _ice.get_host_addresses
+
+    def _filtered(use_ipv4: bool, use_ipv6: bool):
+        addrs = _orig(use_ipv4, use_ipv6)
+        kept = []
+        for a in addrs:
+            try:
+                if ipaddress.ip_address(a) in net:
+                    kept.append(a)
+            except ValueError:
+                continue  # skip anything not a plain IP (e.g. scoped IPv6)
+        if not kept:
+            logger.warning(
+                f"No host address in {subnet_str} (Tailscale down?); keeping all "
+                f"{len(addrs)} addresses so the connection still works."
+            )
+            return addrs
+        return kept
+
+    _ice.get_host_addresses = _filtered
+    logger.info(
+        f"WebRTC ICE host candidates restricted to {subnet_str} "
+        f"(was {len(_orig(True, False))} v4 addrs; WEBRTC_ICE_SUBNET=0 to disable)."
+    )
 
 
 if __name__ == "__main__":
@@ -143,229 +425,27 @@ if __name__ == "__main__":
         except Exception:  # noqa: BLE001
             pass
 
-    # Serve the prebuilt UI unchanged, but drive its in-conversation status line
-    # to read "Waiting for avatar..." while the avatar warms up (before its video
-    # actually appears — the real ready signal). No popup/overlay: we just retext
-    # the prebuilt's own "Waiting for messages..." status node so the loading
-    # state shows inside the conversation screen, then revert once the face is live.
-    from pathlib import Path
+    # Durable per-process log at logs/pipeline.log (rotated, full tracebacks,
+    # plus uvicorn/asyncio via the stdlib intercept). The dashboard thread and
+    # taps log here too. See log_setup.py.
+    from log_setup import setup_logging
 
-    import pipecat_ai_prebuilt
-    from fastapi.responses import HTMLResponse
+    setup_logging("pipeline")
 
-    from pipecat.runner.run import app, main
+    # Bring the debug dashboard up now (own daemon thread) so it's reachable
+    # before any client connects — open http://localhost:<DEBUG_PORT>/debug.
+    if config.debug_dashboard:
+        _launch_debug_dashboard()
 
-    _dist = Path(pipecat_ai_prebuilt.__file__).resolve().parent / "client" / "dist"
-    _html = (_dist / "index.html").read_text(encoding="utf-8")
-    # Make the prebuilt's relative asset paths absolute under /client/.
-    _html = _html.replace('href="./', 'href="/client/').replace('src="./', 'src="/client/')
-
-    _inject = """
-<style>
-  @keyframes vllmpulse{0%,100%{opacity:1}50%{opacity:.5}}
-  .vllm-loading{animation:vllmpulse 1.1s ease-in-out infinite}
-</style>
-<script>
-(function(){
-  var LOADING='Waiting for avatar...';
-  var WAITING='Waiting for messages...';
-  var done=false;
-
-  function video(){return document.querySelector('video');}
-  // The avatar face is genuinely up only once its video produces frames.
-  function live(){var v=video();return !!v&&v.videoWidth>0&&v.readyState>=2&&!v.paused;}
-
-  // The prebuilt's in-conversation status line (only exists once connected):
-  //   <div class="text-muted-foreground text-sm">Waiting for messages...</div>
-  function statusEl(){
-    var els=document.querySelectorAll('div.text-muted-foreground.text-sm');
-    for(var i=0;i<els.length;i++){var t=(els[i].textContent||'').trim();
-      if(t===LOADING||t===WAITING)return els[i];}
-    // fallback (in case the class changes): any leaf node with exact text.
-    els=document.querySelectorAll('div,span,p');
-    for(var j=0;j<els.length;j++){var n=els[j];
-      if(n.children.length===0){var u=(n.textContent||'').trim();
-        if(u===LOADING||u===WAITING)return n;}}
-    return null;
-  }
-
-  setInterval(function(){
-    var el=statusEl();
-    if(!el){ done=false; return; }       // connect screen / disconnected -> reset
-    if(live()){                          // avatar face is genuinely up
-      if(!done){ done=true; el.classList.remove('vllm-loading');
-        if((el.textContent||'').trim()===LOADING) el.textContent=WAITING; }
-      return;
-    }
-    if(!done){                           // connected, avatar still warming up
-      el.textContent=LOADING;
-      el.classList.add('vllm-loading');
-    }
-  },300);
-})();
-</script>
-
-<!-- Avatar source toggle: flips local MuseTalk <-> cloud Simli, applied on the
-     next connection. Floating pill, phone-friendly. -->
-<style>
-  #vllm-avsw{position:fixed;top:env(safe-area-inset-top,10px);right:10px;z-index:99999;
-    display:flex;align-items:center;gap:6px;background:rgba(20,20,24,.82);
-    color:#fff;font:600 13px/1 system-ui,sans-serif;padding:7px 9px;border-radius:999px;
-    box-shadow:0 2px 10px rgba(0,0,0,.35);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);}
-  #vllm-avsw button{appearance:none;border:0;cursor:pointer;border-radius:999px;
-    padding:6px 12px;font:inherit;color:#cfd2da;background:transparent;transition:.15s;}
-  #vllm-avsw button.on{background:#3b82f6;color:#fff;}
-  #vllm-avsw .lbl{opacity:.7;font-weight:500;padding-left:4px;}
-  #vllm-avsw.busy{opacity:.6;pointer-events:none;}
-</style>
-<div id="vllm-avsw" title="Avatar source (applies on next connect)">
-  <span class="lbl">Avatar</span>
-  <button data-m="musetalk_local">Local</button>
-  <button data-m="simli">Cloud</button>
-</div>
-<script>
-(function(){
-  var box=document.getElementById('vllm-avsw');
-  var btns=box.querySelectorAll('button');
-  function paint(mode){
-    btns.forEach(function(b){ b.classList.toggle('on', b.dataset.m===mode); });
-  }
-  function load(){
-    fetch('/avatar-mode').then(function(r){return r.json();})
-      .then(function(j){ paint(j.mode); }).catch(function(){});
-  }
-  btns.forEach(function(b){
-    b.addEventListener('click', function(){
-      if(b.classList.contains('on')) return;
-      box.classList.add('busy');
-      fetch('/avatar-mode',{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({mode:b.dataset.m})})
-        .then(function(r){return r.json();})
-        .then(function(j){
-          paint(j.mode); box.classList.remove('busy');
-          var cloud=j.mode==='simli';
-          alert('Avatar set to '+(cloud?'CLOUD (Simli)':'LOCAL (MuseTalk)')+
-                '.\\n\\nReconnect (leave & rejoin) to apply.'+
-                (cloud?'':'\\nMake sure the local MuseTalk server is running.'));
-        })
-        .catch(function(){ box.classList.remove('busy'); alert('Could not change avatar mode.'); });
-    });
-  });
-  load();
-})();
-</script>
-
-<!-- Android earpiece-vs-speaker toggle. Two-way WebRTC + a mic captured with
-     echo cancellation forces Android into "communication" audio mode, which
-     routes the bot's voice to the EARPIECE. The only web-level lever that flips
-     Android to the media/loudspeaker path is disabling echoCancellation/NS/AGC
-     on the mic — but then the mic can hear the bot (possible echo). So we make
-     it a toggle: default Earpiece (safe, no echo); tap Speaker to force the
-     loudspeaker. Applied by patching getUserMedia, so it takes effect on the
-     next connect. Android-only; iOS already uses the speaker. -->
-<style>
-  #vllm-spk{position:fixed;bottom:env(safe-area-inset-bottom,12px);right:10px;z-index:99999;
-    display:flex;align-items:center;gap:6px;background:rgba(20,20,24,.82);color:#fff;
-    font:600 13px/1 system-ui,sans-serif;padding:7px 9px;border-radius:999px;
-    box-shadow:0 2px 10px rgba(0,0,0,.35);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);}
-  #vllm-spk button{appearance:none;border:0;cursor:pointer;border-radius:999px;
-    padding:6px 12px;font:inherit;color:#cfd2da;background:transparent;transition:.15s;}
-  #vllm-spk button.on{background:#3b82f6;color:#fff;}
-  #vllm-spk .lbl{opacity:.7;font-weight:500;padding-left:4px;}
-</style>
-<script>
-(function(){
-  if(!/Android/i.test(navigator.userAgent||'')) return;
-  var KEY='vllm_speaker';
-  function spkOn(){ return localStorage.getItem(KEY)==='1'; }
-
-  // Patch getUserMedia so the chosen audio routing applies on the next connect.
-  var md=navigator.mediaDevices;
-  if(md && md.getUserMedia){
-    var orig=md.getUserMedia.bind(md);
-    md.getUserMedia=function(c){
-      try{
-        if(spkOn() && c && c.audio){
-          var a=(c.audio===true)?{}:Object.assign({},c.audio);
-          a.echoCancellation=false; a.noiseSuppression=false; a.autoGainControl=false;
-          c=Object.assign({},c,{audio:a});
-        }
-      }catch(e){}
-      return orig(c);
-    };
-  }
-
-  var box=document.createElement('div'); box.id='vllm-spk';
-  box.innerHTML='<span class="lbl">Sound</span>'+
-    '<button data-s="0">Earpiece</button><button data-s="1">Speaker</button>';
-  function paint(){ box.querySelectorAll('button').forEach(function(b){
-    b.classList.toggle('on', (b.dataset.s==='1')===spkOn()); }); }
-  box.querySelectorAll('button').forEach(function(b){
-    b.addEventListener('click', function(){
-      var want=b.dataset.s==='1';
-      if(want===spkOn()){ return; }
-      localStorage.setItem(KEY, want?'1':'0'); paint();
-      alert('Sound set to '+(want?'SPEAKER (loudspeaker)':'EARPIECE')+'.\\n\\n'+
-        'Reconnect (leave & rejoin) to apply.'+
-        (want?'\\nNote: on speaker the mic may pick up the bot (slight echo).':''));
-    });
-  });
-  function mount(){ if(!document.body){ return setTimeout(mount,200);} document.body.appendChild(box); paint(); }
-  mount();
-})();
-</script>
-"""
-    _html = _html.replace("</body>", _inject + "</body>")
-
-    async def _client_with_overlay():
-        # no-store so the browser never serves a stale /client after a restart.
-        return HTMLResponse(_html, headers={"Cache-Control": "no-store"})
-
-    # Registered before the runner mounts the prebuilt assets -> these win for
-    # the HTML, while /client/assets/* still come from the prebuilt mount.
-    for _p in ("/client", "/client/"):
-        app.add_api_route(_p, _client_with_overlay, include_in_schema=False)
-
-    # --- avatar source toggle (in-UI Local/Cloud switch) ---------------------
-    # Reads/writes the same avatar_mode.txt that build_avatar() consults on every
-    # connection, so a switch applies on the next reconnect (no restart needed).
-    from fastapi import Request
-    from fastapi.responses import JSONResponse
-
-    from pipeline.stages.avatar import _MODE_FILE
-
-    _VALID_MODES = {"musetalk_local", "simli", "heygen"}
-
-    def _current_mode() -> str:
-        try:
-            v = _MODE_FILE.read_text(encoding="utf-8").strip()
-            if v:
-                return v
-        except Exception:  # noqa: BLE001
-            pass
-        return config.avatar_provider
-
-    async def _get_avatar_mode():
-        return JSONResponse({"mode": _current_mode()})
-
-    async def _set_avatar_mode(request: Request):
-        try:
-            body = await request.json()
-        except Exception:  # noqa: BLE001
-            body = {}
-        mode = (body or {}).get("mode", "").strip()
-        if mode not in _VALID_MODES:
-            return JSONResponse(
-                {"error": f"invalid mode; expected one of {sorted(_VALID_MODES)}"},
-                status_code=400,
-            )
-        _MODE_FILE.write_text(mode, encoding="utf-8")
-        logger.info(f"Avatar mode set via UI -> {mode} (applies on next connect)")
-        return JSONResponse({"mode": mode})
-
-    app.add_api_route("/avatar-mode", _get_avatar_mode, methods=["GET"],
-                      include_in_schema=False)
-    app.add_api_route("/avatar-mode", _set_avatar_mode, methods=["POST"],
-                      include_in_schema=False)
+    # Bound the VP8 send bitrate so the video fits a remote/WAN link (no starvation/freeze)
+    # BEFORE any peer connection is built, then serve the prebuilt UI at /client with a
+    # receive-side jitter buffer injected so every device (esp. remote/Tailscale viewers)
+    # gets smoother playback automatically.
+    _configure_webrtc_video_bitrate()
+    _install_client_jitter_buffer()
+    # Pin ICE host candidates to the Tailscale interface so the stable 100.x<->100.x pair
+    # wins immediately (kills the intermittent-mic ICE pollution -- see the function docstring).
+    _restrict_ice_to_subnet()
+    from pipecat.runner.run import main
 
     main()

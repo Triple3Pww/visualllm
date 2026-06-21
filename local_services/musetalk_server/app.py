@@ -76,8 +76,23 @@ PARSING_MODE = os.getenv("MUSETALK_PARSING_MODE", "jaw")
 # slows the per-frame full-frame compositing (PIL). Keeps the face well above the
 # 256px VAE crop while making blending realtime.
 BASE_MAX = int(os.getenv("MUSETALK_BASE_MAX", "768"))
+# How long the pump waits (queue empty + no audio) before deciding a `speech_end`
+# was dropped and reverting to the idle loop. Must comfortably exceed the largest
+# normal inter-chunk gap within one utterance, or it flips to idle mid-sentence.
+IDLE_WATCHDOG_S = float(os.getenv("MUSETALK_IDLE_WATCHDOG_S", "3.0"))
 
 app = FastAPI(title="MuseTalk realtime")
+
+# The engine holds shared GPU model + per-turn cursor/fps state, so concurrent
+# renders (even across connections) would corrupt each other. This server is
+# single-client by design; the lock enforces one GPU inference at a time.
+_render_lock = asyncio.Lock()
+
+# Single-client session guard. A new /stream connection SUPERSEDES the prior one:
+# we set the previous connection's `closed` event so its pump stops instead of two
+# pumps competing (the reconnect-freeze: a left-open tab / a pipeline restart left a
+# stale connection whose pump kept holding the line). Holds the active `closed` event.
+_active_closed: "asyncio.Event | None" = None
 
 
 class MuseTalkEngine:
@@ -157,8 +172,12 @@ class MuseTalkEngine:
 
         self._prepare_avatar()
         self._neutral = self._frame_to_bytes(self.frame_cycle[0])
+        self._build_idle_loop()
         self._ready = True
-        logger.info(f"MuseTalk ready. {len(self.frame_cycle)} base frame(s) prepared.")
+        logger.info(
+            f"MuseTalk ready. {len(self.frame_cycle)} base frame(s) prepared; "
+            f"{len(self._idle_loop)} idle frame(s)."
+        )
 
     # --- avatar preparation (mmpose-free, cached) -------------------------
     def _avatar_key(self) -> str:
@@ -315,6 +334,64 @@ class MuseTalkEngine:
     def neutral_frame(self) -> bytes:
         return self._neutral
 
+    def idle_frames(self) -> list[bytes]:
+        """RGB frames the pump plays between turns so the face stays alive
+        instead of freezing on the neutral portrait. See _build_idle_loop."""
+        return getattr(self, "_idle_loop", [])
+
+    def _build_idle_loop(self) -> None:
+        """Precompute a seamless idle-motion loop.
+
+        MuseTalk only moves the *mouth* (driven by audio), so on a still photo
+        there is nothing to animate between turns -- the avatar freezes. To keep
+        it looking alive we synthesize a gentle "breathing" loop from the neutral
+        portrait: a slow scale pulse + a slower micro head-sway (rotation +
+        translate), anchored low so it reads as the chest/shoulders breathing.
+
+        If the avatar reference is a *video* (frame_cycle has real motion), we
+        loop those real frames instead -- natural breathing and blinks.
+
+        Disable with MUSETALK_IDLE_MOTION=0.
+        """
+        import cv2
+
+        if os.getenv("MUSETALK_IDLE_MOTION", "1").lower() not in ("1", "true", "yes"):
+            self._idle_loop = []
+            return
+
+        # Video reference (>2 frames after the ping-pong): use the real motion.
+        if len(self.frame_cycle) > 2:
+            self._idle_loop = [self._frame_to_bytes(f) for f in self.frame_cycle]
+            return
+
+        base = cv2.resize(
+            self.frame_cycle[0], (self.size, self.size), interpolation=cv2.INTER_AREA
+        )
+        h, w = base.shape[:2]
+        n = max(8, int(os.getenv("MUSETALK_IDLE_FRAMES", "80")))  # loop length
+        # Overall amplitude multiplier -- bump MUSETALK_IDLE_GAIN if the breathing
+        # is too subtle to notice (or down to calm it). Base values are tuned to
+        # be clearly visible without looking like camera shake.
+        g = float(os.getenv("MUSETALK_IDLE_GAIN", "1.0"))
+        anchor = (w / 2.0, h * 0.92)  # low anchor -> breathing, not bobbing head
+        loop: list[bytes] = []
+        for t in range(n):
+            ph = 2.0 * np.pi * t / n
+            scale = 1.0 + 0.015 * g * np.sin(ph)        # breathing pulse (~1.5%)
+            dy = 4.0 * g * np.sin(ph)                    # vertical bob (px)
+            ang = 0.9 * g * np.sin(0.5 * ph)             # slow head sway (deg)
+            dx = 3.0 * g * np.sin(0.5 * ph)              # slow horizontal drift (px)
+            M = cv2.getRotationMatrix2D(anchor, ang, scale)
+            M[0, 2] += dx
+            M[1, 2] += dy
+            warp = cv2.warpAffine(
+                base, M, (w, h),
+                flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE,
+            )
+            rgb = cv2.cvtColor(warp, cv2.COLOR_BGR2RGB)
+            loop.append(np.ascontiguousarray(rgb, dtype=np.uint8).tobytes())
+        self._idle_loop = loop
+
     def _frame_to_bytes(self, frame_bgr) -> bytes:
         import cv2
 
@@ -415,7 +492,12 @@ def _startup():
 
 @app.websocket("/stream")
 async def stream(ws: WebSocket):
+    global _active_closed
     await ws.accept()
+    # Session guard: supersede any prior connection so a reconnect can't leave two
+    # pumps competing (the freeze). Signal the previous connection's pump to stop.
+    if _active_closed is not None:
+        _active_closed.set()
     fps = engine.fps
     spf = engine.samples_per_frame(fps)
     seg_samples = spf * SEG_FRAMES
@@ -423,36 +505,125 @@ async def stream(ws: WebSocket):
     # Bounded queue of rendered frames; the pump drains it at a STEADY fps.
     out_q: asyncio.Queue = asyncio.Queue(maxsize=600)
     closed = asyncio.Event()
+    _active_closed = closed
     loop = asyncio.get_event_loop()
+    speaking = asyncio.Event()   # set while a turn's audio is being rendered
+    st = {"last_audio": 0.0}     # loop.time() of the last audio chunk (watchdog)
+    # A/V-sync markers: the pump tells the client which frames are REAL lip-synced
+    # render (vs idle) and how many have played, so the client paces the voice to the
+    # actually-rendered video (see local_services/musetalk_video.py). Best-effort.
+    idle_grace = float(os.getenv("MUSETALK_IDLE_GRACE", "0.3"))
+    # Readiness prime: frames to buffer before a turn starts playing (the "wait until ready"
+    # cushion). ~6 @12fps = 0.5s -> absorbs render hiccups so the locked voice never stutters.
+    lead_frames = int(os.getenv("MUSETALK_LEAD_FRAMES", "6"))
+
+    async def _mark(payload: dict) -> None:
+        try:
+            await ws.send_text(json.dumps(payload))
+        except Exception:  # noqa: BLE001 -- markers are best-effort
+            pass
 
     async def pump():
         """Emit a steady `fps` video stream. WebRTC/mobile decoders freeze on
         bursty input, so we pace output: send the next rendered frame if one is
-        ready, otherwise repeat the last frame to hold a smooth track."""
+        ready. When idle (between turns) we play a gentle breathing loop so the
+        face stays alive instead of freezing on the neutral portrait; while
+        speaking we hold the last frame if rendering momentarily lags."""
         interval = 1.0 / max(1, fps)
-        last = engine.neutral_frame()
+        idle = engine.idle_frames()
+        idle_n = len(idle)
+        idle_i = 0
+        last = idle[0] if idle_n else engine.neutral_frame()
+        was_speaking = False
         nxt = loop.time()
+        # Marker state, driven by REAL frames drained (not idle/held), mirroring the
+        # Ditto pump: `playing` spans a turn's rendered frames; `real_sent` counts only
+        # truly-dequeued frames so a render stall stops the client's voice with it.
+        playing = False
+        real_sent = 0
+        last_clock = 0
+        empty_since = None
         try:
             while not closed.is_set():
+                sp = speaking.is_set()
+                # Watchdog: if a speech_end was dropped, don't stay "speaking"
+                # forever -- once the queue drains and audio has stopped, idle.
+                if sp and out_q.empty() and (loop.time() - st["last_audio"]) > IDLE_WATCHDOG_S:
+                    speaking.clear()
+                    sp = False
+                if was_speaking and not sp:
+                    idle_i = 0  # resume idle from the rest pose (seamless)
+                was_speaking = sp
+
+                # READINESS PRIME: at the start of a turn, don't begin playing until a small
+                # LEAD of frames is buffered (the "wait until the avatar is ready" gate). This
+                # gives the locked audio a cushion so a render hiccup is absorbed (no stutter)
+                # and the voice starts in step with a ready avatar. Hold the last frame while priming.
+                if not playing and sp and out_q.qsize() < lead_frames:
+                    await ws.send_bytes(last)
+                    nxt += interval
+                    await asyncio.sleep(max(0.0, nxt - loop.time()))
+                    continue
+
+                got = None
                 try:
-                    last = out_q.get_nowait()
+                    got = out_q.get_nowait()
                 except asyncio.QueueEmpty:
                     pass
+                if got is not None:
+                    last = got
+                    if not playing:                     # primed & ready: start the clock
+                        playing = True
+                        real_sent = 0
+                        last_clock = 0
+                        await _mark({"type": "video_start"})
+                    real_sent += 1
+                    empty_since = None
+                    if real_sent - last_clock >= 2:     # ~every 2 real frames
+                        last_clock = real_sent
+                        await _mark({"type": "video_clock", "frames": real_sent})
+                else:
+                    if playing:
+                        now = loop.time()
+                        if empty_since is None:
+                            empty_since = now
+                        # Only END the turn's video segment when the turn is REALLY over
+                        # (speech_end -> not sp) AND the queue has drained -- not on a brief
+                        # mid-turn render underflow (that would re-segment + desync the client).
+                        elif not sp and now - empty_since >= idle_grace:
+                            playing = False
+                            empty_since = None
+                            await _mark({"type": "video_end"})
+                        # else: render hiccup OR end-of-turn wait -> HOLD `last`. The stream MUST
+                        # stay continuous (a gap = the avatar freezes); the client caps its own
+                        # release against the audio so a held frame can't run video ahead.
+                    elif not sp and idle_n:
+                        last = idle[idle_i % idle_n]
+                        idle_i += 1
+                # Always emit a frame this tick (real, held-last, or idle) so the video never
+                # freezes -- the end-of-turn freeze was caused by skipping the send on underflow.
                 await ws.send_bytes(last)
                 nxt += interval
                 await asyncio.sleep(max(0.0, nxt - loop.time()))
         except Exception:  # noqa: BLE001
             pass
 
+    def enqueue(frame: bytes) -> None:
+        # Stay realtime: drop the oldest frame rather than lag behind (or, for the
+        # closing neutral frame, rather than raise QueueFull and kill the socket).
+        if out_q.full():
+            try:
+                out_q.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+        out_q.put_nowait(frame)
+
     async def render(segment: np.ndarray) -> int:
-        frames = await asyncio.to_thread(engine.render_segment, segment)
+        # One GPU inference at a time across the whole process (shared engine).
+        async with _render_lock:
+            frames = await asyncio.to_thread(engine.render_segment, segment)
         for f in frames:
-            if out_q.full():  # stay realtime: drop oldest rather than lag behind
-                try:
-                    out_q.get_nowait()
-                except asyncio.QueueEmpty:
-                    pass
-            out_q.put_nowait(f)
+            enqueue(f)
         return len(frames)
 
     pump_task = asyncio.create_task(pump())
@@ -475,8 +646,12 @@ async def stream(ws: WebSocket):
                     logger.info(f"[stream] config: fps={fps}")
                 elif kind == "speech_start":
                     turn_frames = 0
+                    speaking.set()                 # pump holds, not idle, now
+                    st["last_audio"] = loop.time()
                 elif kind in ("reset", "speech_end"):
-                    if kind == "speech_end" and len(audio_buf) >= spf:
+                    # Render the FINAL audio even if it's less than a full segment (pad up to one
+                    # frame) so the last word/syllable isn't dropped -- the "cut at the end".
+                    if kind == "speech_end" and len(audio_buf) > 0:
                         pad = (-len(audio_buf)) % spf
                         seg = (
                             np.concatenate([audio_buf, np.zeros(pad, np.float32)])
@@ -485,14 +660,21 @@ async def stream(ws: WebSocket):
                         turn_frames += await render(seg)
                     audio_buf = np.zeros(0, dtype=np.float32)
                     engine.reset_idx()
+                    speaking.clear()               # let the idle loop resume
                     if kind == "speech_end":
                         logger.info(f"[stream] turn rendered {turn_frames} frames")
-                        out_q.put_nowait(engine.neutral_frame())  # close mouth after speaking
+                        # Graceful TAIL: a few closing frames so the avatar eases out (mouth
+                        # settles to neutral) instead of snapping shut the instant audio ends.
+                        tail = int(os.getenv("MUSETALK_END_TAIL_FRAMES", "4"))
+                        for _ in range(max(1, tail)):
+                            enqueue(engine.neutral_frame())
                 continue
 
             data = msg.get("bytes")
             if not data:
                 continue
+            speaking.set()                          # defensive: audio implies a turn
+            st["last_audio"] = loop.time()
             pcm = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
             audio_buf = np.concatenate([audio_buf, pcm])
             while len(audio_buf) >= seg_samples:
@@ -515,4 +697,13 @@ def health():
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8002)
+    # ws_ping_interval/timeout=None: the stream pump sends frames continuously at
+    # `fps`, so the socket is never idle. The websockets keepalive ping adds no
+    # value here and its write races the pump's high-rate send_bytes -- that race
+    # is what was dropping the connection after a turn or two (AssertionError in
+    # websockets' keepalive_ping). Disable it; the steady frame flow IS the
+    # liveness signal.
+    uvicorn.run(
+        app, host="0.0.0.0", port=8002,
+        ws_ping_interval=None, ws_ping_timeout=None,
+    )

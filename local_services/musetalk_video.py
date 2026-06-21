@@ -1,39 +1,57 @@
 """MuseTalk local lip-sync avatar as a Pipecat FrameProcessor.
 
-Sits between TTS and transport.output(). It streams the TTS audio to a local
-MuseTalk server over a websocket, receives lip-synced RGB video frames back, and
-pushes both the video (OutputImageRawFrame) and the audio (TTSAudioRawFrame)
-downstream so the browser plays them in sync.
+Sits between TTS and transport.output(). It streams the TTS audio to a local MuseTalk
+server over a websocket, receives lip-synced RGB frames back, and pushes both video
+(OutputImageRawFrame) and audio (TTSAudioRawFrame) downstream IN SYNC.
 
-Design mirrors Pipecat's hosted avatar services (Simli/HeyGen):
-- Audio is forwarded downstream *immediately* so speech is never blocked on
-  frame generation.
-- Video frames stream from the server at a fixed FPS (default 25) and are
-  emitted as they arrive — first frame defines the avatar's TTFO contribution.
-- On interruption (barge-in) we reset the server session so stale frames don't
-  leak into the next turn.
+A/V sync (the thing Ditto does badly and we do better here). The server renders with some
+latency, so we cannot just forward the audio immediately and let the video free-run (that is
+the desync). Instead the server emits markers -- `video_start` / `video_clock{frames:N}` /
+`video_end` -- and this client buffers the voice and releases each audio chunk paired with its
+matching rendered frame, tagging the frame `OutputImageRawFrame.sync_with_audio=True` so the
+transport (non-live) pins each frame to its audio position. Two strategies (MUSETALK_SYNC_MODE):
 
-Talks to local_services/musetalk_server/ (FastAPI + websocket).
-Requires: `pip install websockets`.
+  steady    : release incrementally as `video_clock` advances. Because MuseTalk renders
+              steadily at ~real-time (no diffusion warmup), the clock advances smoothly so the
+              voice plays smoothly -- low latency, no stutter.
+  prerender : buffer the whole short reply, release it all aligned on `video_end` -- near-perfect
+              sync at the cost of ~one render's worth of extra start delay.
+
+Set MUSETALK_SYNC_WITH_AUDIO=0 to fall back to the old free-running behaviour.
+Talks to local_services/musetalk_server/ (FastAPI + websocket). Requires `pip install websockets`.
 """
 from __future__ import annotations
 
 import asyncio
 import json
+import os
 
 import numpy as np
 import websockets
 from loguru import logger
 
+from pipecat.frames.frames import (
+    CancelFrame,
+    EndFrame,
+    Frame,
+    InterruptionFrame,
+    OutputImageRawFrame,
+    StartFrame,
+    TTSAudioRawFrame,
+    TTSStartedFrame,
+    TTSStoppedFrame,
+)
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+
 MUSETALK_SR = 16000  # Whisper (server-side) expects 16 kHz mono
 
 
 def _to_16k_mono_pcm(audio: bytes, in_rate: int, channels: int) -> bytes:
-    """Resample int16 PCM to 16 kHz mono for the MuseTalk server.
-
-    MuseTalk's Whisper encoder requires 16 kHz; TTS often emits 24 kHz. Per-chunk
-    linear resampling is sufficient for lip-sync feature extraction.
-    """
+    """Resample int16 PCM to 16 kHz mono for the MuseTalk server."""
+    if len(audio) & 1:
+        audio = audio[:-1]  # pipecat's resampler can hand us an odd-length buffer; int16
+        #                     needs an even byte count or np.frombuffer raises. Drop the
+        #                     stray byte (sub-sample, inaudible) instead of dropping the chunk.
     a = np.frombuffer(audio, dtype=np.int16)
     if a.size == 0:
         return b""
@@ -48,73 +66,310 @@ def _to_16k_mono_pcm(audio: bytes, in_rate: int, channels: int) -> bytes:
         a = np.interp(dst, src, a)
     return a.astype(np.int16).tobytes()
 
-from pipecat.frames.frames import (
-    CancelFrame,
-    EndFrame,
-    Frame,
-    OutputImageRawFrame,
-    StartFrame,
-    InterruptionFrame,
-    TTSAudioRawFrame,
-    TTSStartedFrame,
-    TTSStoppedFrame,
-)
-from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
-
 
 class MuseTalkVideoService(FrameProcessor):
     def __init__(
         self,
         *,
         base_url: str,
-        fps: int = 20,  # match the server's realtime budget on the 5060 Ti
+        fps: int = 20,
         image_size: tuple[int, int] = (512, 512),
         **kwargs,
     ):
         super().__init__(**kwargs)
         self._ws_url = base_url.replace("http", "ws", 1).rstrip("/") + "/stream"
-        self._fps = fps
+        self._fps = float(fps)
         self._size = image_size
         self._ws: websockets.WebSocketClientProtocol | None = None
         self._recv_task: asyncio.Task | None = None
+        self._closing = False
+
+        # --- sync config ---
+        # MODE:
+        #   live (default) = AUDIO-MASTER. The voice plays at real-time; lip-sync is best-effort
+        #     and bounded -- we stop feeding the server when it falls > MAX_LAG behind, so on a
+        #     slow/contended GPU the lips skip stale content to stay current instead of dragging
+        #     the WHOLE voice slow/late. This is the only sane behaviour when the render can't
+        #     sustain real-time (MuseTalk shares the GPU with CosyVoice).
+        #   steady / prerender = VIDEO-MASTER (sync_with_audio pinning) -- tight sync ONLY when the
+        #     render keeps up; on a slow GPU they make the voice lag. Kept for fast-GPU setups.
+        self._mode = (os.getenv("MUSETALK_SYNC_MODE", "live") or "live").lower()
+        self._sync = self._mode in ("steady", "prerender") and (
+            os.getenv("MUSETALK_SYNC_WITH_AUDIO", "1") or "1").lower() in ("1", "true", "yes", "on")
+        self._lead_s = float(os.getenv("MUSETALK_SYNC_LEAD_S", "0.0"))
+        self._fallback_s = float(os.getenv("MUSETALK_SYNC_FALLBACK_S", "10.0"))
+        # Lag cap (default OFF). The voice is released paced to frames AS they arrive, so when
+        # the server sustains its fps the voice already tracks real-time and no cap is needed.
+        # This only helps if the render genuinely sustains BELOW realtime; it keys off buffered
+        # audio (which TTS fills ahead), so leave it 0 unless a slow GPU truly falls behind --
+        # a positive value will skip frames (choppy) to keep the voice from lagging.
+        # 0 = never skip (deadlock-proof; voice real-time, lips best-effort). A positive value
+        # is experimental: MuseTalk renders in ~0.4s segments so the skip can stall the lips.
+        self._max_lag = float(os.getenv("MUSETALK_SYNC_MAX_LAG", "0"))
+        self._last_hold_log = 0.0
+        # live (audio-master) bookkeeping: audio SENT to the server for lip-sync vs the
+        # server's RENDERED seconds (from video_clock). When sent runs > max_lag ahead of
+        # rendered, we skip feeding the server so the lips stay current (the voice is already
+        # forwarded in full at real-time).
+        self._audio_sent_s = 0.0
+        self._video_s = 0.0
+
+        # Real-time-paced feed to the server (live mode). CosyVoice produces the whole reply
+        # FASTER than real-time (RTF<1); if we forwarded all that audio to the renderer as fast
+        # as it arrives, the server renders a big backlog that plays out at fps -> the video
+        # trails the voice by seconds ("audio done, avatar still going"). So we release audio to
+        # the server paced to real-time, keeping the render in lockstep with playback.
+        self._feed_q: asyncio.Queue = asyncio.Queue()
+        self._feed_task: asyncio.Task | None = None
+
+        # --- per-turn sync state ---
+        self._lock = asyncio.Lock()
+        self._abuf: list[tuple[float, Frame, FrameDirection]] = []  # (cum_end_s, frame, dir)
+        self._aidx = 0                # audio release cursor into _abuf
+        self._audio_clock_s = 0.0     # seconds of audio buffered this turn
+        self._vbuf: list[bytes] = []  # rendered frames this turn (index == real frame #)
+        self._released_idx = 0        # video release cursor into _vbuf
+        self._video_active = False    # between video_start and video_end
+        self._unsynced = False        # fallback engaged this turn
+        self._fallback_task: asyncio.Task | None = None
 
     # --- connection lifecycle ---------------------------------------------
     async def _connect(self):
-        if self._ws is not None:
+        if self._recv_task is not None:
             return
-        logger.info(f"Connecting to MuseTalk server at {self._ws_url}")
-        self._ws = await websockets.connect(self._ws_url, max_size=None)
+        self._closing = False
+        try:
+            await self._open_ws()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"MuseTalk initial connect failed ({e!r}); loop will retry.")
+        self._recv_task = asyncio.create_task(self._receive_loop())
+        if self._feed_task is None:
+            self._feed_task = asyncio.create_task(self._feed_loop())
+
+    async def _open_ws(self):
+        logger.info(f"Connecting to MuseTalk server at {self._ws_url} "
+                    f"(sync={'on:'+self._mode if self._sync else 'off'})")
+        self._ws = await websockets.connect(
+            self._ws_url, max_size=None, ping_interval=None, close_timeout=1
+        )
         await self._ws.send(json.dumps({"type": "config", "fps": self._fps}))
-        self._recv_task = asyncio.create_task(self._receive_frames())
+
+    async def _feed_loop(self):
+        """Send queued items to the server, pacing AUDIO to real-time so the renderer never
+        builds a backlog (the cause of the voice-finishes-but-video-keeps-going lag). Markers
+        (start/end/reset) are forwarded immediately, in order with the audio."""
+        while not self._closing:
+            try:
+                kind, payload = await self._feed_q.get()
+            except asyncio.CancelledError:
+                break
+            try:
+                if self._ws is None:
+                    continue
+                if kind == "audio":
+                    pcm, dur = payload
+                    await self._ws.send(pcm)
+                    await asyncio.sleep(dur)        # pace to real-time
+                else:
+                    await self._ws.send(json.dumps({"type": kind}))
+            except asyncio.CancelledError:
+                break
+            except Exception:  # noqa: BLE001
+                pass
 
     async def _disconnect(self):
-        if self._recv_task:
-            self._recv_task.cancel()
-            self._recv_task = None
+        self._closing = True
+        self._cancel_fallback()
+        for task_attr in ("_recv_task", "_feed_task"):
+            task = getattr(self, task_attr)
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
+                setattr(self, task_attr, None)
         if self._ws:
-            await self._ws.close()
+            try:
+                await self._ws.close()
+            except Exception:  # noqa: BLE001
+                pass
             self._ws = None
 
-    async def _receive_frames(self):
-        """Read RGB frames from the server and push them downstream."""
+    async def _receive_loop(self):
+        while not self._closing:
+            try:
+                if self._ws is None:
+                    await self._open_ws()
+                assert self._ws is not None
+                async for message in self._ws:
+                    if isinstance(message, bytes):
+                        await self._on_frame(message)
+                    else:
+                        await self._on_marker(json.loads(message))
+            except asyncio.CancelledError:
+                break
+            except Exception as e:  # noqa: BLE001
+                if not self._closing:
+                    logger.warning(f"MuseTalk ws dropped ({e!r}); reconnecting...")
+            finally:
+                ws, self._ws = self._ws, None
+                if ws is not None:
+                    try:
+                        await ws.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+            if not self._closing:
+                await asyncio.sleep(0.5)
+
+    # --- sync core --------------------------------------------------------
+    async def _on_frame(self, img: bytes):
+        """A rendered RGB frame from the server."""
+        if not self._sync:
+            await self.push_frame(
+                OutputImageRawFrame(image=img, size=self._size, format="RGB"),
+                FrameDirection.DOWNSTREAM,
+            )
+            return
+        if self._video_active and not self._unsynced:
+            async with self._lock:
+                self._vbuf.append(img)
+            if self._mode == "steady":
+                await self._advance()   # release paced to frames AS they arrive (continuous)
+        else:
+            # idle frame (between turns) or fallback: animate immediately, untagged.
+            await self.push_frame(
+                OutputImageRawFrame(image=img, size=self._size, format="RGB"),
+                FrameDirection.DOWNSTREAM,
+            )
+
+    async def _on_marker(self, evt: dict):
+        kind = evt.get("type")
+        if kind == "video_start":
+            # New turn segment. TTSStartedFrame already reset the turn (audio + buffers) BEFORE
+            # any audio was buffered, so here we ONLY mark active. We deliberately do NOT clear
+            # _vbuf / _released_idx -- they stay continuous across the whole turn so a stray
+            # mid-reply re-segment can't desync the frame<->audio mapping.
+            self._cancel_fallback()
+            self._video_active = True
+        elif kind == "video_clock":
+            self._video_s = int(evt.get("frames", 0)) / self._fps   # rendered secs (live skip uses this)
+            if not self._unsynced and self._mode == "steady":
+                await self._advance()   # heartbeat (real pacing is on frame receipt)
+        elif kind == "video_end":
+            await self._advance()       # flush whatever is buffered (prerender: the whole reply)
+            await self._drain_audio()   # release the turn's trailing voice
+            self._video_active = False
+
+    async def _advance(self):
+        """Release received frames, each paired (in order) with the audio due by its time and
+        tagged sync_with_audio so the transport pins it. If the voice is buffered too far ahead
+        of the released video (render falling behind on a long reply), CATCH UP: drop the backlog
+        frames + release their audio so the voice stays ~real-time instead of drifting."""
+        async with self._lock:
+            # Never release video past the voice we actually have buffered: a frame at index
+            # i needs the audio up to i/fps, so cap at the buffered-audio position. This stops
+            # the video running AHEAD of the voice (e.g. if frames briefly outpace audio).
+            target = len(self._vbuf)
+            audio_cap = int(self._audio_clock_s * self._fps) + 1
+            target = min(target, audio_cap)
+            while self._released_idx < target:
+                await self._emit_pair(self._released_idx)
+                self._released_idx += 1
+            if self._mode != "prerender" and self._max_lag > 0:
+                hold = self._audio_clock_s - self._released_idx / self._fps
+                if hold > self._max_lag:
+                    target_audio = self._audio_clock_s - self._max_lag
+                    skip_to = int(target_audio * self._fps)
+                    if skip_to > self._released_idx:
+                        latest = min(skip_to, len(self._vbuf))  # newest frame we actually have
+                        if latest > 0:
+                            fr = OutputImageRawFrame(
+                                image=self._vbuf[latest - 1], size=self._size, format="RGB")
+                            fr.sync_with_audio = True
+                            await self.push_frame(fr, FrameDirection.DOWNSTREAM)
+                        self._released_idx = skip_to   # jump the cursor; the skipped span is dropped
+                    while (self._aidx < len(self._abuf)
+                           and self._abuf[self._aidx][0] <= target_audio):
+                        _e, af, ad = self._abuf[self._aidx]
+                        self._aidx += 1
+                        await self.push_frame(af, ad)
+            self._log_hold()
+
+    async def _emit_pair(self, i: int):
+        """Audio due by frame i's time (in order), then frame i tagged sync_with_audio. Caller
+        holds the lock. Frame is skipped if not buffered yet (a caught-up cursor ran ahead)."""
+        ft = i / self._fps + self._lead_s
+        while self._aidx < len(self._abuf) and self._abuf[self._aidx][0] <= ft:
+            _e, af, ad = self._abuf[self._aidx]
+            self._aidx += 1
+            await self.push_frame(af, ad)
+        if i < len(self._vbuf):
+            fr = OutputImageRawFrame(image=self._vbuf[i], size=self._size, format="RGB")
+            fr.sync_with_audio = True
+            await self.push_frame(fr, FrameDirection.DOWNSTREAM)
+
+    def _log_hold(self):
+        now = asyncio.get_running_loop().time()
+        if now - self._last_hold_log >= 1.0:
+            self._last_hold_log = now
+            hold = self._audio_clock_s - self._released_idx / self._fps
+            logger.info(
+                f"[musetalk sync] hold={hold:0.2f}s (audio {self._audio_clock_s:0.1f}s, "
+                f"video {self._released_idx/self._fps:0.1f}s) "
+                f"abuf={len(self._abuf)-self._aidx} vbuf={len(self._vbuf)-self._released_idx}"
+            )
+
+    async def _drain_audio(self):
+        """Release any audio left after the last rendered frame (tail of the turn)."""
+        async with self._lock:
+            while self._aidx < len(self._abuf):
+                _e, af, ad = self._abuf[self._aidx]
+                self._aidx += 1
+                await self.push_frame(af, ad)
+
+    def _log_live(self, behind: float):
+        now = asyncio.get_running_loop().time()
+        if now - self._last_hold_log >= 1.0:
+            self._last_hold_log = now
+            logger.info(f"[musetalk live] lip-behind={behind:0.2f}s "
+                        f"(sent {self._audio_sent_s:0.1f}s, rendered {self._video_s:0.1f}s)"
+                        f"{' SKIP' if self._max_lag > 0 and behind > self._max_lag else ''}")
+
+    def _reset_turn(self):
+        self._abuf = []
+        self._aidx = 0
+        self._audio_clock_s = 0.0
+        self._vbuf = []
+        self._released_idx = 0
+        self._video_active = False
+        self._unsynced = False
+        self._audio_sent_s = 0.0
+        self._video_s = 0.0
+
+    # --- fallback (marker-less server / lost markers) ---------------------
+    def _arm_fallback(self):
+        if self._fallback_task or not self._sync:
+            return
+        self._fallback_task = asyncio.create_task(self._fallback_watch())
+
+    def _cancel_fallback(self):
+        if self._fallback_task:
+            self._fallback_task.cancel()
+            self._fallback_task = None
+
+    async def _fallback_watch(self):
         try:
-            assert self._ws is not None
-            async for message in self._ws:
-                if isinstance(message, bytes):
-                    # Raw RGB frame buffer (image_size * 3 bytes).
-                    await self.push_frame(
-                        OutputImageRawFrame(
-                            image=message, size=self._size, format="RGB"
-                        ),
-                        FrameDirection.DOWNSTREAM,
-                    )
+            await asyncio.sleep(self._fallback_s)
         except asyncio.CancelledError:
-            pass
-        except Exception:  # noqa: BLE001
-            logger.exception("MuseTalk frame receiver stopped")
+            return
+        if not self._video_active and self._abuf and self._aidx < len(self._abuf):
+            logger.warning(f"MuseTalk sync: no video markers within {self._fallback_s}s; "
+                           "forwarding voice unsynced for this turn.")
+            self._unsynced = True
+            await self._drain_audio()
 
     async def _reset_session(self):
-        """Flush server-side buffers on interruption."""
         if self._ws:
             try:
                 await self._ws.send(json.dumps({"type": "reset"}))
@@ -134,35 +389,52 @@ class MuseTalkVideoService(FrameProcessor):
             await self.push_frame(frame, direction)
 
         elif isinstance(frame, InterruptionFrame):
+            # Barge-in: drop any audio still queued for the server so the interrupted turn
+            # can't keep driving the lips, then reset.
+            while not self._feed_q.empty():
+                try:
+                    self._feed_q.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
             await self._reset_session()
+            self._cancel_fallback()
+            self._reset_turn()
             await self.push_frame(frame, direction)
 
         elif isinstance(frame, TTSAudioRawFrame):
-            # Feed audio to MuseTalk for lip-sync, AND forward it downstream so
-            # speech plays without waiting on frame generation. The server's
-            # Whisper needs 16 kHz mono, so resample before sending (the frame
-            # forwarded downstream keeps its original rate for playback).
-            if self._ws:
-                try:
-                    pcm = _to_16k_mono_pcm(
-                        frame.audio,
-                        getattr(frame, "sample_rate", MUSETALK_SR),
-                        getattr(frame, "num_channels", 1),
-                    )
-                    if pcm:
-                        await self._ws.send(pcm)
-                except Exception:  # noqa: BLE001
-                    logger.exception("Failed sending audio to MuseTalk")
+            sr = getattr(frame, "sample_rate", MUSETALK_SR) or MUSETALK_SR
+            ch = getattr(frame, "num_channels", 1) or 1
+            dur = (len(frame.audio) // (2 * ch)) / sr
+            # ALWAYS feed the server REAL-TIME-PACED (via _feed_q) so the renderer can't build a
+            # backlog from CosyVoice's faster-than-real-time output (the "voice finishes but the
+            # avatar keeps going" lag). Pacing keeps the server's queue ~empty either mode.
+            pcm = _to_16k_mono_pcm(frame.audio, sr, ch)
+            if pcm:
+                self._feed_q.put_nowait(("audio", (pcm, dur)))
+            if not self._sync:
+                # AUDIO-MASTER (live): forward the voice NOW (plays at real-time, lips best-effort).
+                await self.push_frame(frame, direction)
+            elif self._unsynced:
+                await self.push_frame(frame, direction)   # fallback: marker-less server
+            else:
+                # READINESS-GATED (steady): hold the voice and release it locked to the real
+                # rendered frames -- the voice waits until the avatar is ready, then they play
+                # together. No drift, no end cut. (See _advance / video_clock handling.)
+                self._audio_clock_s += dur
+                async with self._lock:
+                    self._abuf.append((self._audio_clock_s, frame, direction))
+                self._arm_fallback()
+
+        elif isinstance(frame, TTSStartedFrame):
+            self._cancel_fallback()
+            self._reset_turn()
+            # speech_start/end go through _feed_q so they order correctly with the real-time-
+            # paced audio (start before the turn's audio, end after it fully drains).
+            self._feed_q.put_nowait(("speech_start", None))
             await self.push_frame(frame, direction)
 
-        elif isinstance(frame, (TTSStartedFrame, TTSStoppedFrame)):
-            # Mark utterance boundaries for the server (helps it pad/idle).
-            if self._ws:
-                tag = "speech_start" if isinstance(frame, TTSStartedFrame) else "speech_end"
-                try:
-                    await self._ws.send(json.dumps({"type": tag}))
-                except Exception:  # noqa: BLE001
-                    pass
+        elif isinstance(frame, TTSStoppedFrame):
+            self._feed_q.put_nowait(("speech_end", None))
             await self.push_frame(frame, direction)
 
         else:

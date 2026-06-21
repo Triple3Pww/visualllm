@@ -1,14 +1,14 @@
 # VisualLLm — Speech → LLM → Talking-Head Avatar
 
-A real-time conversational system: **speak to it, and a photoreal 2D avatar
-speaks back** (lip-synced audio + video). Multi-turn, with barge-in.
+A real-time conversational system: **speak to it, and a photoreal avatar speaks
+back** (lip-synced audio + video). Multi-turn, streaming end-to-end.
 
 ```
 speech → STT → LLM → TTS → lip-sync avatar → audio+video out
 ```
 
 **Goal:** time-to-first-output (you stop speaking → avatar starts responding)
-**< 8 seconds**. See `docs`/the design plan for the full latency budget.
+**< 8 seconds**.
 
 The whole system streams: as soon as the LLM emits its first sentence it flows
 to TTS → first audio chunk → the avatar starts talking. We never wait for a
@@ -19,89 +19,72 @@ stage to fully finish.
 ## Architecture
 
 Built on **[Pipecat](https://github.com/pipecat-ai/pipecat)** — it wires every
-stage with streaming + barge-in built in, and ships pluggable services for all
-the providers below. Every stage is selected from `.env` (no code changes to
-swap English↔Mandarin or API↔local).
+stage with streaming + barge-in built in. This is one pure stack (no
+provider-switching sprawl); the `.env` knobs are `LANGUAGE` (en/zh/th),
+`TTFO_TARGET_SECONDS`, `AVATAR` (`ditto`|`none`), and `CHARACTER_MODE`.
 
-| Stage | Default (EN prototype) | Mandarin / local target |
-|-------|------------------------|-------------------------|
-| VAD / turn-taking | Silero (local) | same |
-| STT   | Deepgram | FunASR Paraformer / faster-whisper |
-| LLM   | GPT-4o-mini | Qwen2.5-7B (local via vLLM/Ollama) |
-| TTS   | ElevenLabs Flash | CosyVoice2-0.5B (local) |
-| Avatar| Simli / HeyGen LiveAvatar | MuseTalk (local, 5060 Ti) |
-| Transport | WebRTC → browser | same |
+| Stage | Service |
+|-------|---------|
+| VAD / turn-taking | Silero (local) |
+| STT   | Deepgram (nova-2; `en-US` / `zh-TW` / `th` by `LANGUAGE`) |
+| LLM   | OpenRouter (any model via `OPENROUTER_MODEL`) |
+| TTS   | ElevenLabs (flash_v2_5, multilingual) |
+| Avatar| Ditto — local lip-sync server on the GPU (5060 Ti); audio frame-clocked to the rendered video. Or `AVATAR=none` (client renders the face) |
+| Transport | WebRTC → browser |
 
 ```
 pipeline/
   main.py            pipeline assembly + dev runner
-  config.py          provider selection + env (single source of truth)
+  config.py          keys + the en/zh/th switch (single source of truth)
   metrics.py         TtfoMeter — measures time-to-first-output
-  stages/            one factory per stage (isolated, swappable imports)
-local_services/      local model wrappers (Phase 3)
-client/              browser WebRTC client
+  stages/            one factory per stage (stt/llm/tts/avatar/vad)
+local_services/      local avatar server + Pipecat wrapper
 scripts/
-  bench_latency.py   per-stage latency probes
+  preflight.py       resolve every import (catches Pipecat version drift)
 ```
 
 ---
 
-## Quick start (Phase 1 — English prototype)
-
-> **Which APIs to buy + where each key/ID comes from:** see
-> [`docs/SETUP.md`](docs/SETUP.md) — dedicated provider per stage (4 services,
-> all with free tiers).
+## Quick start
 
 ```bash
 python -m venv .venv
 .venv\Scripts\activate            # PowerShell: .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 
-python -m scripts.preflight       # verify imports resolve (catches Pipecat
-                                  # version drift) BEFORE wiring keys
+python -m scripts.preflight       # verify imports resolve BEFORE wiring keys
 
-copy .env.example .env            # then fill in keys (Deepgram, OpenAI,
-                                  # ElevenLabs, Simli)
-python -m pipeline.main
+copy .env.example .env            # then fill in keys (Deepgram, OpenRouter,
+                                  # ElevenLabs)
 ```
 
-Open the printed `http://localhost:7860` URL, allow the mic, and talk. The
-console logs a `[TTFO]` line per turn; the disconnect log prints the
-median/p95 summary.
+The avatar runs as a **separate local server** (its own `ditto` conda env).
+Start it first, then the pipeline:
+
+```bash
+conda run -n ditto python -m local_services.ditto_server.app   # GPU avatar server, :8002
+python -m pipeline.main                                        # serves /client
+```
+
+Open the printed `http://localhost:7860/client` URL, allow the mic, **wait for
+the avatar face to appear**, then talk. The console logs a `[TTFO]` line per
+turn; the disconnect log prints the median/p95 summary.
 
 > **Version note:** Pipecat's import paths shift between releases. If an import
-> errors, check `python -c "import pipecat; print(pipecat.__version__)"` and
-> adjust — the fragile imports are isolated to `pipeline/stages/*.py`,
-> `pipeline/main.py`, and `pipeline/metrics.py`.
+> errors, check `python -c "import pipecat; print(pipecat.__version__)"` — the
+> fragile imports are isolated to `pipeline/stages/*.py`, `pipeline/main.py`,
+> and `pipeline/metrics.py`.
 
----
+## Switching to Mandarin
 
-## Switching to Mandarin (Phase 2)
-
-Edit `.env`:
-
-```
-LANGUAGE=zh
-STT_PROVIDER=whisper_local     # or funasr
-LLM_PROVIDER=qwen_local        # vLLM/Ollama OpenAI-compatible endpoint
-TTS_PROVIDER=cosyvoice_local
-```
-
-(Avatar stays on the API — Simli/HeyGen both lip-sync zh audio fine.)
-
-## Going local (Phase 3)
-
-Stand up the local model servers in `local_services/` on the 5060 Ti and point
-`COSYVOICE_URL` / `MUSETALK_URL` / `QWEN_BASE_URL` at them. Watch VRAM —
-16 GB does **not** fit MuseTalk + CosyVoice2 + FunASR + Qwen-7B all at once, so
-keep either the LLM or the avatar on API in steady state (tune in Phase 3).
+Set `LANGUAGE=zh` in `.env` (and optionally an `OPENROUTER_MODEL` strong at
+Chinese). Deepgram switches to `zh-TW` and ElevenLabs flash_v2_5 speaks zh — no
+code changes.
 
 ---
 
 ## Measuring the goal
 
-- **End-to-end:** `TtfoMeter` (in the pipeline) logs each turn's TTFO and a
-  p95 summary. **Pass = p95 < 8 s.**
-- **Per-stage:** `python -m scripts.bench_latency --stage llm` /`--stage tts`
-  to find the dominant cost.
+- `TtfoMeter` (in the pipeline) logs each turn's TTFO and a p95 summary.
+  **Pass = p95 < 8 s.**
 - Biggest tuning lever: the VAD `stop_secs` in `pipeline/stages/vad.py`.

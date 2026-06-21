@@ -4,6 +4,7 @@ __pycache__/
 .venv/
 venv/
 *.log
+logs/
 models/
 checkpoints/
 *.wav
@@ -15,3 +16,14 @@ checkpoints/
 # Phase 3 — local MuseTalk (cloned upstream + multi-GB weights + caches)
 local_services/musetalk_server/vendor/
 local_services/musetalk_server/avatar_cache/
+
+# Ditto fallback — vendored upstream repo (14 GB, nested git) + transient CMake build output
+local_services/ditto_server/vendor/
+local_services/ditto_server/plugin_build/build/
+
+# Runtime artifacts (renders, probes, reports) — regenerated, not source
+output/
+
+# Ditto plugin build: vendored upstream sources (own .git) -- re-clone to rebuild
+local_services/ditto_server/plugin_build/grid-sample3d-trt-plugin/
+local_services/ditto_server/plugin_build/trt_headers/
