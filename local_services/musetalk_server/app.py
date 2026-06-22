@@ -566,9 +566,9 @@ async def stream(ws: WebSocket):
         last = idle[0] if idle_n else engine.neutral_frame()
         was_speaking = False
         nxt = loop.time()
-        # Marker state, driven by REAL frames drained (not idle/held), mirroring the
-        # Ditto pump: `playing` spans a turn's rendered frames; `real_sent` counts only
-        # truly-dequeued frames so a render stall stops the client's voice with it.
+        # Marker state, driven by REAL frames drained (not idle/held): `playing` spans a
+        # turn's rendered frames; `real_sent` counts only truly-dequeued frames so a render
+        # stall stops the client's voice with it.
         playing = False
         real_sent = 0
         last_clock = 0

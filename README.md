@@ -22,8 +22,8 @@ Built on **[Pipecat](https://github.com/pipecat-ai/pipecat)** — it wires every
 stage with streaming + barge-in built in. One pure stack chosen by `.env`; each
 stage is a thin single-provider factory with deliberate fallback switches (not
 multi-provider branching). Core knobs: `LANGUAGE` (en/zh/th), `TTFO_TARGET_SECONDS`,
-`AVATAR` (`musetalk`|`ditto`|`none`), `TTS_PROVIDER` (`cosyvoice`|`elevenlabs`|`deepgram`),
-`CHARACTER_MODE`, and `WEBRTC_ICE_SUBNET` (pin ICE to Tailscale for the remote mic).
+`TTS_PROVIDER` (`cosyvoice`|`elevenlabs`|`deepgram`), `MUSETALK_SYNC_MODE`
+(`steady`|`live`), and `WEBRTC_ICE_SUBNET` (pin ICE to Tailscale for the remote mic).
 
 | Stage | Service |
 |-------|---------|
@@ -31,7 +31,7 @@ multi-provider branching). Core knobs: `LANGUAGE` (en/zh/th), `TTFO_TARGET_SECON
 | STT   | Deepgram (nova-2; `en-US` / `zh-TW` / `th` by `LANGUAGE`) — cloud |
 | LLM   | OpenRouter (any model via `OPENROUTER_MODEL`) — cloud |
 | TTS   | **CosyVoice2-0.5B**, local streaming server, female zero-shot voice — **runs on vLLM in WSL** (first-chunk latency ~1.1s; the Windows PyTorch server is the fallback). ElevenLabs / Deepgram Aura are cloud fallbacks via `TTS_PROVIDER` |
-| Avatar| **MuseTalk** — local mouth-region lip-sync server on the GPU (5060 Ti), female portrait. Or `AVATAR=ditto` (full-face TensorRT path, kept) / `none` (client renders the face) |
+| Avatar| **MuseTalk** — local mouth-region lip-sync server on the GPU (5060 Ti), female portrait |
 | Transport | WebRTC → browser at `/client/` |
 
 ```
@@ -64,7 +64,7 @@ fixed — read before re-debugging the avatar/audio). Short version:
 # 1. CosyVoice TTS — vLLM in WSL (TTFB ~1.1s). Then set COSYVOICE_URL to the WSL IP (`wsl hostname -I`),
 #    NOT localhost (WSL2's localhost relay buffers the audio stream).
 wsl -d Ubuntu -e bash -c "bash /mnt/e/Claude/cosyvoice-local-tts/run_vllm_server.sh"   # :8001
-# 2 + 3. MuseTalk avatar server + pipeline (one script; picks the engine from AVATAR in .env)
+# 2 + 3. MuseTalk avatar server + pipeline (one script: starts both, propagates the MuseTalk knobs from .env)
 .\scripts\run.ps1
 ```
 

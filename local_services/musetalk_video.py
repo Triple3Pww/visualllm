@@ -4,7 +4,7 @@ Sits between TTS and transport.output(). It streams the TTS audio to a local Mus
 server over a websocket, receives lip-synced RGB frames back, and pushes both video
 (OutputImageRawFrame) and audio (TTSAudioRawFrame) downstream IN SYNC.
 
-A/V sync (the thing Ditto does badly and we do better here). The server renders with some
+A/V sync is the hard part. The server renders with some
 latency, so we cannot just forward the audio immediately and let the video free-run (that is
 the desync). Instead the server emits markers -- `video_start` / `video_clock{frames:N}` /
 `video_end` -- and this client buffers the voice and releases each audio chunk paired with its
@@ -139,14 +139,6 @@ class MuseTalkVideoService(FrameProcessor):
         self._video_active = False    # between video_start and video_end
         self._unsynced = False        # fallback engaged this turn
         self._fallback_task: asyncio.Task | None = None
-
-        # DEBUG (MUSETALK_DOWNSTREAM_CAPTURE=1): save every audio frame this service pushes
-        # DOWNSTREAM (post steady buffer/release, PRE transport) to a session wav -- boundary 2.5,
-        # to bisect whether the steady-mode screech is created HERE (our release code) or later
-        # in pipecat's transport. Compared against the transport-output capture in main.py.
-        self._dcap = (os.getenv("MUSETALK_DOWNSTREAM_CAPTURE", "0").lower()
-                      in ("1", "true", "yes", "on"))
-        self._dcap_wf = None
 
         # --- per-turn A/V timing instrumentation (logs audio-vs-avatar offset + lip drift) ---
         self._t_audio_first: float | None = None   # loop.time() of first voice chunk this turn
@@ -453,23 +445,6 @@ class MuseTalkVideoService(FrameProcessor):
             except Exception:  # noqa: BLE001
                 pass
 
-    def _cap_write(self, frame) -> None:
-        """Append a downstream-pushed audio frame to the boundary-2.5 session wav."""
-        try:
-            import time
-            import wave
-            if self._dcap_wf is None:
-                sr = getattr(frame, "sample_rate", 24000) or 24000
-                p = (os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                                  "output", "cosy_noise", f"_musetalk_out_{time.strftime('%H%M%S')}.wav"))
-                os.makedirs(os.path.dirname(p), exist_ok=True)
-                wf = wave.open(p, "wb"); wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(sr)
-                self._dcap_wf = wf
-                logger.info(f"MuseTalk downstream-audio capture ON -> {os.path.basename(p)} (boundary 2.5).")
-            self._dcap_wf.writeframes(frame.audio)
-        except Exception:  # noqa: BLE001
-            pass
-
     def _align_even(self, frame: TTSAudioRawFrame) -> None:
         """SAMPLE-ALIGNMENT GUARD (the real steady-screech root-cause fix).
 
@@ -496,8 +471,6 @@ class MuseTalkVideoService(FrameProcessor):
     async def push_frame(self, frame: Frame, direction: FrameDirection = FrameDirection.DOWNSTREAM):
         if direction == FrameDirection.DOWNSTREAM and isinstance(frame, TTSAudioRawFrame):
             self._align_even(frame)   # keep the downstream PCM whole-sample (anti-screech guard)
-        if self._dcap and direction == FrameDirection.DOWNSTREAM and isinstance(frame, TTSAudioRawFrame):
-            self._cap_write(frame)   # boundary-2.5 WAV (concatenated; judge garble from this, not per-chunk RMS)
         await super().push_frame(frame, direction)
 
     # --- frame processing --------------------------------------------------

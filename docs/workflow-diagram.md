@@ -62,10 +62,9 @@ flowchart TD
     P3a["User context aggregator → LLMContextFrame"]
     P3b["LLM pre-warmed on connect (no cold start)"]
     P3c["OpenRouter (OPENROUTER_MODEL)<br/>streamed tokens"]
-    P3d["System prompt: spoken-style /<br/>in-character Thai (CHARACTER_MODE)"]
-    P3e["EmotionTagger: strip leading [emotion]<br/>before TTS → push to client"]
+    P3d["System prompt: spoken-style<br/>(en / zh / th)"]
     P3f["Sentence aggregation<br/>first sentence → TTS early"]
-    P3a --> P3b --> P3c --> P3d --> P3e --> P3f
+    P3a --> P3b --> P3c --> P3d --> P3f
   end
 
   %% ---------- PHASE 4: TTS ----------
@@ -117,12 +116,6 @@ flowchart TD
   P1 --> P2 --> P3 --> P4 --> P5 --> P6
   P6 -.->|"barge-in: user speaks over avatar → cancel + new turn"| P1
 
-  %% ----- avatar fallbacks -----
-  P5alt1["fallback: Ditto full-face (AVATAR=ditto)<br/>TensorRT FP16 · GridSample3D plugin<br/>frame-drop _StridedQueue · diffusion warmup + idle mask<br/>sync_with_audio ↔ video_out_is_live"]
-  P5alt2["fallback: none (AVATAR=none)<br/>audio-only · 3D face rendered client-side"]
-  P5 -.->|"AVATAR=ditto"| P5alt1
-  P5 -.->|"AVATAR=none"| P5alt2
-
   %% ----- remote viewing -----
   P6r["Remote: tailscale serve HTTPS<br/>_install_client_jitter_buffer (CLIENT_JITTER_BUFFER_MS)<br/>WEBRTC_VIDEO_BITRATE_MAX · fit-the-stream size<br/>open /client/ WITH trailing slash"]
   P6b -.->|"WAN viewer"| P6r
@@ -132,11 +125,9 @@ flowchart TD
   click P1d "../pipeline/stages/vad.py" "stages/vad.py"
   click P2a "../pipeline/stages/stt.py" "stages/stt.py"
   click P3c "../pipeline/stages/llm.py" "stages/llm.py"
-  click P3e "../pipeline/stages/emotion_tagger.py" "stages/emotion_tagger.py"
   click P4a "../pipeline/stages/tts.py" "stages/tts.py"
   click P5b "../local_services/musetalk_video.py" "musetalk_video.py"
   click P5d "../local_services/musetalk_server/app.py" "musetalk_server/app.py"
-  click P5alt1 "../local_services/ditto_video.py" "ditto_video.py"
   click P6a "../pipeline/metrics.py" "pipeline/metrics.py"
 
   %% ----- styling -----
@@ -150,11 +141,11 @@ flowchart TD
 
   class P1a,P1b,P1c,P1d cap;
   class P2a,P2b,P2c,P2d stt;
-  class P3a,P3b,P3c,P3d,P3e,P3f llm;
+  class P3a,P3b,P3c,P3d,P3f llm;
   class P4a,P4b,P4c tts;
   class P5a,P5b,P5c,P5d,P5e,P5f,P5sync av;
   class P6a,P6b,P6c,P6d out;
-  class P4f1,P4f2,P5alt1,P5alt2,P6r alt;
+  class P4f1,P4f2,P6r alt;
 ```
 
 ## Error & troubleshooting paths
@@ -162,11 +153,11 @@ flowchart TD
 ```mermaid
 flowchart TD
     S1["Avatar shows but won't talk<br/>(voice + chat dead)"] -.-> F1["TTS provider out of credits/quota<br/>→ swap TTS_PROVIDER or top up key"]
-    S2["Avatar not showing at all"] -.-> F2["Avatar server (:8002) down<br/>→ start it; pipeline needs it unless AVATAR=none"]
+    S2["Avatar not showing at all"] -.-> F2["Avatar server (:8002) down<br/>→ start it; the pipeline needs it"]
     S3["Lips drift / trail the voice"] -.-> F3["Shared-GPU contention (live mode, no freeze)<br/>→ accepted tradeoff; next safe lever = bound out_q<br/>NEVER re-lock the voice (locked sync froze it)"]
     S4["Video stutters remotely, audio fine"] -.-> F4["WAN: oversized stream<br/>→ fit-the-stream (smaller size + WEBRTC_VIDEO_BITRATE_MAX)<br/>then small CLIENT_JITTER_BUFFER_MS"]
-    S5["Avatar laggy on the GPU box itself"] -.-> F5["onnxruntime fell back to CPU / fps mismatch<br/>→ verify CUDA DLLs on path; one DITTO_FPS everywhere"]
-    S6["Judging sync over RDP looks wrong"] -.-> F6["RDP desyncs A/V paths<br/>→ judge natively or via capture_mp4 / _capture (offline)"]
+    S5["Avatar laggy on the GPU box itself"] -.-> F5["onnxruntime fell back to CPU / fps mismatch<br/>→ verify CUDA DLLs on path; one MUSETALK_FPS everywhere"]
+    S6["Judging sync over RDP looks wrong"] -.-> F6["RDP desyncs A/V paths<br/>→ judge natively or via _capture (offline)"]
 
     classDef sym fill:#2a1510,stroke:#f87171,color:#e8edf4;
     classDef fix fill:#0e1b14,stroke:#34d399,color:#cfe9d8;

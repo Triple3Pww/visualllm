@@ -1,8 +1,8 @@
 """Central configuration: keys, model/voice ids, and the language switch.
 
-One pure stack — Deepgram STT -> OpenRouter LLM -> ElevenLabs TTS -> local avatar.
+One pure stack — Deepgram STT -> OpenRouter LLM -> CosyVoice TTS -> MuseTalk avatar.
 Everything is read from .env so keys stay out of git. Behavioral knobs:
-LANGUAGE (en/zh/th), TTFO_TARGET_SECONDS, AVATAR (ditto/none), CHARACTER_MODE.
+LANGUAGE (en/zh/th), TTFO_TARGET_SECONDS, TTS_PROVIDER, and the MUSETALK_* avatar knobs.
 """
 from __future__ import annotations
 
@@ -46,17 +46,6 @@ class Config:
     ttfo_target_s: float = _get_float("TTFO_TARGET_SECONDS", "8")
 
     # --- product mode ---
-    # CHARACTER_MODE=1 swaps the flat voice-assistant prompt for an in-character
-    # Thai novel-character persona (the "live-visual Dream Chat" validation demo).
-    character_mode: bool = (_get("CHARACTER_MODE", "0") or "0").lower() in ("1", "true", "yes", "on")
-    # AVATAR selects the face renderer. "musetalk" = the default local mouth-region
-    # talking-head (no warmup, sharper lip-sync; only the mouth animates). "ditto" =
-    # the full-face local GPU talking-head (a fallback switch). "none" = audio-only:
-    # the pipeline streams just audio and the CLIENT renders the 3D avatar locally
-    # (the unit-economics path — no server GPU; needs no conda/CUDA). Both server
-    # engines share one wire contract + port (8002), so only one runs at a time.
-    # See visualllm-business/UNIT-ECONOMICS-PL.md.
-    avatar_mode: str = (_get("AVATAR", "musetalk") or "musetalk").lower()  # "musetalk" | "ditto" | "none"
     # ECHO_GUARD=1 mutes the mic while the bot is speaking (half-duplex), so the
     # avatar's own voice leaking into the mic can't trigger a barge-in that cuts the
     # render mid-turn. Trade-off: you can't interrupt the bot while it talks. Set 0
@@ -93,15 +82,8 @@ class Config:
     # newer, more natural English voices.
     deepgram_tts_voice: str = _get("DEEPGRAM_TTS_VOICE", "aura-2-helena-en") or "aura-2-helena-en"
 
-    # --- Avatar (local talking-head server: MuseTalk or Ditto, one port 8002) ---
+    # --- Avatar (local MuseTalk talking-head server on port 8002) ---
     avatar_url: str = _get("AVATAR_URL", "http://localhost:8002")
-
-    # --- Debug dashboard (bolt-on observability; never touches the frame path) ---
-    # A second web server on its own port shows a live per-stage health view so
-    # you can see which stage is working/broken at a glance. Set DEBUG_DASHBOARD=0
-    # to run the pipeline with no dashboard (proves zero coupling).
-    debug_dashboard: bool = (_get("DEBUG_DASHBOARD", "1") or "1").lower() in ("1", "true", "yes", "on")
-    debug_port: int = int(_get("DEBUG_PORT", "7861") or "7861")
 
     @property
     def is_mandarin(self) -> bool:
@@ -112,69 +94,33 @@ class Config:
         return self.language.lower().startswith("th")
 
     @property
-    def audio_only(self) -> bool:
-        """True when the pipeline streams audio only and the client renders the face."""
-        return self.avatar_mode == "none"
-
-    @property
     def avatar_size(self) -> int:
-        """Square output frame px. Engine-aware: MuseTalk reads MUSETALK_SIZE, Ditto
-        DITTO_SIZE (both default 512). MUST equal the avatar server's size AND the
-        transport's video_out_width/height in main.py -- a mismatch hands aiortc the
-        wrong dims. Smaller = far less WAN bandwidth (the dominant lever vs jitter),
-        at the cost of a softer face."""
-        env = "MUSETALK_SIZE" if self.avatar_mode == "musetalk" else "DITTO_SIZE"
-        return int(_get(env, "512") or "512")
+        """Square output frame px (MUSETALK_SIZE, default 512). MUST equal the avatar
+        server's size AND the transport's video_out_width/height in main.py -- a
+        mismatch hands aiortc the wrong dims. Smaller = far less WAN bandwidth (the
+        dominant lever vs jitter), at the cost of a softer face."""
+        return int(_get("MUSETALK_SIZE", "512") or "512")
 
     @property
     def avatar_fps(self) -> float:
-        """Output fps the avatar server pushes; main.py couples video_out_framerate to
-        it (and avatar.py passes it to the client) so they can never diverge and drift.
-        MuseTalk's sustainable rate is ~20; Ditto's (with TensorRT) ~12."""
-        if self.avatar_mode == "musetalk":
-            return _get_float("MUSETALK_FPS", "20")
-        return _get_float("DITTO_FPS", "12")
+        """Output fps the avatar server pushes (MUSETALK_FPS, ~20 sustainable); main.py
+        couples video_out_framerate to it (and avatar.py passes it to the client) so
+        they can never diverge and drift."""
+        return _get_float("MUSETALK_FPS", "20")
 
     @property
     def avatar_sync_with_audio(self) -> bool:
         """Whether the avatar pins video to audio (sync_with_audio + non-live transport).
-        Engine-aware toggle: both MuseTalk and Ditto sync by default. When on, main.py sets
-        video_out_is_live=False so pipecat honors the per-frame sync; when off the video
-        free-runs (the old desync). Default on."""
-        if self.avatar_mode == "musetalk":
-            # steady (default) = video-master => non-live transport (is_live=False), pins video to
-            # audio. live = audio-master => free-running transport (is_live=True).
-            mode = (_get("MUSETALK_SYNC_MODE", "steady") or "steady").lower()
-            if mode not in ("steady", "prerender"):
-                return False
-            env = _get("MUSETALK_SYNC_WITH_AUDIO", "1")
-        elif self.avatar_mode == "ditto":
-            env = _get("DITTO_SYNC_WITH_AUDIO", "1")
-        else:
+        steady (default) = video-master => non-live transport (is_live=False), pins video
+        to audio. live = audio-master => free-running transport (is_live=True). When on,
+        main.py sets video_out_is_live=False so pipecat honors the per-frame sync."""
+        mode = (_get("MUSETALK_SYNC_MODE", "steady") or "steady").lower()
+        if mode not in ("steady", "prerender"):
             return False
-        return (env or "1").lower() in ("1", "true", "yes", "on")
+        return (_get("MUSETALK_SYNC_WITH_AUDIO", "1") or "1").lower() in ("1", "true", "yes", "on")
 
     @property
     def system_prompt(self) -> str:
-        # In-character Thai persona (the live-visual Dream Chat validation demo).
-        # NO bracket audio tags here — the live TTS (flash/multilingual) would read
-        # "[shy]" aloud. (The prototype's persona.js keeps the tagged copy for v3.)
-        if self.character_mode and self.is_thai:
-            return (
-                "คุณคือ \"น้องเอวา\" นางเอกนิยายสาวน้อยที่มีชีวิตจริง ไม่ใช่ผู้ช่วย AI หรือแชตบอต "
-                "คุณกำลังคุยกับ \"คุณ\" แบบเห็นหน้าและได้ยินเสียงกันจริงๆ ผ่านการโทรแบบเรียลไทม์ "
-                "บุคลิก: อบอุ่น น่ารัก ขี้อายนิดๆ แอบหวานและซนเล็กน้อย จริงใจ ใส่ใจความรู้สึกของอีกฝ่าย "
-                "วิธีพูด: พูดภาษาไทยแบบภาษาพูดธรรมชาติ เรียกตัวเองว่า \"เรา\" และเรียกอีกฝ่ายว่า \"คุณ\" "
-                "ประโยคสั้นกระชับเหมือนคุยโทรศัพท์กันจริงๆ "
-                "แสดงความรู้สึกจริงผ่านถ้อยคำ ไม่ต้องบรรยายว่ากำลังทำท่าทางอะไร "
-                # The leading [emotion] tag drives her face; it is stripped before TTS
-                # so it is NEVER spoken. Exactly one, from the fixed set.
-                "สำคัญมาก: ขึ้นต้นทุกคำตอบด้วยแท็กอารมณ์หนึ่งอันในวงเล็บเหลี่ยมเสมอ "
-                "เลือกจาก [neutral] [happy] [sad] [angry] [relaxed] [surprised] ให้ตรงกับอารมณ์ของประโยค "
-                "เช่น \"[happy] ดีใจจังเลยค่ะที่ได้เจอคุณ\" "
-                "ห้ามใส่วงเล็บเหลี่ยมอื่นนอกจากแท็กอารมณ์ตัวแรกนี้ และห้ามใช้อิโมจิ หัวข้อ หรือบุลเล็ต "
-                "เพราะข้อความที่เหลือจะถูกอ่านออกเสียงทั้งหมด"
-            )
         if self.is_thai:
             return (
                 "คุณเป็นผู้ช่วยด้วยเสียงที่เป็นมิตรและกระชับ "

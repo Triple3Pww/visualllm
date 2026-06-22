@@ -32,35 +32,6 @@ from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipeline.config import config
 from pipeline.metrics import TtfoMeter
 from pipeline.stages import build_avatar, build_llm, build_stt, build_tts, build_vad_params
-from pipeline.stages.emotion_tagger import EmotionTagger
-
-
-def _make_debug_taps():
-    # Lazy: the debug package pulls in FastAPI/uvicorn, only needed when on.
-    from pipeline.debug.taps import make_taps
-
-    return make_taps()
-
-
-def _launch_debug_dashboard() -> None:
-    """Start the dashboard server at process startup (its own daemon thread), so
-    it's reachable before any client connects. Bus config that needs no session is
-    set here; the per-session avatar service ref is attached later in run_bot."""
-    from pipeline.debug import bus
-    from pipeline.debug.server import start_debug_server
-
-    avatar_enabled = not config.audio_only
-    bus.configure(
-        avatar_enabled=avatar_enabled,
-        fps_target=25,  # Ditto's locked native rate
-        ttfo_target_s=config.ttfo_target_s,
-        lang=config.language,
-    )
-    start_debug_server(
-        port=config.debug_port,
-        avatar_url=config.avatar_url,
-        avatar_enabled=avatar_enabled,
-    )
 
 
 async def run_bot(transport: BaseTransport) -> None:
@@ -72,24 +43,15 @@ async def run_bot(transport: BaseTransport) -> None:
     ensure_file_sink("pipeline")
 
     logger.info(
-        f"Pipeline: Deepgram STT -> OpenRouter LLM -> ElevenLabs TTS -> local avatar "
+        f"Pipeline: Deepgram STT -> OpenRouter LLM -> CosyVoice TTS -> MuseTalk avatar "
         f"(lang={config.language})"
     )
 
     stt = build_stt(config)
     llm = build_llm(config)
     tts = build_tts(config)
-    # Audio-only mode skips the server-side talking-head entirely: the client
-    # renders the 3D avatar locally from the audio track (the unit-economics path).
-    avatar = None if config.audio_only else build_avatar(config)
+    avatar = build_avatar(config)
     meter = TtfoMeter(target_s=config.ttfo_target_s)
-
-    # In character mode the EmotionTagger (between LLM and TTS) extracts the LLM's
-    # leading [emotion] tag, pushes it to the client out-of-band (RTVIServerMessageFrame
-    # -> the runner's existing RTVI layer -> onServerMessage) to drive the VRM face,
-    # and strips it so it is never spoken. We do NOT add our own RTVIProcessor — a
-    # second one breaks the prebuilt runner's bot-ready handshake.
-    tagger = EmotionTagger() if config.character_mode else None
 
     context = LLMContext([{"role": "system", "content": config.system_prompt}])
     # Echo-guard: mute the mic while the bot is speaking (half-duplex) so the
@@ -109,45 +71,19 @@ async def run_bot(transport: BaseTransport) -> None:
         logger.info("Echo-guard ON: mic muted while the bot speaks (half-duplex).")
     aggregator = LLMContextAggregatorPair(context, user_params=user_params)
 
-    # Debug dashboard: one pass-through StageTap is interleaved after each stage so
-    # the dashboard can show per-stage health. Taps forward every frame unchanged
-    # (same contract as TtfoMeter) — when DEBUG_DASHBOARD=0 none are inserted and
-    # the pipeline is byte-for-byte the original.
-    debug_on = config.debug_dashboard
-    taps = _make_debug_taps() if debug_on else {}
+    pipeline = Pipeline([
+        transport.input(),    # mic in (+ VAD set in transport params)
+        stt,                  # speech -> text
+        aggregator.user(),    # add user turn to context
+        llm,                  # text -> streamed text
+        tts,                  # text -> streamed audio
+        avatar,               # audio -> lip-synced video+audio (server)
+        meter,                # measure TTFO
+        transport.output(),   # -> browser (audio + video)
+        aggregator.assistant(),  # add bot turn to context
+    ])
 
-    def tap(key):
-        return [taps[key]] if debug_on else []
-
-    stages = [
-        transport.input(), *tap("vad"),   # mic in (+ VAD set in transport params)
-        stt, *tap("stt"),                 # speech -> text
-        aggregator.user(),                # add user turn to context
-        llm, *tap("llm"),                 # text -> streamed text
-    ]
-    if tagger is not None:
-        stages.append(tagger)             # strip + forward the leading [emotion] tag
-    stages += [tts, *tap("tts")]          # text -> streamed audio
-    if avatar is not None:
-        stages += [avatar, *tap("avatar")]  # audio -> lip-synced video+audio (server)
-    stages += [
-        *tap("out"),                      # catch BotStartedSpeaking (TTFO/'out' light)
-        meter,                            # measure TTFO
-        transport.output(),               # -> browser (audio, +video unless audio-only)
-        aggregator.assistant(),           # add bot turn to context
-    ]
-    pipeline = Pipeline(stages)
-
-    _install_delivered_audio_capture(transport)
-    _install_handle_audio_probe()
     _relax_bot_vad_stop_timeout()   # steady-mode screech fix (see the function's docstring)
-
-    if debug_on and avatar is not None:
-        # Server already running (started in __main__); just hand the dashboard a
-        # reference to this session's avatar client so it can read live sync state.
-        from pipeline.debug import bus
-
-        bus.set_avatar_service(avatar)
 
     task = PipelineTask(
         pipeline,
@@ -178,8 +114,7 @@ async def run_bot(transport: BaseTransport) -> None:
         logger.info("Client connected — warming LLM + sending greeting.")
         asyncio.create_task(_warmup_llm())   # warm the LLM in the background
         if config.is_thai:
-            greeting = "สวัสดีค่ะ เราพร้อมแล้วนะ พูดได้เลยค่ะ" if config.character_mode \
-                else "สวัสดีค่ะ พร้อมแล้วค่ะ พูดได้เลย"
+            greeting = "สวัสดีค่ะ พร้อมแล้วค่ะ พูดได้เลย"
         elif config.is_mandarin:
             greeting = "嗨，我準備好了，請說。"
         else:
@@ -199,10 +134,6 @@ async def bot(runner_args: RunnerArguments) -> None:
     """Entrypoint the Pipecat dev runner calls with a configured transport."""
     from pipecat.runner.utils import create_transport
 
-    # Audio-only mode (client renders the 3D face) turns the server video stream
-    # off entirely; the Ditto path keeps the live 512x512 25fps video settings.
-    want_video = not config.audio_only
-
     # A/V SYNC MODE -- this picks the transport's video clock, and the two modes are
     # MUTUALLY EXCLUSIVE in pipecat 1.3.0 (verified in base_output.py):
     #   * sync_with_audio  -> a tagged OutputImageRawFrame is routed through the AUDIO
@@ -213,161 +144,39 @@ async def bot(runner_args: RunnerArguments) -> None:
     #     their own wall-clock; `_video_images` (and thus every sync_with_audio frame)
     #     is NEVER read. So with is_live=True the whole sync_with_audio mechanism is a
     #     no-op -- video plays on a free-running clock and drifts vs the voice.
-    # DittoVideoService tags its turn frames sync_with_audio (DITTO_SYNC_WITH_AUDIO,
-    # default on) for true lip pinning, so the transport MUST be NON-live for that to
-    # work. We couple them off the same env: sync on -> is_live False (real sync);
-    # sync off -> is_live True (legacy free-running clock, animates but drifts). Idle
-    # frames are pushed untagged either way and animate via `_set_video_image`.
-    # BOTH local engines pin video to audio now: MuseTalk emits video_start/video_clock/
-    # video_end markers and its client (musetalk_video.py) buffers the voice + tags frames
-    # sync_with_audio, exactly like Ditto. So sync_av (-> non-live transport) is on whenever
-    # the active engine's sync toggle is on. Off -> is_live=True (legacy free-running desync).
+    # MuseTalk emits video_start/video_clock/video_end markers and its client
+    # (musetalk_video.py) buffers the voice + tags frames sync_with_audio for true lip
+    # pinning, so the transport MUST be NON-live for that to work. We couple them off the
+    # same flag: sync on (steady) -> is_live False (real sync); sync off (live) -> is_live
+    # True (legacy free-running clock, animates but drifts). Idle frames are pushed
+    # untagged either way and animate via `_set_video_image`.
     sync_av = config.avatar_sync_with_audio
 
     transport_params = {
         "webrtc": lambda: TransportParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
-            video_out_enabled=want_video,  # off in audio-only (client renders the face)
+            video_out_enabled=True,
             # See the A/V SYNC MODE note above: non-live so sync_with_audio actually
             # pins each frame to its audio. (is_live would silently disable the sync.)
-            video_out_is_live=want_video and not sync_av,
-            # Square portrait; MUST equal the avatar server's DITTO_SIZE and the
-            # service's image_size (config.avatar_size couples all three off DITTO_SIZE,
-            # same discipline as DITTO_FPS below). Smaller = far less WAN bandwidth.
+            video_out_is_live=not sync_av,
+            # Square portrait; MUST equal the avatar server's MUSETALK_SIZE and the
+            # service's image_size (config.avatar_size couples all three off MUSETALK_SIZE,
+            # same discipline as MUSETALK_FPS below). Smaller = far less WAN bandwidth.
             video_out_width=config.avatar_size,
             video_out_height=config.avatar_size,
             # MUST equal the rate the avatar server PUSHES frames, or playout starves/
             # piles up and the face drifts behind the audio (the "laggy/desynced" drift,
-            # then a freeze). The server pumps frames at config.avatar_fps (engine-aware:
-            # MuseTalk ~20, Ditto ~12 -- it frame-drops to that rate so a sub-realtime GPU
-            # stays realtime), so this MUST track the same value -- hardcoding 25 while the
-            # avatar runs slower was a mismatch = guaranteed desync. Coupled here (and in
-            # avatar.py) so they can never diverge again.
+            # then a freeze). The server pumps frames at config.avatar_fps (MuseTalk ~20 --
+            # it frame-drops to that rate so a sub-realtime GPU stays realtime), so this
+            # MUST track the same value. Coupled here (and in avatar.py) so they can never
+            # diverge again.
             video_out_framerate=max(1, round(config.avatar_fps)),
             vad_analyzer=build_vad_params(),
         ),
     }
     transport = await create_transport(runner_args, transport_params)
     await run_bot(transport)
-
-
-def _install_delivered_audio_capture(transport) -> None:
-    """DEBUG (COSYVOICE_DELIVERED_CAPTURE=1): capture the audio the OUTPUT TRANSPORT actually
-    sends to WebRTC -- boundary 3, the closest point to what the user hears. CosyVoice source +
-    musetalk downstream are confirmed clean, so if the screech appears HERE it's the non-live
-    transport path; if HERE is clean too it's WebRTC/browser. Saves a session wav + WARNs on any
-    garbled NON-silent window (normal-volume garble that amplitude alone misses -> spectral flatness)."""
-    import os
-    if os.getenv("COSYVOICE_DELIVERED_CAPTURE", "0").lower() not in ("1", "true", "yes", "on"):
-        return
-    try:
-        out = transport.output()
-    except Exception:  # noqa: BLE001
-        return
-    if out is None or getattr(out, "_delivered_wrapped", False):
-        return
-    import time
-    import wave
-    from pathlib import Path
-    import numpy as np
-
-    d = Path(__file__).resolve().parent.parent / "output" / "cosy_noise"
-    d.mkdir(parents=True, exist_ok=True)
-    wavpath = d / f"_delivered_{time.strftime('%H%M%S')}.wav"
-    st = {"wf": None, "sr": None, "buf": np.zeros(0, np.float32), "t": 0.0}
-    orig = out.write_audio_frame
-    st["fmts"] = {}     # (type, sample_rate, num_channels, nbytes) -> count, across all frames
-    st["dumped"] = 0    # how many per-frame garble metadata lines we've logged
-
-    async def wrapped(frame):
-        try:
-            sr = getattr(frame, "sample_rate", 24000) or 24000
-            if st["wf"] is None:
-                wf = wave.open(str(wavpath), "wb")
-                wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(sr)
-                st["wf"] = wf; st["sr"] = sr
-                logger.info(f"Delivered-audio capture ON -> {wavpath.name} (transport output, sr={sr}).")
-            st["wf"].writeframes(frame.audio)
-            # Per-frame FORMAT census: if garbled frames have a different rate/len/channels than
-            # clean ones, it's a format/rate bug (fixable); if identical, the BYTES are garbage
-            # (deeper queue corruption). type tells us if a non-audio frame slipped to write.
-            key = (type(frame).__name__, sr, getattr(frame, "num_channels", 1), len(frame.audio))
-            st["fmts"][key] = st["fmts"].get(key, 0) + 1
-            fa = np.frombuffer(frame.audio, np.int16).astype(np.float32) / 32768.0
-            # Per-FRAME garble check (frame is ~10ms; use rms + fraction near full-scale as the tell)
-            if fa.size:
-                frms = float(np.sqrt(np.mean(fa ** 2)))
-                ffull = float(np.mean(np.abs(fa) > 0.9))
-                if frms > 0.35 and ffull > 0.02 and st["dumped"] < 25:
-                    st["dumped"] += 1
-                    logger.warning(f"[garble frame] type={type(frame).__name__} sr={sr} "
-                                   f"ch={getattr(frame,'num_channels',1)} nbytes={len(frame.audio)} "
-                                   f"rms={frms:.3f} frac_fullscale={ffull:.3f} "
-                                   f"min={fa.min():.2f} max={fa.max():.2f}")
-            st["buf"] = np.concatenate([st["buf"], fa])
-            win = int(0.5 * sr)
-            while st["buf"].size >= win:
-                seg = st["buf"][:win]; st["buf"] = st["buf"][win:]
-                rms = float(np.sqrt(np.mean(seg ** 2)))
-                if rms > 0.02:  # skip silence (silence reads as flat=1.0)
-                    spec = np.abs(np.fft.rfft(seg)) ** 2 + 1e-10
-                    flat = float(np.exp(np.mean(np.log(spec))) / np.mean(spec))
-                    if flat > 0.15:
-                        logger.warning(f"[delivered noise] t={st['t']:.1f}s rms={rms:.3f} "
-                                       f"flat={flat:.3f} | formats seen: {st['fmts']}")
-                st["t"] += 0.5
-        except Exception:  # noqa: BLE001 -- capture must never break audio output
-            pass
-        return await orig(frame)
-
-    out.write_audio_frame = wrapped
-    out._delivered_wrapped = True
-
-
-def _install_handle_audio_probe() -> None:
-    """DEBUG (COSYVOICE_HANDLE_AUDIO_PROBE=1): instrument pipecat's MediaSender.handle_audio_frame
-    IN boundary. write_audio_frame (boundary 3) is garbled but musetalk push (2.5) is clean and
-    every component reads clean -- so check at runtime: is the audio ALREADY garbled when it ENTERS
-    handle_audio_frame (-> corruption is upstream/in-transit) or clean there (-> inside the transport
-    buffer/chunk/queue)? Also logs the true self._sample_rate (confirms resampler passthrough)."""
-    import os
-    if os.getenv("COSYVOICE_HANDLE_AUDIO_PROBE", "0").lower() not in ("1", "true", "yes", "on"):
-        return
-    try:
-        from pipecat.transports.base_output import BaseOutputTransport
-    except Exception:  # noqa: BLE001
-        return
-    MS = BaseOutputTransport.MediaSender
-    if getattr(MS, "_probe_wrapped", False):
-        return
-    import time
-    import wave
-    from pathlib import Path
-    orig = MS.handle_audio_frame
-    st = {"wf": None}
-    d = Path(__file__).resolve().parent.parent / "output" / "cosy_noise"
-
-    async def wrapped(self, frame):
-        # RELIABLE capture: concatenate frame.audio at the transport INPUT into one wav (per-chunk
-        # rms is meaningless -- chunks aren't sample-aligned). Compare this to musetalk-out (clean)
-        # and delivered (garbled) to localize the corruption to inside-transport vs taps/queue.
-        try:
-            if st["wf"] is None:
-                sr = getattr(frame, "sample_rate", 24000) or 24000
-                d.mkdir(parents=True, exist_ok=True)
-                p = d / f"_handle_in_{time.strftime('%H%M%S')}.wav"
-                wf = wave.open(str(p), "wb"); wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(sr)
-                st["wf"] = wf
-                logger.info(f"handle_audio INPUT wav capture -> {p.name}")
-            st["wf"].writeframes(frame.audio)
-        except Exception:  # noqa: BLE001
-            pass
-        return await orig(self, frame)
-
-    MS.handle_audio_frame = wrapped
-    MS._probe_wrapped = True
-    logger.info("handle_audio_frame IN-boundary probe installed.")
 
 
 def _relax_bot_vad_stop_timeout() -> None:
@@ -587,16 +396,10 @@ if __name__ == "__main__":
             pass
 
     # Durable per-process log at logs/pipeline.log (rotated, full tracebacks,
-    # plus uvicorn/asyncio via the stdlib intercept). The dashboard thread and
-    # taps log here too. See log_setup.py.
+    # plus uvicorn/asyncio via the stdlib intercept). See log_setup.py.
     from log_setup import setup_logging
 
     setup_logging("pipeline")
-
-    # Bring the debug dashboard up now (own daemon thread) so it's reachable
-    # before any client connects — open http://localhost:<DEBUG_PORT>/debug.
-    if config.debug_dashboard:
-        _launch_debug_dashboard()
 
     # Bound the VP8 send bitrate so the video fits a remote/WAN link (no starvation/freeze)
     # BEFORE any peer connection is built, then serve the prebuilt UI at /client with a

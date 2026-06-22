@@ -1,12 +1,12 @@
 """Per-process logging setup (shared by both entrypoints).
 
-Each long-running process (the pipeline and the Ditto avatar server) calls
+Each long-running process (the pipeline and the MuseTalk avatar server) calls
 `setup_logging("<name>")` once at startup. That gives every run a durable, rotated
 file at `logs/<name>.log` capturing all loguru output (Pipecat, our code, the
 watchdog) AND the standard-library logging of uvicorn / asyncio / websockets /
 onnxruntime -- so when something breaks there is a file to read instead of a guess.
 
-Kept deliberately dependency-light and ASCII-only: it is imported by the Ditto
+Kept deliberately dependency-light and ASCII-only: it is imported by the MuseTalk
 server too, which runs in a separate conda env and must stay ASCII-safe.
 
 Security: the file sink uses diagnose=False on purpose. loguru's diagnose=True

@@ -16,6 +16,12 @@ the code — see the "Source of numbers" note at the end of each measured claim.
 **Progress update for the advisor**
 Updated: **2026-06-14**
 
+> ⚠️ **Historical snapshot (2026-06-14).** This deck records the state and measured
+> numbers as of that date and is kept as-is. The stack has since changed (TTS is now
+> local **CosyVoice2 on vLLM**, the avatar is **MuseTalk-only**, Ditto/Simli and the
+> multi-provider menu below are gone). For current state see **`STATUS.md`** and
+> **`WORKFLOW.md`** — those win over anything here.
+
 A conversational AI avatar that **listens, thinks, and speaks back with a
 photoreal lip-synced face** — in real time, end-to-end streaming.
 

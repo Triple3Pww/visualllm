@@ -10,7 +10,7 @@ For each stage it reports one of:
   DEPR  constructs, but on a deprecated Pipecat API — soft drift; fix soon
   DRIFT import failed — a Pipecat path moved or an extra isn't installed (FIX)
   SKIP  optional local dep not installed yet (the avatar's torch/onnx stack,
-        which only lives in the `ditto` conda env)
+        which only lives in the `musetalk` conda env)
 
 Exit code is non-zero if any DRIFT is found, so it doubles as a CI gate. DEPR is
 non-fatal (it's the early-warning net for the *next* hard drift), so it does not
@@ -29,7 +29,7 @@ from pathlib import Path
 # we can't fix and don't want crying wolf on every run.
 ROOT = Path(__file__).resolve().parent.parent
 
-# Local avatar deps that are expected to be absent outside the `ditto` env. An
+# Local avatar deps that are expected to be absent outside the `musetalk` env. An
 # import error mentioning one of these is a SKIP, not a Pipecat-drift failure.
 OPTIONAL_DEPS = {"websockets", "torch", "numpy", "cv2", "onnxruntime", "mediapipe", "filetype"}
 
@@ -92,13 +92,9 @@ def main() -> int:
     print(_check("stt  (Deepgram)", lambda: build_stt(config)))
     print(_check("llm  (OpenRouter)", lambda: build_llm(config)))
     print(_check(f"tts  ({config.tts_provider})", lambda: build_tts(config)))
-    print(_check(f"avatar ({config.avatar_mode})", lambda: build_avatar(config)))
+    print(_check("avatar (musetalk)", lambda: build_avatar(config)))
 
-    print("\n== Debug dashboard ==")
-    # taps.py holds the version-sensitive frame imports; server.py needs FastAPI.
-    print(_check("debug.status_bus", lambda: __import__("pipeline.debug.status_bus", fromlist=["bus"])))
-    print(_check("debug.taps", lambda: __import__("pipeline.debug.taps", fromlist=["make_taps"])))
-    print(_check("debug.server", lambda: __import__("pipeline.debug.server", fromlist=["start_debug_server"])))
+    print("\n== Support ==")
     print(_check("log_setup", lambda: __import__("log_setup", fromlist=["setup_logging"])))
 
     print()

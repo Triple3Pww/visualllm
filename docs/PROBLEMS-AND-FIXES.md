@@ -220,14 +220,3 @@ error.
 **Fix.** `TTS_PROVIDER` switch in `pipeline/stages/tts.py` — `deepgram` builds Deepgram Aura
 (English-only) as a fallback; `cosyvoice` (default) and `elevenlabs` remain. A deliberate single
 fallback switch, not a return to multi-provider branching.
-
----
-
-## Earlier Ditto-path fixes (fallback engine, `AVATAR=ditto`)
-
-The Ditto full-face TensorRT path accumulated its own long bug list — onnxruntime silently on CPU
-(missing CUDA DLLs), reconnect freeze (session lock), frame-rate mismatch drift, bursty-render
-jerkiness, neutral-snap between sentences, the diffusion-warmup "delay", and the
-**`sync_with_audio` no-op under a live transport** (the same `video_out_is_live` coupling that
-underlies P3). Those are documented in detail in `STATUS.md` (the dated Ditto sections) and remain
-valid for the `AVATAR=ditto` fallback. MuseTalk is the default and the focus of P1–P3 above.
