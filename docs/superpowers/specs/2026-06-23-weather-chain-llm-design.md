@@ -1,13 +1,18 @@
-# Design: Weather-chain LLM node
+# Design: Weather-chain LLM node + local memory harness
 
 _2026-06-23 — baseline `cd88f20`. Status: approved (scope + approach), pending spec review._
 
 ## Goal
 
-Replace the general OpenRouter LLM at the pipeline's LLM slot with a **dedicated Chinese
-weather assistant** that calls a collaborator's LangServe weather-chain endpoint. Every user
-turn becomes a weather question routed to the chain; the chain's streamed answer flows through
-the unchanged TTS → MuseTalk avatar path. The avatar becomes a spoken Mandarin weather bot.
+Two coupled requirements from the collaborator:
+
+1. **Replace the general OpenRouter LLM** at the pipeline's LLM slot with a **dedicated Chinese
+   weather assistant** that calls a LangServe weather-chain endpoint. Every user turn becomes a
+   weather question routed to the chain; the chain's streamed answer flows through the unchanged
+   TTS → MuseTalk avatar path. The avatar becomes a spoken Mandarin weather bot.
+2. **Give the virtual human growing, persistent memory** ("context engineering + harness
+   engineering … increase the memory continuously after a conversation") — a memory layer we
+   build *around* the stateless chain, kept **fully local** (local `qwen2.5:3b`, no cloud).
 
 The endpoint (NCU, Taiwan):
 
@@ -103,14 +108,66 @@ factories. Import the weather service lazily inside the branch (keep preflight i
   exact chunk shape can be confirmed the instant the server is reachable and the parser tweaked in
   one line if LangServe's framing differs from the assumed `event: data` / `data: <json-string>`.
 
-## Data flow (one turn)
+## Memory harness (requirement 3) — fully local
+
+The chain accepts **only** `{"query","model"}`; we don't own it and can't feed it history or a
+profile. So the virtual human's memory lives entirely in **our harness, wrapped around** the
+stateless chain. The engine for the memory ops is **local `qwen2.5:3b` via Ollama's
+OpenAI-compatible endpoint** (`http://localhost:11434/v1`) — no cloud, no per-token cost, matching
+the local-first stack (CosyVoice/MuseTalk). Validated 2026-06-23 (qwen resolved both continuity
+and profile-fill correctly in Traditional Chinese — see §"Validation").
+
+### 6. `local_services/avatar_memory.py` — `MemoryStore` (harness engineering)
+
+Persists to `AVATAR_MEMORY_DIR` (default `state/avatar_memory/`, gitignored — per-user runtime):
+- `profile.json` — durable facts: `name`, `default_city`, `preferences`, free-form `notes`. Small,
+  always loaded. **Single shared profile** (one viewer at a time; per-user keying is out of scope).
+- `summary.txt` — a rolling Traditional-Chinese summary of past conversations (long-term memory).
+- `session.jsonl` — the current conversation's turns (`{user, bot, ts}`), appended live.
+
+API: `recall() -> str` (compact zh context block = profile + summary), `record_turn(user, bot)`,
+`async distill(client)` (end-of-conversation profile+summary update).
+
+### 7. Turn-time context engineering — gated query rewrite
+
+Inside `WeatherChainLLMService`, before the chain call: take the raw utterance + `memory.recall()`
+and, **gated**, rewrite it into a self-contained zh weather query via the local qwen client.
+- **Gated** (`MEMORY_LLM_GATED=1`, default): only call qwen when the utterance looks
+  context-dependent (pronoun/ellipsis like "那…呢", or names no city). Otherwise pass the utterance
+  straight through. Keeps the fast path fast and **minimizes GPU contention** with the avatar
+  render (the project's #1 smoothness enemy). `MEMORY_LLM_GATED=0` = always rewrite.
+- Prompt shape (validated): **single user turn, few-shot, ending in `改寫：`** as a completion
+  primer. A system-prompt-heavy shape did not steer the 3B reliably.
+- After the turn: `memory.record_turn(raw, answer)`.
+
+### 8. After-conversation distillation (the *continuous growth*)
+
+`main.py::on_client_disconnected` (already fires at conversation end): `await memory.distill(client)`
+— one local-qwen call reads the session turns + old profile/summary and returns (a) a merged
+profile and (b) a refreshed rolling summary; persist both, clear `session.jsonl`. **This is the
+step that grows the human's memory after every chat.** Not latency-critical (post-conversation) →
+GPU contention is irrelevant here. Next connect, the greeting is personalized from `profile.json`.
+
+### 9. Config + degradation (hardening)
+
+New config (all `.env`): `AVATAR_MEMORY` (1=on, default), `MEMORY_LLM_URL`
+(`http://localhost:11434/v1`), `MEMORY_LLM_MODEL` (`qwen2.5:3b`), `MEMORY_LLM_GATED` (1),
+`AVATAR_MEMORY_DIR` (`state/avatar_memory`). **Degrade cleanly**: if Ollama is down or a
+rewrite/distill call fails/times out, pass the raw utterance through and skip distillation — the
+weather bot still works, just without memory that turn. Memory never blocks or breaks a turn.
+
+## Data flow (one turn, with memory)
 
 ```
 mic → STT(zh) → aggregator.user() → LLMContextFrame
-   → WeatherChainLLMService:  last user msg → POST .../stream
-                              ← SSE tokens → LLMTextFrame*
+   → WeatherChainLLMService:
+        raw utterance + memory.recall()
+        → [gated] local qwen2.5:3b rewrite → self-contained zh query
+        → POST chain/stream → SSE tokens → LLMTextFrame*
+        → memory.record_turn(raw, answer)
    → TTS(CosyVoice) → MuseTalk avatar → browser
    aggregator.assistant() records the bot turn
+… on disconnect: memory.distill(qwen) → profile.json + summary.txt grow
 ```
 
 ## Risks / flags (not hidden)
@@ -119,18 +176,36 @@ mic → STT(zh) → aggregator.user() → LLMContextFrame
   standard LangServe `/stream` contract; the probe + a possible 1-line SSE-parse tweak close the
   gap once it's up. **The SSE chunk shape is an assumption until verified.**
 - **TTFO < 8 s may not hold.** `gemma3:27b` on Ollama in Taiwan + a likely weather-retrieval step
-  may be slower than OpenRouter. Streaming first-token mitigates; measure with `scripts/measure`.
-- **No conversation memory** by design — each turn is an independent weather query. Acceptable for
-  the demo; revisit only if follow-up questions ("那後天呢?") need context.
+  may be slower than OpenRouter; a gated rewrite adds one short local-qwen hop on context-dependent
+  turns. Streaming first-token mitigates; measure with `scripts/measure`.
+- **GPU contention.** The 16 GB card is already ~13.4/16 used (MuseTalk + CosyVoice-vLLM); qwen2.5:3b
+  adds ~2.2 GB and ran 100% GPU in the test. Gating keeps rewrites rare + short, but if the avatar
+  stalls during a rewrite the escape hatch is pinning qwen to CPU (`OLLAMA`/`num_gpu 0`) — distill
+  is end-of-conversation so CPU is fine there regardless.
+- **Windows UTF-8 trap (verified).** Inline `curl -d` with Chinese, and `print()` to the cp1252
+  console, both corrupt the bytes (caused a false "model can't read Chinese" scare). All Chinese
+  must travel as real UTF-8 (httpx/JSON `.encode("utf-8")`); never inline-curl Chinese on Windows.
 
 ## Out of scope
 
-Intent routing (weather vs general), tool-calling, multi-provider blending, and any change to STT/
-TTS/avatar/sync. Reverting to general chat is a one-line `.env` flip (`LLM_PROVIDER=openrouter`).
+Intent routing (weather vs general), tool-calling, per-user memory keying, vector/embedding
+retrieval (the profile+summary is small enough to always load), and any change to STT/TTS/avatar/
+sync. Reverting to plain general chat is a one-line `.env` flip (`LLM_PROVIDER=openrouter`); memory
+off is `AVATAR_MEMORY=0`.
+
+## Validation (done 2026-06-23, before build)
+
+Local `qwen2.5:3b` via Ollama `/v1` (clean UTF-8 over httpx):
+- continuity: "那台中呢？" + (lives Taipei, prior "明天台北市會下雨嗎？") → **"明天台中會下雨嗎？"** ✓
+- profile-fill: "明天會很熱嗎？" + (lives Kaohsiung) → **"明天高雄市會很熱嗎？"** ✓
+The earlier garbled outputs were the Windows UTF-8 trap, not the model.
 
 ## Testing / verification
 
 - `python -m scripts.preflight` — imports resolve with no keys/network.
 - `python scripts/probe_weather_chain.py` — confirm live SSE shape (when reachable).
-- Live: `LANGUAGE=zh LLM_PROVIDER=weather_chain`, open `/client/`, ask a Chinese weather question,
-  confirm the avatar speaks the answer; check `[TTFO]` in `pipeline.log` and `scripts/measure`.
+- A small memory unit test: seed `profile.json`, feed an elliptical utterance, assert the rewrite
+  fills it; run `distill` over a fake session, assert profile/summary update + `session.jsonl` clear.
+- Live: `LANGUAGE=zh LLM_PROVIDER=weather_chain AVATAR_MEMORY=1`, open `/client/`, ask a Chinese
+  weather question + a follow-up ("那台中呢?"), confirm the avatar resolves it; disconnect, reopen,
+  confirm the greeting/profile reflects the prior chat. Check `[TTFO]` + `scripts/measure`.
