@@ -220,3 +220,72 @@ error.
 **Fix.** `TTS_PROVIDER` switch in `pipeline/stages/tts.py` — `deepgram` builds Deepgram Aura
 (English-only) as a fallback; `cosyvoice` (default) and `elevenlabs` remain. A deliberate single
 fallback switch, not a return to multi-provider branching.
+
+---
+
+## P9 — On long replies the avatar (lips) finishes ~1–2 s BEFORE the voice ✅ FIXED (2026-06-23)
+
+**Symptom.** On longer answers the mouth stopped moving / settled to neutral while the voice kept
+talking for the last ~1–2 s. Short replies looked fine. The gap scaled with reply length. Only
+appeared after `MUSETALK_FPS` was lowered to 12.
+
+**Investigation.** Matched the server's per-turn `[stream] turn rendered N` against the client's
+audio for the same turn:
+
+| Audio (TTS) | Lip frames rendered | Needed @12fps | Lips short by |
+|---|---|---|---|
+| 13.48 s | **141** | 161 | ~1.7 s |
+| 12.52 s | **132** | 150 | ~1.5 s |
+
+The server's own warmup log gave it away: `MuseTalk warmup done … (7 frames/segment)` — `SEG_FRAMES=8`
+but each segment rendered **7**. The client's `[avatar timing] end drift` is *misleading* here (it
+counts held + `END_TAIL` neutral frames as "video", so it under-reports the gap); the reliable
+signal is the server's `turn rendered N` vs `audio_sec × fps`.
+
+**Root cause.** The server sized each render segment as `int(16000/fps) · SEG_FRAMES`, but the
+renderer counts frames as `floor(len/sr · fps)` (`audio_processor.get_whisper_chunk`). `int(16000/12)`
+truncates `1333.33 → 1333`, so an 8-frame batch measures `floor(7.998) = 7` — **one lip frame lost
+per segment**, accumulating ~12.5% over a turn. It only bites at fps that don't divide 16000 evenly,
+so **lowering `MUSETALK_FPS` to 12 introduced it** (at the old default 20, `16000/20 = 800` exact → no
+loss). The `speech_end` tail-pad (`(-len) % spf`) had the same truncation on the final syllable.
+
+**Fix.** `MuseTalkEngine.samples_for_frames(n) = ceil(n · 16000 / fps)` (`app.py`) — size each segment
+to the frame's *upper* sample boundary so `floor()` lands on exactly `SEG_FRAMES` for any fps. Wired
+into all four audio→frame sizing sites: stream init, the `config` handler, `_warmup`, and the
+`speech_end` tail-pad. Frame count is now `= audio_sec × fps` end-to-end. **`MUSETALK_FPS` should
+divide 16000** (8/10/12.5/16/20/25…); the fix makes 12 correct anyway.
+
+**Verified (live, fps=12).** Warmup `7 → 8 frames/segment`; a 13.56 s reply rendered **163** lip
+frames (was 141) = its full audio length, so the lips end with the voice. Deterministic repro (no
+GPU): `archive/_frame_deficit_repro_test.py` (old=142 ≈ the observed 141, new=162). Live driver:
+`scripts/_verify_frame_count.py <wav> <fps>`.
+
+---
+
+## P10 — A fraction-of-a-second of leftover audio plays ~1–2 s AFTER the turn ⏸️ KNOWN ISSUE (fix reverted by preference, 2026-06-23)
+
+> **Status: NOT applied in this baseline.** A fix was implemented and verified, then the user judged
+> the prior behavior better and rolled it back. Root cause + the candidate fix are kept below for if we
+> revisit. To re-apply: change `int()` → `ceil()` in `musetalk_video.py::_advance` (see **Fix**).
+
+**Symptom.** After the voice finished, ~1–2 s of silence, then a brief (<~0.1 s) fragment of the
+turn's audio played. Worse after `MUSETALK_END_TAIL_FRAMES` was raised to 10.
+
+**Root cause.** Steady mode releases each buffered audio chunk paired with the rendered frame whose
+time covers it (`musetalk_video.py::_advance`/`_emit_pair`). `_advance` capped the release cursor at
+`audio_cap = int(audio_clock·fps) + 1` — **`int()` = floor**. A turn's audio length is rarely a whole
+number of frames (13.56 s × 12 = 162.72), so the last real frame paired audio only up to
+`floor(162.72)/12 = 13.5 s`, stranding the final **sub-frame** (0.06 s). The same floor cap stopped
+the END_TAIL frames from releasing it, so it waited for `_drain_audio()` at the `video_end` marker —
+which the server delays by END_TAIL (10 frames = 0.83 s) + `idle_grace` (0.3 s) ≈ **1.1 s**. So the
+stranded sub-frame played ~1–2 s late as a blip. (P9's frame-count fix made the lips end on time but
+left this sub-frame remainder, which this exposed.)
+
+**Candidate fix (reverted).** `audio_cap = ceil(audio_clock·fps) + 1` (`musetalk_video.py::_advance`).
+`ceil` makes the trailing frame reachable, so the last sub-frame of audio releases paired with the
+trailing/END_TAIL frame (~one frame later, contiguous) instead of waiting for the delayed drain. Costs
+one frame of look-ahead, which only binds at end-of-turn (mid-turn the binding cap is the rendered-frame
+count) and which TTS — running ahead of real-time — has already buffered. It was verified with a
+deterministic repro (a 13.56 s turn stranded **1** audio chunk to the drain before, **0** after), then
+reverted because the user preferred the prior behavior. Re-apply if the blip is judged worse than
+whatever motivated the rollback.

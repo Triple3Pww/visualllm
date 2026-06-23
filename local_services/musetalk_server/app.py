@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import pickle
 import sys
@@ -340,8 +341,7 @@ class MuseTalkEngine:
         """
         import time as _t
         try:
-            spf = self.samples_per_frame(self.fps)
-            seg = np.zeros(spf * SEG_FRAMES, dtype=np.float32)   # ~SEG_FRAMES of silence
+            seg = np.zeros(self.samples_for_frames(SEG_FRAMES), dtype=np.float32)   # ~SEG_FRAMES of silence
             t0 = _t.time()
             n = 0
             for _ in range(2):   # 1st call compiles/autotunes; 2nd confirms the warm path
@@ -357,6 +357,19 @@ class MuseTalkEngine:
     # --- realtime inference ----------------------------------------------
     def samples_per_frame(self, fps: int) -> int:
         return int(AUDIO_SR / fps)
+
+    def samples_for_frames(self, n_frames: int, fps: int | None = None) -> int:
+        """Samples that render to EXACTLY n_frames lip frames.
+
+        The renderer counts frames as floor(len/sr*fps) (get_whisper_chunk). Sizing a
+        segment as int(sr/fps)*n (the old way) TRUNCATES sr/fps -- at fps that don't
+        divide 16000 (e.g. 12: sr/fps=1333.33->1333) an 8-frame segment lands at
+        floor(7.998)=7, losing one lip frame PER segment. Over a long reply that ~12.5%
+        deficit accumulates and the avatar finishes ~1-2s before the audio. Sizing to the
+        frame's UPPER sample boundary (ceil) keeps floor() at exactly n_frames for any fps
+        (it was only ever correct at fps that divide 16000, e.g. the old default 20)."""
+        f = int(fps if fps is not None else self.fps)
+        return math.ceil(n_frames * AUDIO_SR / f)
 
     def reset_idx(self):
         self.idx = 0
@@ -529,8 +542,7 @@ async def stream(ws: WebSocket):
     if _active_closed is not None:
         _active_closed.set()
     fps = engine.fps
-    spf = engine.samples_per_frame(fps)
-    seg_samples = spf * SEG_FRAMES
+    seg_samples = engine.samples_for_frames(SEG_FRAMES, fps)   # ceil-sized: exactly SEG_FRAMES/seg
     audio_buf = np.zeros(0, dtype=np.float32)
     # Bounded queue of rendered frames; the pump drains it at a STEADY fps.
     out_q: asyncio.Queue = asyncio.Queue(maxsize=600)
@@ -671,8 +683,7 @@ async def stream(ws: WebSocket):
                 if kind == "config":
                     fps = int(evt.get("fps", fps))
                     engine.fps = fps
-                    spf = engine.samples_per_frame(fps)
-                    seg_samples = spf * SEG_FRAMES
+                    seg_samples = engine.samples_for_frames(SEG_FRAMES, fps)
                     logger.info(f"[stream] config: fps={fps}")
                 elif kind == "speech_start":
                     turn_frames = 0
@@ -682,7 +693,13 @@ async def stream(ws: WebSocket):
                     # Render the FINAL audio even if it's less than a full segment (pad up to one
                     # frame) so the last word/syllable isn't dropped -- the "cut at the end".
                     if kind == "speech_end" and len(audio_buf) > 0:
-                        pad = (-len(audio_buf)) % spf
+                        # Pad the trailing remainder UP to a whole frame's worth so the last
+                        # partial frame renders instead of being floor()'d away (the dropped
+                        # final syllable). Use the SAME ceil sizing as the main loop so the
+                        # frame count stays = audio_seconds*fps end-to-end (no early finish).
+                        f_final = max(1, math.ceil(len(audio_buf) / AUDIO_SR * fps))
+                        seg_len = engine.samples_for_frames(f_final, fps)
+                        pad = max(0, seg_len - len(audio_buf))
                         seg = (
                             np.concatenate([audio_buf, np.zeros(pad, np.float32)])
                             if pad else audio_buf
