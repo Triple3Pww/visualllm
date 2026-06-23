@@ -536,7 +536,8 @@ git commit -m "feat(memory): pure rewrite-gating heuristic"
 - Consumes: `needs_rewrite()`, `recall()`, `self.profile`, `self.summary`, `self.session` (Tasks 3–4).
 - Produces:
   - `async build_query(self, raw: str) -> str` — gated rewrite; returns a self-contained zh query, or `raw` on skip/failure.
-  - `async distill_and_save(self) -> None` — update profile + summary from the session via qwen, persist, reset session.
+  - `async distill_and_save(self) -> None` — distill the live session into profile + summary, persist, reset session (end of conversation).
+  - `async distill_pending(self) -> None` — startup recovery: distill any turns left in `session.jsonl` by a crashed prior run, then clear (instant no-op when none).
   - `async aclose(self) -> None` — close the httpx client.
 
 - [ ] **Step 1: Write the failing (live) test**
@@ -572,6 +573,20 @@ async def run() -> None:
     raw = "明天會下雨嗎？"
     assert await bad.build_query(raw) == raw
     await bad.aclose()
+
+    # startup recovery: a leftover session.jsonl is distilled + cleared, never raises
+    import json
+    from pathlib import Path
+    d3 = tempfile.mkdtemp()
+    Path(d3, "session.jsonl").write_text(
+        json.dumps({"user": "我住在台南市", "bot": "好的", "ts": 0}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    m3 = MemoryStore(base_dir=d3, enabled=True,
+                     llm_url="http://localhost:11434/v1", llm_model="qwen2.5:3b-cpu")
+    await m3.distill_pending()
+    assert Path(d3, "session.jsonl").read_text(encoding="utf-8") == ""  # cleared
+    await m3.aclose()
     print("PASS _memory_rewrite_test")
 
 
@@ -636,12 +651,13 @@ Add `import httpx` and `import re` at the top, then these methods on `MemoryStor
         return out or raw
 
     # ---- harness: distill the conversation into durable memory ----
-    async def distill_and_save(self) -> None:
-        if not self.enabled or not self._llm_url or not self.session:
+    async def _distill_turns(self, turns: list[dict]) -> None:
+        """Fold a list of turns into the profile + summary via local qwen, then save.
+        Shared by end-of-conversation (distill_and_save) and startup recovery
+        (distill_pending). Never raises -- memory must not break the app."""
+        if not self.enabled or not self._llm_url or not turns:
             return
-        convo = "\n".join(
-            f"使用者：{t['user']}\n助理：{t['bot']}" for t in self.session
-        )
+        convo = "\n".join(f"使用者：{t['user']}\n助理：{t['bot']}" for t in turns)
         prompt = (
             "你是記憶整理助手。讀下面的對話，更新使用者記憶。"
             "只輸出一個 JSON，欄位：name、default_city、preferences(陣列)、summary(繁體中文一段話)。"
@@ -665,6 +681,40 @@ Add `import httpx` and `import re` at the top, then these methods on `MemoryStor
                 logger.info("memory distilled + saved")
         except Exception as e:  # noqa: BLE001
             logger.warning(f"distill failed ({type(e).__name__}); memory unchanged")
+
+    async def distill_and_save(self) -> None:
+        """End of conversation: distill the live session, then clear it + close."""
+        try:
+            await self._distill_turns(self.session)
+        finally:
+            self.reset_session()
+            await self.aclose()
+
+    def _read_session_file(self) -> list[dict]:
+        """Leftover turns persisted live by record_turn (survive a hard crash)."""
+        if not self.enabled or not self._session_path.exists():
+            return []
+        turns = []
+        for line in self._session_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                turns.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        return turns
+
+    async def distill_pending(self) -> None:
+        """Startup recovery: if a prior run crashed without a clean disconnect,
+        session.jsonl still holds its turns. Fold them in + clear so the next
+        conversation starts clean. Instant no-op when nothing is pending."""
+        pending = self._read_session_file()
+        if not pending:
+            return
+        logger.info(f"recovering {len(pending)} pending memory turn(s) from a prior session")
+        try:
+            await self._distill_turns(pending)
         finally:
             self.reset_session()
             await self.aclose()
@@ -990,8 +1040,14 @@ Replace the `llm = build_llm(config)` line (~line 51) with:
             enabled=True,
         )
         logger.info(f"Avatar memory ON (model={config.memory_llm_model}, gated={config.memory_llm_gated}).")
+        # Startup recovery: fold in any turns a crashed prior session left behind
+        # (instant no-op on a normal boot -- session.jsonl is empty). Runs before any
+        # client connects, so the next conversation starts from a clean session.
+        await memory.distill_pending()
     llm = build_llm(config, memory)
 ```
+
+(This `await` requires the surrounding `run_bot`/bot function to be `async` — it is; the memory block sits in the same async body as the existing `await PipelineRunner().run(task)`.)
 
 - [ ] **Step 2: Update the startup log line**
 
@@ -1182,6 +1238,7 @@ git commit -m "chore(weather): SSE probe, .env docs, ignore state dir"
 - Req 1 (replace LLM with weather chain) → Tasks 2, 6, 7, 8. ✓
 - Req 2 (Chinese) → `LANGUAGE=zh` doc (Task 9) + zh prompts/greeting (Tasks 5, 8). ✓
 - Req 3 components 6–9 (MemoryStore, gated rewrite, distill, config+degradation) → Tasks 1, 3, 4, 5, 8. ✓
+- Crash-safe memory (distill on clean disconnect AND recover leftover session on next startup) → `distill_and_save` + `distill_pending` (Task 5), wired in Task 8. ✓
 - Fully-local CPU qwen → Tasks 1 (defaults), 5, 9 (model). ✓
 - Probe + SSE-assumption hedge → Tasks 2, 9. ✓
 - Graceful degradation → try/except in Tasks 5, 6, 8; disabled-store inert (Task 3). ✓
