@@ -1,12 +1,21 @@
-"""Speech-to-text: Deepgram streaming (nova-2). Switches model language by config
-so the same provider serves the English prototype, the zh-TW target, and the Thai
-(th) live-character validation."""
+"""Speech-to-text. Default: Deepgram streaming (nova-2), switching model language by
+config so one provider serves the English prototype, the zh-TW target, and the Thai
+(th) live-character validation. Fallback: STT_PROVIDER=funasr -> a local OFFLINE
+SenseVoice-Small server (CPU, ~0 VRAM) for a fully-local zh-TW stack. Deliberate
+fallback switch, not multi-provider branching."""
 from __future__ import annotations
 
 from pipeline.config import Config
 
 
 def build_stt(cfg: Config):
+    if cfg.stt_provider == "funasr":
+        # Local OFFLINE SenseVoice-Small on CPU (~0 VRAM). The server returns
+        # Traditional (zh-TW) text via OpenCC, so no pipeline-side conversion.
+        from local_services.funasr_stt import FunasrSTTService
+
+        return FunasrSTTService(base_url=cfg.funasr_url)
+
     from pipecat.services.deepgram.stt import DeepgramSTTService
 
     if cfg.is_thai:
