@@ -60,12 +60,20 @@ class Config:
     deepgram_api_key: str | None = _get("DEEPGRAM_API_KEY")
 
     # --- STT provider switch (deliberate fallback switch, like TTS_PROVIDER) ---
-    # deepgram = cloud streaming (default, interim partials); funasr = local OFFLINE
-    # SenseVoice-Small on CPU (zh-TW via server-side OpenCC), ~0 VRAM. One flip reverts.
+    # deepgram = cloud streaming (default, interim partials);
+    # sherpa   = local OFFLINE STREAMING (sherpa-onnx zipformer bilingual zh-en, CPU/~0 VRAM,
+    #            drives turn-taking from its own ASR endpoint detector -- robust to a quiet mic);
+    # funasr   = local OFFLINE SEGMENTED (SenseVoice-Small server; needs the energy-VAD to fire).
     stt_provider: str = (_get("STT_PROVIDER", "deepgram") or "deepgram").lower()
     funasr_url: str = _get("FUNASR_URL", "http://localhost:8004") or "http://localhost:8004"
     funasr_model: str = _get("FUNASR_MODEL", "iic/SenseVoiceSmall") or "iic/SenseVoiceSmall"
     funasr_device: str = _get("FUNASR_DEVICE", "cpu") or "cpu"
+    # sherpa: local streaming model dir + whether to convert zh output to Traditional (zh-TW).
+    sherpa_model_dir: str = _get(
+        "SHERPA_MODEL_DIR",
+        "models/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20",
+    ) or "models/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20"
+    sherpa_traditional: bool = (_get("SHERPA_TRADITIONAL", "1") or "1").lower() in ("1", "true", "yes", "on")
 
     # --- LLM (OpenRouter: one key, any model via OPENROUTER_MODEL) ---
     openrouter_api_key: str | None = _get("OPENROUTER_API_KEY")

@@ -1,14 +1,26 @@
 """Speech-to-text. Default: Deepgram streaming (nova-2), switching model language by
 config so one provider serves the English prototype, the zh-TW target, and the Thai
-(th) live-character validation. Fallback: STT_PROVIDER=funasr -> a local OFFLINE
-SenseVoice-Small server (CPU, ~0 VRAM) for a fully-local zh-TW stack. Deliberate
-fallback switch, not multi-provider branching."""
+(th) live-character validation. Local fallbacks (fully offline, CPU, ~0 VRAM):
+  STT_PROVIDER=sherpa -> sherpa-onnx STREAMING zipformer (bilingual zh-en); drives
+    turn-taking from its own ASR endpoint detector, robust to a quiet/attenuated mic.
+  STT_PROVIDER=funasr -> SenseVoice-Small SEGMENTED server (needs the energy-VAD to fire).
+Deliberate fallback switches, not multi-provider branching."""
 from __future__ import annotations
 
 from pipeline.config import Config
 
 
 def build_stt(cfg: Config):
+    if cfg.stt_provider == "sherpa":
+        # Local OFFLINE STREAMING (sherpa-onnx, CPU, ~0 VRAM). Drives turn-taking from its
+        # own ASR endpoint detector, so it works even when the energy-VAD doesn't fire.
+        from local_services.sherpa_stt import SherpaStreamingSTTService
+
+        return SherpaStreamingSTTService(
+            model_dir=cfg.sherpa_model_dir,
+            to_traditional=cfg.sherpa_traditional,
+        )
+
     if cfg.stt_provider == "funasr":
         # Local OFFLINE SenseVoice-Small on CPU (~0 VRAM). The server returns
         # Traditional (zh-TW) text via OpenCC, so no pipeline-side conversion.
