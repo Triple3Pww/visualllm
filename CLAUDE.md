@@ -45,6 +45,9 @@ needs the card mostly free; if you restart cosyvoice *while MuseTalk already hol
 "No available memory for the cache blocks" (and raising util then trips "Free memory … less than desired").
 Clean recovery = stop all three → start cosyvoice on the near-empty card (`run_vllm_server.sh`) → then
 `scripts/run.ps1` (MuseTalk + pipeline). The launcher already does this order. (`docs/PROBLEMS-AND-FIXES.md` P15.)
+**Freeing VRAM (levers + what won't work): `docs/gpu-memory-notes.md`.** Key finding: much of the card's
+"used" is the Windows desktop/background apps (explorer, EdgeWebView, NVIDIA overlay, Razer…), not the
+pipeline — closing them reclaims VRAM for free. `run.ps1` sets `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.
 
 **Chinese voice starts ~1s later than English — known, unfixable on one GPU (`docs/PROBLEMS-AND-FIXES.md` P15).**
 CosyVoice's zh first-chunk TTFB is ~2.3s vs en ~1.1s (it emits a bigger opening stream chunk for zh). The
