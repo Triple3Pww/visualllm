@@ -82,6 +82,17 @@ class Config:
     openrouter_api_key: str | None = _get("OPENROUTER_API_KEY")
     openrouter_base_url: str = _get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
     openrouter_model: str = _get("OPENROUTER_MODEL", "google/gemini-2.5-flash-lite")
+    # Reasoning/"thinking" models (e.g. local qwen3.5:4b via Ollama) emit a long hidden
+    # reasoning pass before answering -> ~25-33s TTFB, fatal for realtime. Set this to
+    # "none" to disable thinking through the OpenAI /v1 endpoint (the ONLY mechanism that
+    # works on Ollama's /v1 -- think:false / chat_template_kwargs are ignored there; verified
+    # 2026-07-01: qwen3.5:4b 33s/3290tok -> 0.95s/38tok). Empty = don't send it (cloud models
+    # untouched). Goes into the OpenAI call's `extra` (base_llm.py merges it into create()).
+    openrouter_reasoning_effort: str = _get("OPENROUTER_REASONING_EFFORT", "") or ""
+    # Hard cap on reply length (max_completion_tokens). Spoken brevity lives in the system
+    # prompt, but some local models (qwen3.5:4b) ignore it and monologue -> an 18s reply that
+    # makes the avatar drift. This is the safety net. Empty = unset (cloud models untouched).
+    openrouter_max_tokens: int | None = int(_get("OPENROUTER_MAX_TOKENS", "0") or "0") or None
 
     # --- LLM provider switch (deliberate fallback switch, like TTS_PROVIDER) ---
     # weather_chain = a dedicated Chinese weather bot backed by the NCU LangServe
@@ -184,16 +195,18 @@ class Config:
         if self.is_mandarin:
             return (
                 "你是一個友善、簡潔的語音助理。"
-                "請用口語化、適合朗讀的方式回答，句子要短，"
-                "每次回覆都要簡短，最多 2-3 句；內容很多時先給簡短答案再問是否要繼續，不要長篇大論，"
+                "請用口語化、適合朗讀的方式回答，句子要短。"
+                "每次只回答一到兩句，最多三句，講完重點就立刻停止，絕對不要長篇大論；"
+                "內容很多時先給一句簡短答案，再問對方要不要聽更多。"
                 "避免使用表情符號、條列符號或特殊格式。"
             )
         return (
             "You are a friendly, concise voice assistant. Answer in a natural, "
-            "spoken style. Keep sentences short. Do not use emojis, bullet "
-            "points, or any special formatting — your text will be read aloud. "
-            "Keep every reply brief — at most 2-3 short sentences. If the topic is "
-            "big, give the short answer and offer to say more, rather than monologuing."
+            "spoken style. Do not use emojis, bullet points, or any special "
+            "formatting — your text will be read aloud. "
+            "Answer in one or two short sentences and then stop; never write more "
+            "than three. If the topic is big, give a one-sentence answer first and "
+            "ask if they want to hear more — never monologue."
         )
 
 

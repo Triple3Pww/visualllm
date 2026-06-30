@@ -22,9 +22,21 @@ def build_llm(cfg: Config, memory=None):
 
     from pipecat.services.openai.llm import OpenAILLMService
 
+    # `extra` is merged into the chat.completions.create() call (base_llm.py). For local
+    # reasoning models (qwen3.5:4b via Ollama /v1) we must pass reasoning_effort="none" or
+    # the model spends ~25-33s thinking before answering. Empty knob -> send nothing, so the
+    # cloud-gemini path is byte-for-byte unchanged.
+    extra = {}
+    if cfg.openrouter_reasoning_effort:
+        extra["reasoning_effort"] = cfg.openrouter_reasoning_effort
+
     # `model=` is deprecated; the model now lives in the `settings=` object.
+    settings_kw = dict(model=cfg.openrouter_model, extra=extra)
+    if cfg.openrouter_max_tokens:
+        # Hard length cap — the safety net for models that ignore the brevity prompt.
+        settings_kw["max_completion_tokens"] = cfg.openrouter_max_tokens
     return OpenAILLMService(
         api_key=cfg.openrouter_api_key,
         base_url=cfg.openrouter_base_url,
-        settings=OpenAILLMService.Settings(model=cfg.openrouter_model),
+        settings=OpenAILLMService.Settings(**settings_kw),
     )
