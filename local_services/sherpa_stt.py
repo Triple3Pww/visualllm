@@ -16,18 +16,22 @@ Model: sherpa-onnx streaming zipformer bilingual (k2-fsa), int8, downloaded unde
 """
 from __future__ import annotations
 
+import asyncio
 import os
 from typing import AsyncGenerator
 
 import numpy as np
 from loguru import logger
 from pipecat.frames.frames import (
+    BotStartedSpeakingFrame,
+    BotStoppedSpeakingFrame,
     Frame,
     InterimTranscriptionFrame,
     TranscriptionFrame,
     VADUserStartedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
 )
+from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.stt_service import STTService
 from pipecat.utils.time import time_now_iso8601
 
@@ -64,6 +68,7 @@ class SherpaStreamingSTTService(STTService):
         )
         self._stream = self._rec.create_stream()
         self._speaking = False
+        self._bot_speaking = False
         self._last_partial = ""
         self._cc = None
         if to_traditional:
@@ -74,21 +79,36 @@ class SherpaStreamingSTTService(STTService):
     def _conv(self, text: str) -> str:
         return self._cc.convert(text) if self._cc else text
 
-    async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame | None, None]:
-        # Called per audio frame (streaming). Feed it, decode what's ready, then act on
-        # the recognizer's partial result + endpoint state.
+    def _decode(self, audio: bytes) -> tuple[str, bool]:
+        """Feed one chunk + decode whatever is ready, returning (partial text, is_endpoint).
+        Pure CPU (the zipformer forward pass); runs in a thread so it never blocks the pipeline's
+        asyncio loop -- on this single-loop box, decoding inline starved the real-time TTS->avatar
+        audio pacing and pushed lip-start ~4s late (the decode is fast but fires on every mic frame,
+        so it monopolised loop time slices). sherpa-onnx releases the GIL in its C++ core, so the
+        loop runs free while this thread decodes. run_stt awaits this, so calls stay sequential ->
+        no concurrent access to the (non-thread-safe) recognizer/stream."""
         samples = np.frombuffer(audio, dtype=np.int16).astype(np.float32) / 32768.0
         self._stream.accept_waveform(self.sample_rate, samples)
         while self._rec.is_ready(self._stream):
             self._rec.decode_stream(self._stream)
-        text = self._rec.get_result(self._stream).strip()
+        return self._rec.get_result(self._stream).strip(), self._rec.is_endpoint(self._stream)
+
+    async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame | None, None]:
+        # Called per audio frame (streaming). PAUSE while the bot is speaking: don't feed/decode
+        # at all -- the user isn't talking then, and the avatar's own voice echoing into the mic
+        # would otherwise be transcribed as a phantom user turn. Also keeps the loop free for the
+        # render. The stream is reset on bot-stop (process_frame) so the next turn starts clean.
+        if self._bot_speaking:
+            return
+        text, is_endpoint = await asyncio.get_running_loop().run_in_executor(
+            None, self._decode, audio)
 
         # Speech onset: drive the user turn from the ASR (not the energy-VAD).
         if text and not self._speaking:
             self._speaking = True
             yield VADUserStartedSpeakingFrame()
 
-        if self._rec.is_endpoint(self._stream):
+        if is_endpoint:
             if text:
                 yield TranscriptionFrame(self._conv(text), "", time_now_iso8601())
             if self._speaking:
@@ -99,3 +119,18 @@ class SherpaStreamingSTTService(STTService):
         elif text and text != self._last_partial:
             self._last_partial = text
             yield InterimTranscriptionFrame(self._conv(text), "", time_now_iso8601())
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        # Track when the bot is speaking so run_stt can pause (above). Bot speaking frames are
+        # pushed UPSTREAM from the output transport, so they reach this stage; super() forwards them.
+        await super().process_frame(frame, direction)
+        if isinstance(frame, BotStartedSpeakingFrame):
+            self._bot_speaking = True
+        elif isinstance(frame, BotStoppedSpeakingFrame):
+            if self._bot_speaking:
+                self._bot_speaking = False
+                # Drop any stale partial captured around the bot's turn so the next user
+                # utterance starts from a clean stream.
+                self._rec.reset(self._stream)
+                self._speaking = False
+                self._last_partial = ""
