@@ -179,6 +179,17 @@ class MuseTalkEngine:
         self._build_idle_loop()
         self._ready = True
         self._warmup()   # pay the first-inference cost NOW so the first real turn isn't cold
+        # VRAM trim: warmup ran dummy segments to pay one-time cuDNN/kernel/alloc costs;
+        # that leaves reserved-but-unused blocks in PyTorch's caching allocator. Return
+        # them to the driver so the idle footprint reflects the real working set (this is
+        # where the measured ~8.7GB vs the model's ~4-6GB gap mostly hides). Best-effort:
+        # an empty_cache failure must never block the server coming up.
+        try:
+            if self.torch.cuda.is_available():
+                self.torch.cuda.synchronize()
+                self.torch.cuda.empty_cache()
+        except Exception:  # noqa: BLE001 -- cache release is best-effort
+            logger.exception("empty_cache after warmup failed (non-fatal).")
         logger.info(
             f"MuseTalk ready. {len(self.frame_cycle)} base frame(s) prepared; "
             f"{len(self._idle_loop)} idle frame(s)."
@@ -544,8 +555,12 @@ async def stream(ws: WebSocket):
     fps = engine.fps
     seg_samples = engine.samples_for_frames(SEG_FRAMES, fps)   # ceil-sized: exactly SEG_FRAMES/seg
     audio_buf = np.zeros(0, dtype=np.float32)
-    # Bounded queue of rendered frames; the pump drains it at a STEADY fps.
-    out_q: asyncio.Queue = asyncio.Queue(maxsize=600)
+    # Bounded queue of rendered frames; the pump drains it at a STEADY fps. A SMALLER
+    # cap is the documented SAFE lag lever for live mode: under GPU contention the render
+    # skips stale frames instead of letting the lips fall arbitrarily far behind the voice.
+    # Do NOT re-lock the voice to video (that froze it). 600 ~= 30s @20fps (effectively
+    # unbounded); tighten via MUSETALK_OUT_Q for a shorter max trail.
+    out_q: asyncio.Queue = asyncio.Queue(maxsize=int(os.getenv("MUSETALK_OUT_Q", "600")))
     closed = asyncio.Event()
     _active_closed = closed
     loop = asyncio.get_event_loop()

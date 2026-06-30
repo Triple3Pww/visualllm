@@ -35,19 +35,20 @@ PyTorch server is the fallback (set `COSYVOICE_URL=http://localhost:8001` + star
 notes + gotchas: the `project-visualllm-cosyvoice-vllm` memory.
 
 **Shared-GPU VRAM (why "won't talk" can mean CosyVoice crashed):** vLLM and MuseTalk share the one
-16GB card. vLLM's `gpu_memory_utilization` (env `COSYVOICE_VLLM_GPU_UTIL`, **default `0.3`**, set in
-the cosyvoice repo) must exceed vLLM's own ~4GB footprint or load crashes with "No available memory
-for the cache blocks" (the old hardcoded `0.2` = 3.26GB was too low). If the avatar shows but the bot
-is silent, first check `:8001` is actually up — the pipeline log shows "Cannot connect to host …:8001".
-Free VRAM (close a heavy GPU app) or nudge the util fraction; the "Available KV cache memory" log line
-must be positive. **LOAD ORDER MATTERS: start CosyVoice (vLLM) BEFORE MuseTalk.** At `gpu_util 0.3` vLLM
-needs the card mostly free; if you restart cosyvoice *while MuseTalk already holds ~5GB*, vLLM crashes
-"No available memory for the cache blocks" (and raising util then trips "Free memory … less than desired").
-Clean recovery = stop all three → start cosyvoice on the near-empty card (`run_vllm_server.sh`) → then
-`scripts/run.ps1` (MuseTalk + pipeline). The launcher already does this order. (`docs/PROBLEMS-AND-FIXES.md` P15.)
-**Freeing VRAM (levers + what won't work): `docs/gpu-memory-notes.md`.** Key finding: much of the card's
-"used" is the Windows desktop/background apps (explorer, EdgeWebView, NVIDIA overlay, Razer…), not the
-pipeline — closing them reclaims VRAM for free. `run.ps1` sets `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.
+16GB card. **After the 2026-06-30 trim the stack fits ~8.4GB working (was ~15.7GB) — see
+`docs/gpu-memory-notes.md` for the measured table.** vLLM's `gpu_memory_utilization` (env
+`COSYVOICE_VLLM_GPU_UTIL`, **default now `0.16`**, set in `run_vllm_server.sh`) plus
+`COSYVOICE_VLLM_MAX_LEN` (**default `2048`**) cap the KV reservation — short TTS prompts never need the
+old 32k-token default, so the util can sit far below the OBSOLETE "~0.25 floor" (set `0.12` to fit an
+8GB card; KV log must stay positive). If the avatar shows but the bot is silent, first check `:8001` is
+up — the pipeline log shows "Cannot connect to host …:8001". **LOAD ORDER MATTERS: start CosyVoice (vLLM)
+BEFORE MuseTalk.** Lower util now reserves less of the card, so this is *less* fragile than before, but
+the rule still holds. Clean recovery = stop all three → start cosyvoice on the near-empty card
+(`run_vllm_server.sh`) → then `scripts/run.ps1`. The launcher already does this order.
+(`docs/PROBLEMS-AND-FIXES.md` P15.) **Freeing more VRAM + the MuseTalk `empty_cache` trim + what
+DOESN'T work: `docs/gpu-memory-notes.md`.** Corrected findings: the Windows **desktop is only ~0.9GB**
+(closing apps reclaims almost nothing — earlier "close apps" claim was WRONG), and
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` (set by `run.ps1`) is a **no-op on Windows** (Linux-only).
 
 **Chinese voice starts ~1s later than English — known, unfixable on one GPU (`docs/PROBLEMS-AND-FIXES.md` P15).**
 CosyVoice's zh first-chunk TTFB is ~2.3s vs en ~1.1s (it emits a bigger opening stream chunk for zh). The
