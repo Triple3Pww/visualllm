@@ -56,6 +56,10 @@ are **deliberate fallback switches, not multi-provider branching**:
 - `TTS_PROVIDER` = `cosyvoice` (default) | `moss` (local MOSS-TTS-Realtime, `:8003`) | `elevenlabs` | `deepgram`.
 - `LLM_PROVIDER` = `openrouter` (default; point `OPENROUTER_BASE_URL` at `https://openrouter.ai/api/v1` for
   cloud or `http://localhost:11434/v1` for a local Ollama model) | `weather_chain` (NCU zh weather bot).
+- `STT_PROVIDER` = `deepgram` (default, cloud streaming) | `funasr` (local OFFLINE SenseVoice-Small server,
+  `:8004`, `funasr-stt` conda env, **CPU/~0 VRAM** — runs before the avatar render so no GPU contention;
+  returns zh-TW via server-side OpenCC. Segmented, +~0.3-1.5s vs Deepgram. `run.ps1` auto-starts `:8004`
+  when set). `local_services/funasr_server/app.py` (server) + `local_services/funasr_stt.py` (Pipecat wrapper).
 
 **The web config panel (`local_services/config_panel/`, `:7870`) is the easy way to change all of this**
 — it edits `.env` in place (preserving comments) and restarts the pipeline. Run it with the system

@@ -22,7 +22,8 @@
   .\scripts\run.ps1
 #>
 param(
-    [string]$MusetalkPython = "E:\miniconda3\envs\musetalk\python.exe"
+    [string]$MusetalkPython = "E:\miniconda3\envs\musetalk\python.exe",
+    [string]$FunasrPython = "E:\miniconda3\envs\funasr-stt\python.exe"
 )
 
 $ErrorActionPreference = "Stop"
@@ -58,6 +59,19 @@ Set-EnvFromDotenv "MUSETALK_FPS"
 Set-EnvFromDotenv "MUSETALK_LEAD_FRAMES"
 Set-EnvFromDotenv "MUSETALK_END_TAIL_FRAMES"
 Set-EnvFromDotenv "MUSETALK_IDLE_MOTION"
+
+# Offline-STT knobs -- the funasr server reads OS env ONLY (like the avatar server).
+$sttProvider = (Get-EnvVal "STT_PROVIDER")
+if (-not $sttProvider) { $sttProvider = "deepgram" }
+$sttProvider = $sttProvider.ToLower()
+if ($sttProvider -eq "funasr") {
+    Set-EnvFromDotenv "FUNASR_MODEL"
+    Set-EnvFromDotenv "FUNASR_DEVICE"
+}
+
+# Cut CUDA allocator fragmentation so the same TTS+avatar workload fits in less reserved
+# VRAM on the shared 16GB card (no behavior change; pure allocator hint).
+$env:PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True"
 
 function Test-PortBusy([int]$port) {
     # netstat (native), NOT Get-NetTCPConnection: the CIM cmdlet hangs tens of
@@ -102,6 +116,32 @@ for ($i = 0; $i -lt 60; $i++) {
 }
 if ($ok) { Write-Host "  musetalk ready." -ForegroundColor Green }
 else { Write-Host "  musetalk not healthy in ~120s; check logs\musetalk.err.log" -ForegroundColor Yellow }
+
+# 1b) Optional local OFFLINE STT (SenseVoice on CPU, ~0 VRAM) -- only when STT_PROVIDER=funasr.
+if ($sttProvider -eq "funasr") {
+    if (-not (Test-Path $FunasrPython)) {
+        Write-Host "ERROR: funasr-stt python not found at $FunasrPython (pass -FunasrPython <path>)." -ForegroundColor Red
+        exit 1
+    }
+    Write-Host "Starting funasr STT server -> logs\funasr.out.log"
+    $stt = Start-Process -FilePath $FunasrPython `
+        -ArgumentList '-u', '-m', 'uvicorn', 'local_services.funasr_server.app:app', '--host', '0.0.0.0', '--port', '8004' `
+        -WorkingDirectory $repo -NoNewWindow -PassThru `
+        -RedirectStandardOutput (Join-Path $logs "funasr.out.log") `
+        -RedirectStandardError  (Join-Path $logs "funasr.err.log")
+    $pids += $stt.Id
+    Write-Host ("  funasr PID {0}; waiting for SenseVoice to load (/health)..." -f $stt.Id)
+    $ok = $false
+    for ($i = 0; $i -lt 60; $i++) {
+        Start-Sleep -Seconds 2
+        try {
+            $h = Invoke-RestMethod -Uri "http://127.0.0.1:8004/health" -TimeoutSec 3
+            if ($h.status -eq 'ok') { $ok = $true; break }
+        } catch { }
+    }
+    if ($ok) { Write-Host "  funasr ready." -ForegroundColor Green }
+    else { Write-Host "  funasr not healthy in ~120s; check logs\funasr.err.log" -ForegroundColor Yellow }
+}
 
 # 2) Pipeline (serves /client at :7860).
 Write-Host "Starting pipeline -> logs\pipeline.out.log"

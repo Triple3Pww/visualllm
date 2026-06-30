@@ -161,6 +161,31 @@ server's module docstring. Run it **eager** (the default) to avoid recompile sta
 
 ---
 
+## 6.5 (Optional) Offline STT — SenseVoice on CPU
+
+By default STT is **Deepgram** (cloud). For a **fully-offline** stack, swap to a local
+**SenseVoice-Small** server (`local_services/funasr_server/app.py`, FunAudioLLM family,
+same as CosyVoice) — it runs on **CPU (system RAM), ~0 VRAM**, so it doesn't compete for
+the shared GPU. It returns **Traditional (zh-TW)** text via OpenCC.
+
+```bash
+# one-time: a `funasr-stt` conda env (Python 3.10/3.11) + its deps
+conda create -y -n funasr-stt python=3.11
+conda activate funasr-stt
+pip install -r local_services/funasr_server/requirements.txt
+# the model (~1GB) auto-downloads on first run; if the conda cert store blocks it,
+# set SSL_CERT_FILE to certifi's cacert.pem (same gotcha as MuseTalk/CosyVoice).
+```
+
+Then in `.env`: `STT_PROVIDER=funasr` (and `LANGUAGE=zh`). `scripts/run.ps1` auto-starts
+the server on **:8004** when `STT_PROVIDER=funasr`.
+
+> **Tradeoff (state it honestly):** fully offline + ~0 VRAM, but **segmented** (no interim
+> partials) and **+~0.3–1.5s** to first transcript on CPU vs Deepgram's streaming, and
+> zh-TW accuracy below nova-2. Deepgram stays the default; this is opt-in.
+
+---
+
 ## 7. Configure `.env`
 
 ```bash

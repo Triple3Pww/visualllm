@@ -74,10 +74,17 @@ only by `.env` (no provider-selection branching — see `CLAUDE.md`).
 `pipeline/stages/vad.py` (`build_vad_params`). Runs on the input audio to detect when you
 **stop** speaking, which ends the user turn and kicks STT's final transcript.
 
-### STT — Deepgram nova-2
-`pipeline/stages/stt.py`. Streams your mic audio to Deepgram over a websocket; emits
-interim + final transcripts. Language follows `LANGUAGE` (`en-US` / `zh-TW` / `th`). Needs
-`DEEPGRAM_API_KEY`.
+### STT — Deepgram nova-2 (default) / FunASR SenseVoice (local offline)
+`pipeline/stages/stt.py` switches on `STT_PROVIDER`:
+- **`deepgram`** (default): streams your mic audio to Deepgram over a websocket; emits
+  interim + final transcripts. Language follows `LANGUAGE` (`en-US` / `zh-TW` / `th`). Needs
+  `DEEPGRAM_API_KEY`.
+- **`funasr`** (local OFFLINE): a SenseVoice-Small server (`local_services/funasr_server/app.py`,
+  `funasr-stt` conda env, `:8004`) on **CPU (~0 VRAM)**. The Pipecat wrapper
+  (`local_services/funasr_stt.py`) buffers the utterance, POSTs the PCM, and emits the
+  **Traditional zh-TW** text the server returns (server-side OpenCC `s2twp`). Segmented (no
+  interim partials), +~0.3-1.5s on CPU. Knobs: `FUNASR_URL`, `FUNASR_MODEL`, `FUNASR_DEVICE`.
+  `run.ps1` auto-starts `:8004` when `STT_PROVIDER=funasr`.
 
 ### LLM — OpenRouter (cloud or local Ollama) / weather_chain
 `pipeline/stages/llm.py`. `LLM_PROVIDER=openrouter` builds an OpenAI-compatible client, so it points at
