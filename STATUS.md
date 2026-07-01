@@ -1,6 +1,35 @@
 # VisualLLm — Project Status & Next Steps
 
-_Last updated: 2026-06-30 (**LLM reverted to cloud (gemini-2.5-flash-lite)** per the 2026-06-29 plan — fixes the CPU-contention regression. Investigated a **Chinese-only voice-delay**: root cause is CosyVoice's zh first-chunk TTFB (~2.3s vs en ~1.1s), NOT the LLM/avatar — but the fix conflicts with the avatar on the shared GPU, so it's left UNRESOLVED, see the 2026-06-30 session below + P15. Previously (2026-06-29): MOSS-TTS option, web CONFIG PANEL, local-Ollama LLM mode.)_
+_Last updated: 2026-07-01 (**NEW BASELINE: TensorRT avatar (`MUSETALK_TRT=1`) is now default on `main`** — it fixes the shared-GPU long-turn A/V drift; LLM stays **cloud gemini-2.5-flash-lite**. See the 2026-07-01 session below.)_
+
+> **⭐ Baseline (2026-07-01) — the known-good config to return to:**
+> `MUSETALK_TRT=1` (TensorRT render, merged to `main`), `MUSETALK_SYNC_MODE=steady`, `MUSETALK_FPS=12`,
+> `MUSETALK_SIZE=256`, `MUSETALK_LEAD_FRAMES=14`, `MUSETALK_END_TAIL_FRAMES=0`, `MUSETALK_CLOSE_FADE_FRAMES=5`,
+> `MUSETALK_IDLE_MOTION=0`; **LLM = cloud** `OPENROUTER_BASE_URL=https://openrouter.ai/api/v1` +
+> `OPENROUTER_MODEL=google/gemini-2.5-flash-lite` (do NOT use a *thinking* model like `qwen3.5:4b` — it
+> returns empty `content`; `OPENROUTER_REASONING_EFFORT` is a dead knob the pipeline never reads);
+> `TTS_PROVIDER=cosyvoice` (WSL vLLM, `COSYVOICE_URL` = WSL IP). One-click: **`Run VisualLLm.exe`**.
+
+## ⭐ Session 2026-07-01: TensorRT avatar = new baseline (long-turn drift fixed)
+
+**Root-caused "avatar frames != audio frames" + "sync drift on long turns" by driving the MuseTalk
+server with real WAVs at prod fps (offline, no CosyVoice/WebRTC).** Findings: the RENDERED lip-frame
+count (server `video_clock`) DOES equal `audio*fps` (±1, the P9/P10 ceil pad is correct) — the "extra"
+frames are the pump's HELD/duplicate frames that keep the WebRTC track continuous whenever render dips
+below fps. Per 8-frame segment on the PyTorch path: gpu 259ms + composite ~120ms ≈ 389ms vs the 667ms
+real-time budget @12fps (~1.7x headroom), so ALONE it barely drifts (fixed +0.36s startup offset any
+length). The drift becomes length-scaling ONLY when render drops below 12fps — proven with a GPU compute
+hog (100% util, CosyVoice stand-in): PyTorch drifted `+0.37s(2.9s) -> +1.35s(5.5s) -> +3.94s(13.6s)`,
+render ~9fps. **So the long-turn drift is shared-GPU contention, NOT the frame math.**
+
+**Fix = TensorRT, now merged to `main` and default (`MUSETALK_TRT=1`).** Ported the prebuilt UNet+VAE TRT
+engines (were on `feat/offline-stt-sensevoice`). Measured: gpu 259->168ms, composite ~120->78ms,
+total/seg 389->~255ms (~1.5x; headroom 1.7x->2.6x). **Under the SAME 100% contention that drifted the
+PyTorch path +3.94s on the 13.6s reply, TRT holds drift FLAT at +0.36s at every length** (held frames
+50->4). Off unless `MUSETALK_TRT=1`; any engine-load failure falls back to PyTorch. Engines are
+GPU/driver-specific (~1.75GB, gitignored) — rebuild with `local_services/musetalk_server/trt_build.py`.
+Next cheap lever (no 2nd GPU): the composite is CPU PIL blending (~31% of render even with TRT) — move it
+to GPU. Structural fix remains a dedicated avatar GPU.
 
 > **See `WORKFLOW.md`** for the full end-to-end system workflow (the processes, the turn
 > flow, the avatar wire contract, running locally + remote, config reference).
