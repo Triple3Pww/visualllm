@@ -97,6 +97,13 @@ per-segment render ~389ms→~255ms so the avatar keeps ~12fps under CosyVoice's 
 contention — where the PyTorch path drifts seconds behind the voice on long turns. Engines live in
 `musetalk_server/trt_cache/` (~1.75GB, gitignored, GPU/driver-specific — rebuild with `trt_build.py`);
 any load failure silently falls back to PyTorch. `0` = PyTorch. `docs/PROBLEMS-AND-FIXES.md` P16),
+`MUSETALK_GPU_COMPOSITE` (**1** — runs the per-frame mask-blend + downscale on the GPU (torch) instead
+of CPU PIL/cv2: composite ~73ms→~11ms per 8-frame seg → total render 246→182ms (−26%, ceiling ~33→44fps).
+**Only active with `MUSETALK_TRT=1`** (the VAE output is already a GPU tensor there; the PyTorch path
+keeps the CPU composite). Output is pixel-identical — SSIM 1.0, ≤1 LSB vs the CPU path. Falls back to CPU
+if a crop_box runs off-frame. Code default off (opt-in); `app.py::_composite_gpu`. **Benchmarked: at 12fps
+it does NOT reduce A/V drift** (TRT already holds render ≥12fps, even under 100% GPU contention) — the win
+is reserve headroom + a freed CPU, judged by the live call. `docs/PROBLEMS-AND-FIXES.md` P17),
 `MUSETALK_LEAD_FRAMES` (**14, load-bearing** — lower starves the queue → freeze),
 `COSYVOICE_PACE_RATE` (1.3, in the cosyvoice server — caps voice production so it doesn't burst
 the shared GPU), `CLIENT_JITTER_BUFFER_MS` (raise only for a remote/WAN viewer),
@@ -155,6 +162,19 @@ python -m scripts._webrtc_probe --mic output/q_ai.wav --lead 8     # drives a tu
 E:\miniconda3\envs\musetalk\python.exe -m local_services.musetalk_server._capture output/q_ai.wav  # offline mp4
 # A/V-SYNCED offline capture (keeps ONLY real video_start..video_end frames, auto-detects frame size):
 E:\miniconda3\envs\musetalk\python.exe scripts\_capture_synced.py output/q_ai.wav
+
+# FRAMES-vs-AUDIO + DRIFT method (how the P16 numbers were measured; no CosyVoice/pipeline/WebRTC):
+# 1) start the MuseTalk server ALONE with the prod env (MUSETALK_TRT/FPS/SIZE from .env), MUSETALK_PROFILE=1
+#    for per-8-frame-segment cost (logs feat/whisper/gpu/composite ms -> is render >= the fps budget?).
+# 2) drive a WAV and read the THREE distinct counts + effective render fps:
+python -m scripts._drive_frames output/reply_concise.wav 12          # paced (default) | burst (pure render)
+#    - REAL rendered (server video_clock) = audio_sec*fps (+/-1)  <- lips are never short (P9/P10)
+#    - DELIVERED > that by the pump's HELD/duplicate frames (frozen frame kept when render < fps)
+#    - drift ~= audio_len * (1 - render_fps/fps); it only SCALES with turn length once render < fps
+# 3) reproduce the shared-GPU drift offline (CosyVoice stand-in) — prove MUSETALK_TRT=1 holds >=fps:
+E:\miniconda3\envs\musetalk\python.exe scripts\_gpu_contention_hog.py 4096   # run alongside step 2
+# GOTCHA: _drive_frames paces the feed with ABSOLUTE deadlines, NOT cumulative asyncio.sleep(0.02) —
+# on Windows the ~15ms timer granularity makes a cumulative-sleep feed ~40% slow and FAKES drift.
 
 # Remote-link isolation test (streams a rendered mp4 LIVE as MJPEG, no GPU/WebRTC) — isolate link vs render:
 python -m scripts.stream_live
