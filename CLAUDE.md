@@ -57,10 +57,22 @@ needs the card mostly free; if you restart cosyvoice *while MuseTalk already hol
 Clean recovery = stop all three → start cosyvoice on the near-empty card (`run_vllm_server.sh`) → then
 `scripts/run.ps1` (MuseTalk + pipeline). The launcher already does this order. (`docs/PROBLEMS-AND-FIXES.md` P15.)
 
-**Chinese voice starts ~1s later than English — known, unfixable on one GPU (`docs/PROBLEMS-AND-FIXES.md` P15).**
-CosyVoice's zh first-chunk TTFB is ~2.3s vs en ~1.1s (it emits a bigger opening stream chunk for zh). The
-`COSYVOICE_FIRST_HOP` knob cuts it but its extra GPU work starves the avatar render (lips ~2s→~8s) — do NOT
-enable it. Fast zh TTS and a smooth avatar conflict on the shared GPU; the real fix is a dedicated avatar GPU.
+**Chinese first-chunk is slower than English, and the two languages want DIFFERENT TTFO levers
+(2026-07-03).** CosyVoice's zh first-chunk TTFB is ~2.3s vs en ~1.1s — Chinese commits to a *bigger opening
+stream chunk*. The two levers, and why each fits one language:
+- **`COSYVOICE_FIRST_HOP=5` (baseline, set in the cosyvoice repo's `run_vllm_server.sh`) = the zh lever.**
+  It emits the first audio after fewer speech tokens, capping zh's big opening → zh first-chunk ~2.5s→~1.8s,
+  whole natural sentences. The old "do NOT enable — starves the avatar (lips 2s→8s)" verdict was **pre-TensorRT**;
+  with `MUSETALK_TRT=1` the render holds ≥12fps under the extra load, so hop=5 no longer starves. It does NOT
+  help English (en's opening is already small; en's sentences are *long*, and hop must wait for the whole
+  sentence) and is harmless there (the split feeds en short clauses anyway).
+- **`COSYVOICE_FIRST_PIECE` (the first-clause split, `.env`) = the en lever.** en's long sentences benefit
+  from starting speech on the first *clause* early — which hop can't do. It's a near-no-op for zh (zh sentences
+  are shorter than its char thresholds; forcing a small zh split cuts mid-word — 天氣預|報 — and was rejected).
+
+They coexist for free: the split only fires on long (en) sentences, hop=5 only bites short (zh) ones. The
+residual "zh starts a bit later than en" is intrinsic to the bigger zh opening; a dedicated avatar GPU is the
+only way to also spend GPU on an even more aggressive hop without any render risk.
 
 Each stage is a thin single-provider factory in `pipeline/stages/` chosen by `.env` — these
 are **deliberate fallback switches, not multi-provider branching**:

@@ -20,11 +20,16 @@ via the first-clause TTS split — `COSYVOICE_FIRST_PIECE=1`, now baseline.)_
 > (`CosyVoice/asset/pro_ref.wav`, the default in `tts_engine.py`) — naturally fluid zh (~1 pause/sentence,
 > ~64% voiced ≈ English). The zh pause-trimmer is OFF by default (`COSYVOICE_SILENCE_CAP_S=0`; not needed with
 > the pro voice). One-click: **`Run VisualLLm.exe`**.
-> **TTFO (2026-07-02):** `COSYVOICE_FIRST_PIECE=1` (MIN=18/MAX=32) — emit a short opening clause to TTS
-> first, then normal sentences. CosyVoice's first-chunk TTFB scales with the input sentence length, so the
-> LLM's long opener was the biggest TTFO cost; splitting cut TTS first-chunk ~3.0s→~1.7s and **TTFO
-> ~4.6s→~3.2s** with smooth flow (delivered audio gap ~55ms, never a stall). Code:
-> `local_services/first_piece_aggregator.py` (gated; `=0` reverts to plain sentence aggregation).
+> **TTFO — per-language levers (2026-07-03):**
+> **English → the split** `COSYVOICE_FIRST_PIECE=1` (MIN=18/MAX=32, `.env`) — emit a short opening clause to
+> TTS first, then normal sentences. en's long sentences make the early-clause start worth **TTFO ~4.6s→~3.2s**,
+> smooth (gap ~55ms). Code: `local_services/first_piece_aggregator.py` (gated; `=0` = plain aggregation).
+> **Chinese → FIRST_HOP** `COSYVOICE_FIRST_HOP=5` (set in the cosyvoice repo's `run_vllm_server.sh`) — emits
+> the first audio after fewer speech tokens, capping zh's bigger opening → zh first-chunk **~2.5s→~1.8s**, whole
+> natural sentences, no avatar starvation (TensorRT holds ≥12fps; the old pre-TRT "starves" verdict is void).
+> They coexist: the split only fires on long en sentences, hop=5 only bites short zh ones. (Splitting zh was
+> tried and rejected — it cuts mid-word, 天氣預|報, with no TTFO win.) The LLM cloud-hop variance now dominates
+> worst-case end-to-end TTFO in both languages (a separate, deferred lever).
 
 ## ⭐ Session 2026-07-02: Chinese TTS fixed (RAS restored + fluid "pro" voice)
 
