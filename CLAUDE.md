@@ -34,6 +34,17 @@ cause of the avatar lip-lag. The pipeline reaches it via `COSYVOICE_URL` set to 
 PyTorch server is the fallback (set `COSYVOICE_URL=http://localhost:8001` + start it). Full build
 notes + gotchas: the `project-visualllm-cosyvoice-vllm` memory.
 
+**Chinese TTS fix (2026-07-02, baked into the cosyvoice repo — `docs/PROBLEMS-AND-FIXES.md` P18):** running
+the LLM on vLLM had **dropped CosyVoice's repetition-aware sampling (RAS)**, so zh intermittently looped on
+the silence token → a ~4s sentence became ~12s of dead silence (heard as "halting" speech; the avatar kept
+moving through the silence). Fixed by **restoring RAS as a vLLM logits processor**
+(`CosyVoice/cosyvoice/vllm/ras_logits_processor.py` + `top_p=0.8` in `llm.py`; vLLM's own
+`repetition_penalty` CANNOT be used — it CUDA-asserts on the `prompt_embeds` input). Separately, the zh
+voice was choppy vs en purely because of the **reference clip** (`zero_shot` clones its rhythm); the baseline
+now uses the fluid **"pro" AI-assistant voice** (`CosyVoice/asset/pro_ref.wav`, default in `tts_engine.py`) →
+zh ≈ English pacing. An optional zh pause-trimmer (`COSYVOICE_SILENCE_CAP_S`, `_squeeze_silence`) is **OFF by
+default** (not needed with the pro voice). Swap voices via `COSYVOICE_PROMPT_WAV`/`COSYVOICE_PROMPT_TEXT`.
+
 **Shared-GPU VRAM (why "won't talk" can mean CosyVoice crashed):** vLLM and MuseTalk share the one
 16GB card. vLLM's `gpu_memory_utilization` (env `COSYVOICE_VLLM_GPU_UTIL`, **default `0.3`**, set in
 the cosyvoice repo) must exceed vLLM's own ~4GB footprint or load crashes with "No available memory

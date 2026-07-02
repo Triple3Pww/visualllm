@@ -1,14 +1,62 @@
 # VisualLLm — Project Status & Next Steps
 
-_Last updated: 2026-07-01 (**NEW BASELINE: TensorRT avatar (`MUSETALK_TRT=1`) is now default on `main`** — it fixes the shared-GPU long-turn A/V drift; LLM stays **cloud gemini-2.5-flash-lite**. See the 2026-07-01 session below.)_
+_Last updated: 2026-07-02 (**Chinese TTS fixed**: the broken/"halting" zh voice was CosyVoice-on-vLLM
+losing its repetition guard — restored RAS in the vLLM sampler; and swapped the zh reference to a naturally
+fluid "pro" voice so zh is now as smooth as English. See the 2026-07-02 session below. Avatar baseline
+unchanged: TensorRT `MUSETALK_TRT=1`, LLM cloud gemini-2.5-flash-lite.)_
 
-> **⭐ Baseline (2026-07-01) — the known-good config to return to:**
-> `MUSETALK_TRT=1` (TensorRT render, merged to `main`), `MUSETALK_SYNC_MODE=steady`, `MUSETALK_FPS=12`,
-> `MUSETALK_SIZE=256`, `MUSETALK_LEAD_FRAMES=14`, `MUSETALK_END_TAIL_FRAMES=0`, `MUSETALK_CLOSE_FADE_FRAMES=5`,
-> `MUSETALK_IDLE_MOTION=0`; **LLM = cloud** `OPENROUTER_BASE_URL=https://openrouter.ai/api/v1` +
-> `OPENROUTER_MODEL=google/gemini-2.5-flash-lite` (do NOT use a *thinking* model like `qwen3.5:4b` — it
-> returns empty `content`; `OPENROUTER_REASONING_EFFORT` is a dead knob the pipeline never reads);
-> `TTS_PROVIDER=cosyvoice` (WSL vLLM, `COSYVOICE_URL` = WSL IP). One-click: **`Run VisualLLm.exe`**.
+> **⭐ Baseline (2026-07-02) — the known-good config to return to:**
+> **Avatar:** `MUSETALK_TRT=1` (TensorRT render, merged to `main`), `MUSETALK_GPU_COMPOSITE=1` (GPU per-frame
+> blend, opt-in; needs TRT), `MUSETALK_SYNC_MODE=steady`, `MUSETALK_FPS=12`, `MUSETALK_SIZE=256`,
+> `MUSETALK_LEAD_FRAMES=14`, `MUSETALK_END_TAIL_FRAMES=0`, `MUSETALK_CLOSE_FADE_FRAMES=5`, `MUSETALK_IDLE_MOTION=0`.
+> **LLM = cloud** `OPENROUTER_BASE_URL=https://openrouter.ai/api/v1` + `OPENROUTER_MODEL=google/gemini-2.5-flash-lite`
+> (do NOT use a *thinking* model like `qwen3.5:4b` — it returns empty `content`; `OPENROUTER_REASONING_EFFORT`
+> is a dead knob the pipeline never reads).
+> **TTS = `TTS_PROVIDER=cosyvoice`** (WSL vLLM, `COSYVOICE_URL` = WSL IP). The CosyVoice repo
+> (`E:\Claude\cosyvoice-local-tts`) now bakes in two zh fixes (in code, not `.env`): **(1) RAS restored in the
+> vLLM sampler** (`CosyVoice/cosyvoice/vllm/ras_logits_processor.py` + `top_p=0.8` in `llm.py`) — stops the
+> intermittent silence-loop that made zh "halting"; **(2) the "pro" AI-assistant reference voice**
+> (`CosyVoice/asset/pro_ref.wav`, the default in `tts_engine.py`) — naturally fluid zh (~1 pause/sentence,
+> ~64% voiced ≈ English). The zh pause-trimmer is OFF by default (`COSYVOICE_SILENCE_CAP_S=0`; not needed with
+> the pro voice). One-click: **`Run VisualLLm.exe`**.
+
+## ⭐ Session 2026-07-02: Chinese TTS fixed (RAS restored + fluid "pro" voice)
+
+**Symptom:** zh sounded broken ("like autism speaking" — long unnatural pauses) and the avatar kept
+moving after the voice ended; **English was perfect**. Both were ONE TTS bug, not the avatar/steady/GPU.
+
+**Root cause (proven offline via `/tts/stream`, concatenated-PCM analysis):** CosyVoice2's LLM runs on
+**vLLM** here (the latency fix), and the vLLM decode path does its own sampling — it **dropped CosyVoice's
+repetition-aware sampling (RAS)**. RAS (native PyTorch path, `cosyvoice/utils/common.py`) bans a speech
+token that just recurred in the last ~10 tokens; without it the model intermittently **loops on the silence
+token** — the SAME short zh sentence came out ~4s clean one run and **~12s with ~5s of dead silence** the
+next (~40% of zh runs). That silence *is* both symptoms: the pauses = "halting" voice; MuseTalk renders
+frames for the whole 12s (idle mouth) while the words are ~4s = "avatar keeps moving". zh uses
+`inference_zero_shot` (denser tokens) and hits it; en uses `cross_lingual` and doesn't.
+
+**Fix 1 — restore RAS in the vLLM sampler (the real root-cause fix, in `E:\Claude\cosyvoice-local-tts`):**
+`CosyVoice/cosyvoice/vllm/ras_logits_processor.py` = a vLLM V1 per-request logits processor that bans any
+token seen in the last `COSYVOICE_RAS_WIN` (=10) OUTPUT tokens, registered via
+`EngineArgs(logits_processors=[...])` in `cli/model.py`, plus `top_p=0.8` in `llm.py` to match RAS's nucleus.
+**DEAD END:** vLLM's own `repetition_penalty`/`frequency_penalty` build a prompt-token bincount, but CosyVoice
+feeds `prompt_embeds` (no prompt token ids) → CUDA `ScatterGatherKernel index out of bounds` device-side
+assert that kills the engine. Verified: **48 zh runs, 0 degenerate** (was ~40%); tighter + lower-latency
+than an earlier output-guard/retry workaround (which was reverted).
+
+**Fix 2 — a naturally fluid "pro" reference voice (the actual reason zh was choppy-vs-en):** after the loop
+was fixed, zh still felt choppy/slow (~57% voiced / ~3.8 pauses/sentence vs en's ~65% / ~2.5). Ruled out the
+`speed` knob and the `cross_lingual` path (both barely helped). The lever was the **reference clip** —
+`zero_shot` clones its rhythm. Swapped the gappy "weather" clip for the **MOSS "pro" AI-assistant voice**
+(`assets/moss_pro_ref.wav` → copied to `CosyVoice/asset/pro_ref.wav`, transcribed via Deepgram, now the
+default in `tts_engine.py`): zh → **~64% voiced / ~1 pause/sentence** (fewer than English), no trimming
+needed. (An interim streaming pause-trimmer `_squeeze_silence` / `COSYVOICE_SILENCE_CAP_S` is now **OFF by
+default** — kept as an optional knob for gappy voices.) **Correction to an earlier claim:** the choppiness
+was NOT "inherent to the model" (that was premature) — it was the reference voice, and CosyVoice2 is in fact
+Chinese-first and fine at zh.
+
+**Status:** live + verified offline; changes are in the `cosyvoice-local-tts` + nested `CosyVoice` repos
+(pro voice clip committed there), **not yet git-committed**. Full detail: `docs/PROBLEMS-AND-FIXES.md` P18 +
+the `project-visualllm-zh-silence-loop-fix` memory. Avatar/LLM baseline unchanged.
 
 ## ⭐ Session 2026-07-01: TensorRT avatar = new baseline (long-turn drift fixed)
 
@@ -30,6 +78,22 @@ PyTorch path +3.94s on the 13.6s reply, TRT holds drift FLAT at +0.36s at every 
 GPU/driver-specific (~1.75GB, gitignored) — rebuild with `local_services/musetalk_server/trt_build.py`.
 Next cheap lever (no 2nd GPU): the composite is CPU PIL blending (~31% of render even with TRT) — move it
 to GPU. Structural fix remains a dedicated avatar GPU.
+
+**Follow-on same session (GPU composite + engine-build CLI).** Took the two cheap levers off the
+P16 handoff list. (1) **GPU composite (`MUSETALK_GPU_COMPOSITE=1`, P17):** moved the per-frame
+mask-blend + downscale off the CPU (PIL/cv2) onto the GPU in torch. **Benchmarked OFF vs ON** (clean
+no-contention drive, TRT on both, 13.56s reply): per 8-frame seg gpu ~170ms unchanged + composite
+**~73ms → ~11ms** (6.6×) → total **246 → 182ms**, i.e. **−26% render, ceiling ~33 → ~44 fps**.
+**Pixel-identical** (SSIM 1.0, ≤1 LSB, verified vs CPU on smooth/random/checkerboard content).
+**HONEST caveat:** at the production 12fps this does **NOT** change A/V drift — both configs hold drift
+flat (+0.69s, 7 held frames) at all lengths **even under a verified 100% GPU-contention hog**, because
+TRT alone already keeps render ≥12fps. The win is **reserve** (render ceiling 33→44fps + a freed CPU for
+STT/pipecat/LLM-streaming), which the offline render-isolation test can't see — the **live call (#1)** is
+the judge of the CPU-relief benefit. Opt-in, code default off, needs TRT (uses the VAE GPU tensor
+directly); this box's `.env`=1, `run.ps1` propagates it; CPU fallback if a crop_box runs off-frame.
+(2) **One-command engine-build CLI:** `python -m local_services.musetalk_server.trt_build` now wraps the
+4 export/build one-liners (forces the PyTorch path during capture, derives seq-len + max batch from the
+model). Both validated offline; **the live A/V judgement (handoff #1) is still the open item.**
 
 > **See `WORKFLOW.md`** for the full end-to-end system workflow (the processes, the turn
 > flow, the avatar wire contract, running locally + remote, config reference).
@@ -352,19 +416,25 @@ fixing the shared-GPU long-turn A/V drift; LLM = cloud `google/gemini-2.5-flash-
 and TRT holds it flat (+3.94s→+0.36s at 100% contention on a 13.6s reply). Live stack was left running
 (cloud LLM + TRT); TRT load confirmed in `logs/musetalk.err.log` ("TRT engines loaded").
 
+**✅ Done in the follow-on session (2026-07-01, NOT yet committed — working tree only):**
+- **#2 Composite-on-GPU** — `MUSETALK_GPU_COMPOSITE=1` (P17). ~68ms→~4–15ms/seg, pixel-identical
+  (SSIM 1.0). Opt-in, needs TRT, CPU fallback. Code `app.py` (`_init_gpu_composite` + `_composite_gpu`),
+  wired into `.env` + `run.ps1`.
+- **#3 One-command engine build** — `python -m local_services.musetalk_server.trt_build` (`build_all`
+  in `trt_build.py`); SETUP.md updated.
+- **#6 `.superpowers` hygiene** — already safe: `.superpowers/sdd/.gitignore` is `*`, so the
+  forgetting-benchmark workspace is self-ignoring and cannot leak to public `main` via `git add`. (The
+  only tracked "benchmark" is `tts/cosyvoice-server/benchmark.py` = the CosyVoice latency benchmark.)
+
 **Not yet done / open, in priority order:**
 1. **Human A/V judgement on a real call** — open `/client/` (mic + headphones), speak a long
-   multi-sentence turn, confirm the lips stay locked to the voice end-to-end with TRT on. The offline
-   proof used a synthetic hog, not the real CosyVoice burst pattern.
-2. **Composite-on-GPU** — the PIL blend is CPU-bound and still ~31% of render even with TRT (~78ms/seg);
-   moving it to torch/GPU adds contention headroom without a 2nd GPU. Highest cheap lever.
-3. **A one-command engine build** — building TRT engines is 4 `trt_export`/`trt_build` one-liners
-   (SETUP.md "TensorRT engines"); wrap them in a `python -m …trt_build` CLI for a fresh machine.
-4. **Dedicated avatar GPU** — the structural fix; removes contention entirely (avatar working set ~4.8GB).
-5. **Confirm the felt CosyVoice-vLLM latency** on a live remote call; Chinese zh-TTS delay (P15) still open.
-6. **Hygiene:** `.superpowers/sdd/*.md` (the memory-*forgetting-benchmark* project, uses `qwen3.5:4b`)
-   sit in this tree — per the public-handoff note that benchmark must NOT be on public `main`; check
-   whether those are tracked/pushed and clean up separately (unrelated to the avatar stack).
+   multi-sentence turn, confirm the lips stay locked to the voice end-to-end with TRT + GPU composite on.
+   The offline proof used a synthetic hog, not the real CosyVoice burst pattern. **This gates promoting
+   `MUSETALK_GPU_COMPOSITE` from opt-in.** _(Stack was left LIVE with GPU composite on: MuseTalk :8002 +
+   pipeline :7860 + CosyVoice :8001 all up — test it directly.)_
+2. **Commit the follow-on work** — the #2/#3 changes above are in the working tree only, not committed.
+3. **Dedicated avatar GPU** — the structural fix; removes contention entirely (avatar working set ~4.8GB).
+4. **Confirm the felt CosyVoice-vLLM latency** on a live remote call; Chinese zh-TTS delay (P15) still open.
 
 **To run cold:** double-click `Run VisualLLm.exe` (brings up WSL CosyVoice → MuseTalk+TRT → pipeline →
 `/client/`). If the bot goes silent after a `wsl --shutdown`, the WSL IP changed — update `COSYVOICE_URL`

@@ -523,3 +523,99 @@ drifted the PyTorch path +3.94s on the 13.6s reply, TRT holds the drift flat at 
 path. Next cheap lever (no 2nd GPU): the composite is CPU PIL blending (~31% of render even with TRT) —
 move it to the GPU. Structural fix remains a **dedicated avatar GPU**. Full detail:
 `project-visualllm-musetalk-trt-drift-fix` memory.
+
+## P17 — Per-frame composite was CPU-bound (~31% of render even with TRT) ✅ FIXED (2026-07-01, GPU composite, opt-in)
+
+**Context (the P16 "next cheap lever").** After TRT, each rendered frame still ran `get_image_blending`
+(PIL crop/paste + cv2) on the **CPU** to alpha-blend the rendered mouth back onto the base portrait and
+downscale to the output size. Measured at ~**68 ms per 8-frame segment** with TRT on (`MUSETALK_PROFILE=1`)
+— about a quarter of the ~255 ms/seg render, and it also forced a GPU→CPU copy of the VAE output every
+frame. On the shared GPU that CPU time is headroom lost to nothing.
+
+**Fix — `MUSETALK_GPU_COMPOSITE=1`: do the blend + downscale on the GPU in torch.** With the TRT path the
+VAE output is **already a GPU tensor**, so the composite runs there with no extra transfer:
+`_composite_gpu` (`app.py`) bilinear-resizes the mouth, alpha-composites it into the crop_box region with
+the precomputed mask, downscales to `MUSETALK_SIZE` with `mode="area"`, and transfers only the final
+frame. Base frames + masks are uploaded once at load (`_init_gpu_composite`).
+
+**Result (measured, `_drive_frames.py` + `MUSETALK_PROFILE=1`, prod fps=12/SIZE=256, clean no-contention
+drive on the 13.56s reply):** per 8-frame segment, gpu (UNet+VAE) **~170 ms unchanged** + composite
+**~73 ms → ~11 ms** (~6.6×) → total **246 → 182 ms**, i.e. **~26% off render, render ceiling ~33 → ~44
+fps**. **Output is pixel-identical:** SSIM **1.0**, max **≤1 LSB** vs the CPU path across smooth,
+random-high-frequency and checkerboard mouth content (the blend is content-independent, so the 1-LSB gap
+is just rounding). No render errors over a full turn.
+
+**Honest read of the benchmark — it does NOT reduce A/V drift *today*.** At 12 fps both configs sit far
+above the 667 ms/seg real-time budget (246 and 182 ms), so the paced A/V metrics are **identical**: drift
+flat +0.69 s at every length (2.88/5.48/13.56 s), 7 held frames — **even under a verified 100% GPU
+contention hog** (TRT alone already holds ≥12 fps, so the composite saving isn't the deciding factor).
+The value is **reserve**: (1) the render ceiling rises 33→44 fps — headroom for heavier/real-bursty
+contention, higher fps/resolution, or a weaker/dedicated GPU; (2) it **frees the CPU** (the CPU PIL blend
+is gone), which the live pipeline needs for STT / pipecat / LLM-streaming. That CPU relief is exactly what
+the offline render-isolation test can't see and what the **live call (#1)** is the judge of. So: strictly
+not worse (pixel-identical, drift unchanged), with real headroom banked. VRAM change is negligible
+(base-frame + mask tensors, tens of MB).
+
+**Gates / safety (mirrors how TRT landed).** Code default **off** (opt-in, public-repo-safe); this box's
+`.env` sets `1` and `run.ps1` propagates it. **Only active with `MUSETALK_TRT=1`** — the PyTorch path's
+`recon` is CPU numpy, so there it logs "ignored" and keeps the CPU composite. If any `crop_box` runs
+off-frame (an off-center/edge portrait) it **disables itself and falls back to the CPU path** (logged).
+One-time cost: the first turn after a server start pays ~100 ms of `F.interpolate` CUDA-kernel init
+(seen as elevated composite on the first 2 segments), then it settles. **Still open:** the composite
+`empty`/`clone` allocations could be pre-allocated, and the base-frame `clone()` per frame could be an
+in-place write into a scratch buffer — micro-optimizations, not needed yet. Structural fix is still a
+**dedicated avatar GPU**.
+
+## P18 — Chinese voice "halting/broken" + avatar keeps moving after the voice ✅ FIXED (2026-07-02, RAS restored in vLLM + fluid "pro" voice)
+
+**Symptom.** With `LANGUAGE=zh`, the Chinese voice sounded broken ("like autism speaking" — long unnatural
+pauses) and the avatar kept animating after the words ended. **English was perfect.** Both are Chinese-only
+and are ONE bug in the TTS, not the avatar/steady/GPU. (Distinct from P15, which was zh *first-chunk latency*.)
+
+**Root cause (proven offline, no pipeline/WebRTC — hit `/tts/stream` directly and analyze the CONCATENATED
+PCM, never per-chunk).** CosyVoice2's autoregressive speech-token LLM runs on **vLLM** here (the P-era
+latency fix), and the vLLM decode path does its OWN sampling — it **lost CosyVoice's Repetition-Aware
+Sampling (RAS)**. Native RAS (`cosyvoice/utils/common.py::ras_sampling`): nucleus (top_p=0.8/top_k=25), then
+if the sampled token appears in the last `win_size`=10 decoded tokens, ban it and resample — the guard that
+stops the model looping on the silence token. vLLM's `inference_wrapper` used plain `SamplingParams(top_k=25)`
+= no guard. So the LLM intermittently loops on silence: the SAME short zh sentence came out ~4s clean one run
+and **~12s with ~5s of dead silence** the next (~40% of zh runs); English rock-stable. That silence is BOTH
+symptoms — the pauses = "halting" voice; MuseTalk faithfully renders frames for all ~12s (idle mouth through
+the silence) while the words are only ~4s = "avatar keeps moving after the voice". zh uses
+`inference_zero_shot` (denser/longer token seqs) and hits the loop; en uses `cross_lingual` and doesn't.
+
+**Fix 1 — restore RAS inside vLLM's sampler (the real root-cause fix).** New
+`CosyVoice/cosyvoice/vllm/ras_logits_processor.py`: a vLLM V1 `AdapterLogitsProcessor` whose per-request
+`(output_ids, logits)` callback sets `-inf` on every token seen in the last `COSYVOICE_RAS_WIN` (=10) OUTPUT
+tokens — identical anti-loop effect to native RAS, using OUTPUT tokens only (embeds-safe). Registered via
+`EngineArgs(logits_processors=[RasLogitsProcessor])` in `cli/model.py::load_vllm`; `top_p=0.8` added to
+`llm.py::inference_wrapper` to match RAS's nucleus. **DEAD END (do not retry):** vLLM's own
+`repetition_penalty`/`frequency_penalty`/`presence_penalty` all build a prompt-token bincount, but CosyVoice
+feeds `prompt_embeds` (no prompt token ids) → `ScatterGatherKernel index out of bounds` CUDA **device-side
+assert** that kills the engine (corrupts the CUDA context → full restart). Verified: was ~40% degenerate →
+**48 varied zh runs, 0 degenerate**; tighter + lower-latency than an interim output-guard/retry workaround
+(abort_request on a dominant-token window + zh retry-on-empty), which was **reverted** in favor of this.
+
+**Fix 2 — a naturally fluid reference voice (why zh still felt choppy-vs-en after Fix 1).** With the loop
+gone, zh still measured gappier than en: **~57% voiced / ~3.8 pauses per sentence vs en ~65% / ~2.5**. Ruled
+out: the `speed` knob (1.15/1.3 didn't reduce dur or gaps) and the `cross_lingual` path (57%→59%, marginal).
+The real lever is the **reference clip** — `zero_shot` clones its RHYTHM. Swapped the gappy "weather" clip
+(`asset/zero_shot_prompt.wav`) for the **MOSS "pro" AI-assistant voice** — found on disk at
+`visualllm/assets/moss_pro_ref.wav`, language-confirmed + transcribed via Deepgram (conf 1.00:
+"你好，我是你的AI虚拟助手…"), copied to `CosyVoice/asset/pro_ref.wav`, now the default `PROMPT_WAV`/`PROMPT_TEXT`
+in `tts_engine.py`. Result: zh → **~64% voiced / ~1 pause per sentence** (fewer than English), smooth with no
+trimming. **Correction to an earlier in-session claim:** the choppiness was NOT "inherent to the model" (that
+was premature — concluded before testing another voice); it was the reference clip. CosyVoice2 is Chinese-first
+and is fine at zh.
+
+**Interim band-aid, now off by default.** Before Fix 2, a streaming pause-compressor
+(`TTSEngine._squeeze_silence`, `COSYVOICE_SILENCE_CAP_S`) capped over-long zh silences to match en pacing
+(brought zh to 64% voiced). The pro voice makes it unnecessary, so it is **OFF by default**
+(`COSYVOICE_SILENCE_CAP_S=0`) but kept as an optional knob for a gappy voice.
+
+**Files (all in `E:\Claude\cosyvoice-local-tts`; the nested `CosyVoice/` is its own git repo):**
+`CosyVoice/cosyvoice/vllm/ras_logits_processor.py` (new), `CosyVoice/cosyvoice/cli/model.py` (register the LP),
+`CosyVoice/cosyvoice/llm/llm.py` (`top_p=0.8`), `CosyVoice/asset/pro_ref.wav` (new voice clip),
+`tts_engine.py` (pro voice defaults + the off-by-default squeeze). **Not yet git-committed.** Baseline knobs:
+`COSYVOICE_RAS_WIN` (10), `COSYVOICE_PROMPT_WAV`/`COSYVOICE_PROMPT_TEXT` (pro voice), `COSYVOICE_SILENCE_CAP_S`
+(0 = off). **Still open:** human A/V confirmation on a live call; git-commit both repos.

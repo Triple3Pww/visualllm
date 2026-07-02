@@ -59,6 +59,7 @@ Set-EnvFromDotenv "MUSETALK_LEAD_FRAMES"
 Set-EnvFromDotenv "MUSETALK_END_TAIL_FRAMES"
 Set-EnvFromDotenv "MUSETALK_IDLE_MOTION"
 Set-EnvFromDotenv "MUSETALK_TRT"
+Set-EnvFromDotenv "MUSETALK_GPU_COMPOSITE"
 
 function Test-PortBusy([int]$port) {
     # netstat (native), NOT Get-NetTCPConnection: the CIM cmdlet hangs tens of
