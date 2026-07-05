@@ -1,4 +1,4 @@
-"""Pure latency functions for the measure waterfall — onset, waterfall sum, beacon parse.
+"""Pure latency functions for the measure waterfall -- onset, waterfall sum, beacon parse.
 Run: python -m archive._measure_waterfall_test  (or: pytest archive/_measure_waterfall_test.py)"""
 from datetime import datetime
 
