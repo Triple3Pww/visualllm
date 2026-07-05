@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import re
 import sys
 import time
@@ -193,6 +194,77 @@ def parse_turn():
     turn.update(user_started=user_started, llm_ttfb=llm_ttfb, bot_stopped=bot_stopped,
                 sentences=sentences, tts_ttfb=tts_ttfb, tts_proc=tts_proc)
     return turn
+
+
+def answer_onset_epoch(samples, t0_epoch, guard=0.15, thresh_frac=0.18, run=3):
+    """First SUSTAINED energetic audio frame after t0 = the answer reaching the client.
+
+    samples: list of (arrival_epoch, rms). Frames at/after t0_epoch+guard are considered, so the
+    greeting (well before t0) and inter-turn silence are skipped; the threshold is a fraction of
+    the post-t0 peak, and `run` consecutive frames must clear it so a lone spike doesn't trigger.
+    Returns the onset epoch (same clock as the log's t0), or None.
+    """
+    win = [(t, r) for (t, r) in samples if t >= t0_epoch + guard]
+    if len(win) < run:
+        return None
+    peak = max(r for _, r in win)
+    if peak <= 0:
+        return None
+    thr = thresh_frac * peak
+    for i in range(len(win) - run + 1):
+        if all(win[i + k][1] >= thr for k in range(run)):
+            return win[i][0]
+    return None
+
+
+# Ordered stages of the turn; each row's cost ends at the named anchor. Kept module-level so the
+# HTML/JS and the tests share one definition of "the stages".
+_WATERFALL_STAGES = [
+    ("STT finalize -> LLM", "llm_recv", "log"),
+    ("LLM first token", "llm_ttfb", "log"),
+    ("LLM -> TTS (sentence-1 flush)", "tts_recv", "log"),
+    ("TTS synth first chunk", "tts_ttfb", "log"),
+    ("TTS -> bot-start (steady lead-hold)", "bot_started", "log"),
+    ("Transport + encode + network", "client_arrival", "probe"),
+    ("Browser jitter + decode + playout", "playout", "browser"),
+]
+
+
+def build_waterfall(anchors, playout_source="est"):
+    """Per-stage latency from t0 to the user's ear. anchors: dict of t0-relative offsets (s);
+    a None anchor yields an 'unknown' row that does NOT corrupt the running sum (the next known
+    stage's delta absorbs the gap, so ok-row deltas always telescope to the last known cum).
+    Returns ordered rows: {stage, delta, cum, source, status}; the final 'total' row carries the
+    end-to-end cum. The last stage's source is `playout_source` (browser | est).
+    """
+    rows, prev = [], 0.0
+    for label, key, source in _WATERFALL_STAGES:
+        if key == "playout":
+            source = playout_source
+        end = anchors.get(key)
+        if end is None:
+            rows.append(dict(stage=label, delta=None, cum=None, source=source, status="unknown"))
+            continue
+        rows.append(dict(stage=label, delta=round(end - prev, 3), cum=round(end, 3),
+                         source=source, status="ok"))
+        prev = end
+    total = next((r["cum"] for r in reversed(rows) if r["cum"] is not None), None)
+    rows.append(dict(stage="END-TO-END, user hears", delta=None, cum=total,
+                     source="", status="total"))
+    return rows
+
+
+def parse_playout_beacon(lines, t0_dt):
+    """First real-browser [client-playout] audio-onset after t0. lines: list of (datetime, text)
+    (as _parse_lines returns). The beacon body is JSON {"ev":"audio-onset","t":<epoch_ms>}.
+    Returns the offset from t0 in seconds (same-box clock), or None."""
+    t0e = t0_dt.timestamp()
+    for dt, txt in lines:
+        if "[client-playout]" in txt and "audio-onset" in txt and dt >= t0_dt:
+            m = re.search(r'"t":\s*(\d+(?:\.\d+)?)', txt)
+            if m:
+                return round(float(m.group(1)) / 1000.0 - t0e, 3)
+    return None
 
 
 # --------------------------------------------------------- assemble timeline JS
