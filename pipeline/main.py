@@ -511,8 +511,9 @@ def _install_client_video_stall_monitor() -> None:
     How: the same sanctioned <head> injection as the jitter buffer + speaker route -- the
     prebuilt bundle is untouched, and play() is hooked so it catches the <video> whenever it
     starts (even if the bundle never attaches it to the DOM). CLIENT_VIDEO_STALL_MONITOR=0
-    disables; CLIENT_VIDEO_STALL_MS sets the gap that counts as a freeze."""
-    if (os.getenv("CLIENT_VIDEO_STALL_MONITOR", "1") or "1") == "0":
+    disables; CLIENT_VIDEO_STALL_MS sets the gap that counts as a freeze. Default OFF (diagnostic
+    scaffolding); set CLIENT_VIDEO_STALL_MONITOR=1 to re-arm it when hunting a freeze."""
+    if (os.getenv("CLIENT_VIDEO_STALL_MONITOR", "0") or "0") == "0":
         return
     try:
         thr = int(os.getenv("CLIENT_VIDEO_STALL_MS", "350") or "350")
@@ -564,7 +565,8 @@ def _install_client_av_stats_monitor() -> None:
     idiom as the speaker route's play() hook, so the global constructor + its statics stay intact
     and the prebuilt bundle is untouched. CLIENT_AV_STATS_MONITOR=0 disables; CLIENT_AV_STATS_MS
     sets the sample interval."""
-    if (os.getenv("CLIENT_AV_STATS_MONITOR", "1") or "1") == "0":
+    # Default OFF (diagnostic scaffolding); set CLIENT_AV_STATS_MONITOR=1 to re-arm.
+    if (os.getenv("CLIENT_AV_STATS_MONITOR", "0") or "0") == "0":
         return
     try:
         iv = int(os.getenv("CLIENT_AV_STATS_MS", "1000") or "1000")

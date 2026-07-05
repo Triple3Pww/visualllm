@@ -97,16 +97,7 @@ class MuseTalkVideoService(FrameProcessor):
         self._mode = (os.getenv("MUSETALK_SYNC_MODE", "steady") or "steady").lower()
         self._sync = self._mode in ("steady", "prerender") and (
             os.getenv("MUSETALK_SYNC_WITH_AUDIO", "1") or "1").lower() in ("1", "true", "yes", "on")
-        self._lead_s = float(os.getenv("MUSETALK_SYNC_LEAD_S", "0.0"))
         self._fallback_s = float(os.getenv("MUSETALK_SYNC_FALLBACK_S", "10.0"))
-        # Lag cap (default OFF). The voice is released paced to frames AS they arrive, so when
-        # the server sustains its fps the voice already tracks real-time and no cap is needed.
-        # This only helps if the render genuinely sustains BELOW realtime; it keys off buffered
-        # audio (which TTS fills ahead), so leave it 0 unless a slow GPU truly falls behind --
-        # a positive value will skip frames (choppy) to keep the voice from lagging.
-        # 0 = never skip (deadlock-proof; voice real-time, lips best-effort). A positive value
-        # is experimental: MuseTalk renders in ~0.4s segments so the skip can stall the lips.
-        self._max_lag = float(os.getenv("MUSETALK_SYNC_MAX_LAG", "0"))
         self._last_hold_log = 0.0
 
         # Real-time-paced feed to the server (live mode). CosyVoice produces the whole reply
@@ -167,8 +158,9 @@ class MuseTalkVideoService(FrameProcessor):
         # also stopped feeding us -> high arrival gap) vs delivery-side (frames buffered but not
         # going out). A TOTAL stall emits nothing, so a poller (_watch_loop) raises it rather than
         # the next emit. Pairs with the browser-side monitor in main.py for the transport/browser
-        # leg the server can't see. 0 disables.
-        self._stall_s = float(os.getenv("MUSETALK_STALL_LOG_S", "0.4") or "0")
+        # leg the server can't see. Default 0 (OFF) -- diagnostic scaffolding; set a value like
+        # 0.4 to re-arm it when hunting a freeze.
+        self._stall_s = float(os.getenv("MUSETALK_STALL_LOG_S", "0") or "0")
         self._last_emit_t: float | None = None   # loop.time() of the last video frame pushed out
         self._stall_open = False                 # a freeze is currently being reported
         self._watch_task: asyncio.Task | None = None
@@ -346,9 +338,8 @@ class MuseTalkVideoService(FrameProcessor):
 
     async def _advance(self):
         """Release received frames, each paired (in order) with the audio due by its time and
-        tagged sync_with_audio so the transport pins it. If the voice is buffered too far ahead
-        of the released video (render falling behind on a long reply), CATCH UP: drop the backlog
-        frames + release their audio so the voice stays ~real-time instead of drifting."""
+        tagged sync_with_audio so the transport pins it. Never release past the voice we have
+        buffered (the audio_cap below), so the video can't run ahead of the voice."""
         async with self._lock:
             # Never release video past the voice we actually have buffered: a frame at index
             # i needs the audio up to i/fps, so cap at the buffered-audio position. This stops
@@ -363,30 +354,12 @@ class MuseTalkVideoService(FrameProcessor):
             while self._released_idx < target:
                 await self._emit_pair(self._released_idx)
                 self._released_idx += 1
-            if self._mode != "prerender" and self._max_lag > 0:
-                hold = self._audio_clock_s - self._released_idx / self._fps
-                if hold > self._max_lag:
-                    target_audio = self._audio_clock_s - self._max_lag
-                    skip_to = int(target_audio * self._fps)
-                    if skip_to > self._released_idx:
-                        latest = min(skip_to, len(self._vbuf))  # newest frame we actually have
-                        if latest > 0:
-                            fr = OutputImageRawFrame(
-                                image=self._vbuf[latest - 1], size=self._size, format="RGB")
-                            fr.sync_with_audio = True
-                            await self.push_frame(fr, FrameDirection.DOWNSTREAM)
-                        self._released_idx = skip_to   # jump the cursor; the skipped span is dropped
-                    while (self._aidx < len(self._abuf)
-                           and self._abuf[self._aidx][0] <= target_audio):
-                        _e, af, ad = self._abuf[self._aidx]
-                        self._aidx += 1
-                        await self.push_frame(af, ad)
             self._log_hold()
 
     async def _emit_pair(self, i: int):
         """Audio due by frame i's time (in order), then frame i tagged sync_with_audio. Caller
         holds the lock. Frame is skipped if not buffered yet (a caught-up cursor ran ahead)."""
-        ft = i / self._fps + self._lead_s
+        ft = i / self._fps
         while self._aidx < len(self._abuf) and self._abuf[self._aidx][0] <= ft:
             _e, af, ad = self._abuf[self._aidx]
             self._aidx += 1
