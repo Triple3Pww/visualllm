@@ -19,6 +19,7 @@ from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     Frame,
     UserStoppedSpeakingFrame,
+    VADUserStoppedSpeakingFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
@@ -33,8 +34,13 @@ class TtfoMeter(FrameProcessor):
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
 
-        if isinstance(frame, UserStoppedSpeakingFrame):
-            # User just finished talking — start the clock for this turn.
+        if isinstance(frame, (UserStoppedSpeakingFrame, VADUserStoppedSpeakingFrame)):
+            # User just finished talking — start the clock for this turn. We arm on EITHER
+            # frame: Deepgram + the transport's turn machinery emit UserStoppedSpeakingFrame,
+            # but the ASR-driven local STT (sherpa) drives turns with VADUserStoppedSpeakingFrame
+            # (a SystemFrame, NOT a subclass of UserStoppedSpeakingFrame) — without this the meter
+            # never armed on the sherpa path and reported count:0. When both fire (Deepgram), the
+            # later one wins; they mark the same instant, so the measurement is unchanged.
             self._turn_end_t = time.monotonic()
 
         elif isinstance(frame, BotStartedSpeakingFrame) and self._turn_end_t is not None:
