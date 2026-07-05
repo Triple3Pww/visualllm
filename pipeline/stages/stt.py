@@ -20,6 +20,10 @@ def build_stt(cfg: Config):
             model_dir=cfg.sherpa_model_dir,
             to_traditional=cfg.sherpa_traditional,
             endpoint_silence=cfg.sherpa_endpoint_silence,
+            # Only pause on bot speech when echo-guard is on (valid only with live sync). Under the
+            # default steady sync the resume signal never fires, so pausing would strand the mic
+            # after the greeting (P11); default OFF keeps the mic live (barge-in/headphones).
+            pause_while_bot_speaks=cfg.echo_guard,
         )
 
     if cfg.stt_provider == "funasr":

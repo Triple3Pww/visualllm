@@ -32,6 +32,7 @@ from pipecat.frames.frames import (
     VADUserStoppedSpeakingFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection
+from pipecat.services.settings import STTSettings
 from pipecat.services.stt_service import STTService
 from pipecat.utils.time import time_now_iso8601
 
@@ -46,7 +47,13 @@ def _find(model_dir: str, *names: str) -> str:
 
 class SherpaStreamingSTTService(STTService):
     def __init__(self, *, model_dir: str, to_traditional: bool = True,
-                 endpoint_silence: float = 0.5, sample_rate: int | None = None, **kwargs):
+                 endpoint_silence: float = 0.5, pause_while_bot_speaks: bool = False,
+                 sample_rate: int | None = None, **kwargs):
+        # Bilingual model, language auto-detected per utterance; declare model/language so
+        # Pipecat's STTSettings.validate_complete doesn't log a (harmless) NOT_GIVEN error.
+        kwargs.setdefault(
+            "settings", STTSettings(model="sherpa-onnx-streaming-zipformer-zh-en", language=None, extra={})
+        )
         super().__init__(sample_rate=sample_rate, **kwargs)
         import sherpa_onnx
 
@@ -68,6 +75,15 @@ class SherpaStreamingSTTService(STTService):
         )
         self._stream = self._rec.create_stream()
         self._speaking = False
+        # Pause decoding while the bot speaks (avoids transcribing the avatar's own voice as a
+        # phantom turn) ONLY when echo-guard is on. Under the default steady sync the screech fix
+        # pins BOT_VAD_STOP_FALLBACK_SECS=600, so the audio-gap BotStoppedSpeakingFrame never
+        # fires -> the pause would get STUCK True after the first bot turn (the greeting) and drop
+        # every later mic frame (docs/PROBLEMS-AND-FIXES.md P11, same mechanism as the echo-guard
+        # mute). echo-guard is default OFF and only valid with live sync (where BotStopped fires
+        # reliably), so gating on it keeps the mic always-live under steady -- the documented
+        # barge-in/headphones tradeoff -- and never strands the pause.
+        self._pause_while_bot_speaks = pause_while_bot_speaks
         self._bot_speaking = False
         self._last_partial = ""
         self._cc = None
@@ -94,11 +110,11 @@ class SherpaStreamingSTTService(STTService):
         return self._rec.get_result(self._stream).strip(), self._rec.is_endpoint(self._stream)
 
     async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame | None, None]:
-        # Called per audio frame (streaming). PAUSE while the bot is speaking: don't feed/decode
-        # at all -- the user isn't talking then, and the avatar's own voice echoing into the mic
-        # would otherwise be transcribed as a phantom user turn. Also keeps the loop free for the
-        # render. The stream is reset on bot-stop (process_frame) so the next turn starts clean.
-        if self._bot_speaking:
+        # Called per audio frame (streaming). When echo-guard is on, PAUSE while the bot is
+        # speaking so the avatar's own voice isn't transcribed as a phantom user turn. Default is
+        # OFF (mic always live -- barge-in/headphones), because under steady sync the resume signal
+        # never arrives and the pause would strand (P11); see __init__.
+        if self._pause_while_bot_speaks and self._bot_speaking:
             return
         text, is_endpoint = await asyncio.get_running_loop().run_in_executor(
             None, self._decode, audio)
@@ -121,9 +137,12 @@ class SherpaStreamingSTTService(STTService):
             yield InterimTranscriptionFrame(self._conv(text), "", time_now_iso8601())
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
-        # Track when the bot is speaking so run_stt can pause (above). Bot speaking frames are
-        # pushed UPSTREAM from the output transport, so they reach this stage; super() forwards them.
+        # Track when the bot is speaking so run_stt can pause (above), only relevant with
+        # echo-guard on. Bot speaking frames are pushed UPSTREAM from the output transport, so they
+        # reach this stage; super() forwards them.
         await super().process_frame(frame, direction)
+        if not self._pause_while_bot_speaks:
+            return
         if isinstance(frame, BotStartedSpeakingFrame):
             self._bot_speaking = True
         elif isinstance(frame, BotStoppedSpeakingFrame):
