@@ -49,6 +49,15 @@ RING, DOT = "◯", "●"  # 'receives'  /  'emits'
 _TS = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d+) \| ")
 
 
+def _audio_rms(frame):
+    """RMS of one decoded aiortc AudioFrame (int16 PCM) -> float."""
+    s = frame.to_ndarray()
+    if s.size == 0:
+        return 0.0
+    s = s.astype(np.float64)
+    return float(np.sqrt(np.mean(s * s)))
+
+
 # ----------------------------------------------------------------- WebRTC probe
 async def run_probe(mic_wav: str, lead: float, tail: float, duration: float):
     """Connect like a browser, play the mic wav, record + time the bot's A/V."""
@@ -76,22 +85,30 @@ async def run_probe(mic_wav: str, lead: float, tail: float, duration: float):
             break
         await asyncio.sleep(0.1)
 
-    async def pump(track, sink):
+    async def vpump(track):
         while True:
             try:
                 await track.recv()
             except Exception:
                 return
-            sink.append(time.time())
+            vwall.append(time.time())
+
+    async def apump(track):
+        while True:
+            try:
+                frame = await track.recv()
+            except Exception:
+                return
+            awall.append((time.time(), _audio_rms(frame)))
 
     relay = MediaRelay()
     recorder = MediaRecorder(MP4)
     if "video" in tracks:
         recorder.addTrack(relay.subscribe(tracks["video"]))
-        asyncio.ensure_future(pump(relay.subscribe(tracks["video"]), vwall))
+        asyncio.ensure_future(vpump(relay.subscribe(tracks["video"])))
     if "audio" in tracks:
         recorder.addTrack(relay.subscribe(tracks["audio"]))
-        asyncio.ensure_future(pump(relay.subscribe(tracks["audio"]), awall))
+        asyncio.ensure_future(apump(relay.subscribe(tracks["audio"])))
     await recorder.start()
     print(f"  connected (pc_id={ans.get('pc_id')}, tracks={list(tracks)}); capturing {duration}s...")
     await asyncio.sleep(duration)
@@ -114,7 +131,7 @@ def probe_metrics(vwall, awall, connect_t, fps):
             freeze_ms=round(gaps.max() * 1000),
         )
     if len(awall) > 2:
-        ag = np.diff(np.array(awall))
+        ag = np.diff(np.array([t for t, _ in awall]))
         m["audio_gap_p95_ms"] = round(float(np.percentile(ag, 95)) * 1000, 1)
         m["audio_gap_max_ms"] = round(ag.max() * 1000, 1)
     off, corr, err = lip_offset_from_mp4(MP4, fps)
@@ -486,26 +503,69 @@ def print_summary(report):
     print("metrics:")
     for m in report["metrics"]:
         print(f"  {m['k']:<28} {m['v']} {m['u']}  ({m['n']})")
+    print("latency waterfall (t0 = user stopped -> user hears):")
+    for r in report.get("waterfall", []):
+        d = f"{r['delta']:+.2f}s" if r["delta"] is not None else "   ?  "
+        c = f"{r['cum']:.2f}s" if r["cum"] is not None else "  ?  "
+        src = f"[{r['source']}]" if r["source"] else ""
+        print(f"  {r['stage']:<36} {d:>8}   cum {c:>7}  {src}")
     print(f"wrote {JSON_OUT}")
     print(f"wrote {JS_OUT}  -> open docs/workflow-timeline.html (auto-uses it)")
     print("=======================================================\n")
 
 
 async def main(args):
-    print("[1/3] driving a real turn through the live pipeline (WebRTC)...")
-    vwall, awall, connect_t = await run_probe(args.mic, args.lead, args.tail, args.duration)
-    pm = probe_metrics(vwall, awall, connect_t, args.fps)
+    lines_cache = None
+    if args.from_browser:
+        print("[1/3] --from-browser: parsing the last real-browser turn (no headless probe)...")
+        vwall, awall, pm = [], [], {}
+    else:
+        print("[1/3] driving a real turn through the live pipeline (WebRTC)...")
+        vwall, awall, connect_t = await run_probe(args.mic, args.lead, args.tail, args.duration)
+        pm = probe_metrics(vwall, awall, connect_t, args.fps)
 
     print("[2/3] parsing the pipeline.log delta for this turn...")
     turn = parse_turn()
+    t0_epoch = turn["t0"].timestamp()
+
+    # Last mile source 1 (headless): first ANSWER audio arriving at the client, on the log clock.
+    client_arrival = None
+    if awall:
+        onset = answer_onset_epoch(awall, t0_epoch)
+        client_arrival = round(onset - t0_epoch, 3) if onset else None
+
+    # Last mile source 2 (real browser): the [client-playout] onset beacon, if present.
+    playout = None
+    if args.from_browser:
+        lines_cache = _parse_lines()
+        playout = parse_playout_beacon(lines_cache, turn["t0"])
+
+    anchors = dict(
+        llm_recv=0.0,
+        llm_ttfb=turn["llm_ttfb"][0] if turn["llm_ttfb"] else None,
+        tts_recv=turn["sentences"][0][0] if turn["sentences"] else None,
+        tts_ttfb=turn["tts_ttfb"][0][0] if turn["tts_ttfb"] else None,
+        bot_started=turn["bot_started"],
+        client_arrival=client_arrival,
+        playout=playout,
+    )
+    # Fill the playout row: measured browser beacon, else estimate = arrival + jitter buffer.
+    if anchors["playout"] is not None:
+        playout_source = "browser"
+    elif client_arrival is not None:
+        jb = float(os.getenv("CLIENT_JITTER_BUFFER_MS", "400") or 400) / 1000.0
+        anchors["playout"] = round(client_arrival + jb, 3)
+        playout_source = "est"
+    else:
+        playout_source = "est"
 
     offline_lip = None
-    if args.offline_capture:
+    if args.offline_capture and not args.from_browser:
         ow = args.offline_wav if Path(args.offline_wav).exists() else args.mic
         print(f"[3/3] offline avatar capture for a clean lip offset (wav={ow})...")
         offline_lip = await offline_capture(ow, args.fps)
     else:
-        print("[3/3] offline capture skipped (pass --offline-capture to enable).")
+        print("[3/3] offline capture skipped.")
 
     report = {
         "meta": {
@@ -518,7 +578,8 @@ async def main(args):
         "events": build_events(turn),
         "handoffs": build_handoffs(turn),
         "metrics": build_metrics(turn, pm, offline_lip),
-        "raw": {"probe": pm, "ttfo_s": turn["ttfo_s"],
+        "waterfall": build_waterfall(anchors, playout_source),
+        "raw": {"probe": pm, "ttfo_s": turn["ttfo_s"], "anchors": anchors,
                 "sentences": turn["sentences"], "tts_ttfb": turn["tts_ttfb"]},
     }
     write_outputs(report)
@@ -538,6 +599,10 @@ if __name__ == "__main__":
     ap.add_argument("--fps", type=int, default=12)
     ap.add_argument("--offline-capture", action="store_true",
                     help="also drive the MuseTalk server directly for a guaranteed lip offset")
+    ap.add_argument("--from-browser", action="store_true",
+                    help="parse-only: use a real browser's [client-playout] beacon for the last "
+                         "mile instead of driving the headless probe (open /client, do one turn, "
+                         "with CLIENT_PLAYOUT_PROBE=1)")
     ap.add_argument("--offline-wav", default="output/reply_concise.wav",
                     help="wav for the offline avatar capture; a longer bot-reply clip gives a more reliable lip offset")
     ap.add_argument("--machine", default="this box (RTX 5060 Ti, Blackwell)")
