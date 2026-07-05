@@ -237,7 +237,7 @@ def answer_onset_epoch(samples, t0_epoch, guard=0.15, thresh_frac=0.18, run=3):
 # Ordered stages of the turn; each row's cost ends at the named anchor. Kept module-level so the
 # HTML/JS and the tests share one definition of "the stages".
 _WATERFALL_STAGES = [
-    ("STT finalize -> LLM", "llm_recv", "log"),
+    ("STT finalize -> LLM", "llm_recv", "assumed"),  # llm_recv is pinned to t0 (pre-warmed), not measured
     ("LLM first token", "llm_ttfb", "log"),
     ("LLM -> TTS (sentence-1 flush)", "tts_recv", "log"),
     ("TTS synth first chunk", "tts_ttfb", "log"),
@@ -562,7 +562,9 @@ async def main(args):
     )
     # Fill the playout row: measured browser beacon, else estimate = arrival + jitter buffer.
     if anchors["playout"] is not None:
-        playout_source = "browser"
+        # When there's no headless client_arrival (browser-only mode), the transport row is
+        # 'unknown' so this beacon Delta absorbs server->browser transport+network too -- say so.
+        playout_source = "browser" if client_arrival is not None else "browser+net"
     elif client_arrival is not None:
         jb = float(os.getenv("CLIENT_JITTER_BUFFER_MS", "400") or 400) / 1000.0
         anchors["playout"] = round(client_arrival + jb, 3)
