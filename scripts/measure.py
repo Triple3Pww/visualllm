@@ -62,7 +62,7 @@ def _audio_rms(frame):
 async def run_probe(mic_wav: str, lead: float, tail: float, duration: float):
     """Connect like a browser, play the mic wav, record + time the bot's A/V."""
     vwall: list[float] = []
-    awall: list[float] = []
+    awall: list[tuple[float, float]] = []  # (arrival_epoch, rms) per received audio frame
     mic = build_mic_wav(mic_wav, lead, tail)
 
     pc = RTCPeerConnection()
@@ -529,10 +529,21 @@ async def main(args):
     t0_epoch = turn["t0"].timestamp()
 
     # Last mile source 1 (headless): first ANSWER audio arriving at the client, on the log clock.
+    # Guard: parse_turn() returns the LAST [TTFO] in the log, which can be an OLD turn if the probe
+    # never drove a fresh one. Correlating this run's live audio arrivals against a stale t0 yields a
+    # plausible-but-wrong number, so only trust the arrival when t0 falls inside this capture window.
     client_arrival = None
     if awall:
         onset = answer_onset_epoch(awall, t0_epoch)
-        client_arrival = round(onset - t0_epoch, 3) if onset else None
+        turn_age = time.time() - t0_epoch
+        fresh_window = args.duration + args.tail + 15.0
+        if onset is None:
+            pass
+        elif turn_age > fresh_window:
+            print(f"  [warn] latest log turn is {turn_age:.0f}s old (> {fresh_window:.0f}s window) "
+                  "-- no fresh turn captured; client_arrival left blank.")
+        else:
+            client_arrival = round(onset - t0_epoch, 3)
 
     # Last mile source 2 (real browser): the [client-playout] onset beacon, if present.
     playout = None
