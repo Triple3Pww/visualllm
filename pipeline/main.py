@@ -374,6 +374,19 @@ def _ensure_client_patch_middleware() -> bool:
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"[av-stats] unreadable body: {e!r}")
             return HTMLResponse("", status_code=204)
+        # Playout beacon: the browser reports the instant the bot's VOICE actually starts
+        # playing (to the ear) -- the last mile the server clock can't see. measure.py stitches
+        # its epoch onto the log t0 to close the waterfall. See _install_client_playout_probe.
+        if request.method == "POST" and request.url.path == "/client/playout":
+            try:
+                from log_setup import ensure_file_sink
+
+                ensure_file_sink("pipeline")
+                body = (await request.body())[:2000]
+                logger.info(f"[client-playout] {body.decode('utf-8', 'replace')}")
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"[client-playout] unreadable body: {e!r}")
+            return HTMLResponse("", status_code=204)
         # Only the index page (exact /client or /client/); assets pass through to the mount.
         if request.method == "GET" and request.url.path in ("/client", "/client/"):
             try:
@@ -611,6 +624,49 @@ def _install_client_av_stats_monitor() -> None:
                 "(CLIENT_AV_STATS_MONITOR=0 to disable).")
 
 
+def _install_client_playout_probe() -> None:
+    """Beacon the instant the bot's VOICE first plays in the browser (to the ear).
+
+    Why: measure.py can clock the moment audio ARRIVES at a headless client, but the true
+    to-the-ear moment adds the browser's own jitter buffer + decode + speaker route. This taps
+    the actual played audio and reports its onset, so the latency waterfall can close the last
+    mile with a real device instead of an estimate.
+
+    How: hook HTMLMediaElement.prototype.play (the same prototype-method-hook idiom as the
+    speaker route, so the prebuilt bundle is untouched and it catches elements a DOM sweep
+    misses). On play, if the element's srcObject carries an audio track, pipe it through an
+    AudioContext AnalyserNode and watch the RMS; the first frame above threshold beacons
+    {"ev":"audio-onset","t":Date.now()} to /client/playout, then re-arms after ~0.5s of silence
+    for the next turn. Default OFF (measurement scaffolding); CLIENT_PLAYOUT_PROBE=1 to arm."""
+    if (os.getenv("CLIENT_PLAYOUT_PROBE", "0") or "0") == "0":
+        return
+    patch = (
+        "<script>(()=>{try{"
+        "const bea=o=>{try{fetch('/client/playout',{method:'POST',keepalive:true,"
+        "headers:{'Content-Type':'application/json'},body:JSON.stringify(o)});}catch(_){}};"
+        "let ctx=null,armed=true,quiet=0;const seen=new WeakSet();"
+        "const watch=stream=>{try{ctx=ctx||new (window.AudioContext||window.webkitAudioContext)();"
+        "const src=ctx.createMediaStreamSource(stream);const an=ctx.createAnalyser();"
+        "an.fftSize=512;const buf=new Float32Array(an.fftSize);src.connect(an);"
+        "const tick=()=>{an.getFloatTimeDomainData(buf);let s=0;"
+        "for(let i=0;i<buf.length;i++)s+=buf[i]*buf[i];const rms=Math.sqrt(s/buf.length);"
+        "if(rms>0.02){if(armed){armed=false;bea({ev:'audio-onset',t:Date.now()});}quiet=0;}"
+        "else if(!armed){if(++quiet>30)armed=true;}"
+        "requestAnimationFrame(tick);};tick();"
+        "console.log('[playout-probe] watching bot audio');}catch(_){}};"
+        "const M=HTMLMediaElement.prototype,PL=M.play;"
+        "M.play=function(){try{const st=this.srcObject;"
+        "if(st&&st.getAudioTracks&&st.getAudioTracks().length&&!seen.has(st)){"
+        "seen.add(st);watch(st);}}catch(_){}return PL.apply(this,arguments);};"
+        "console.log('[playout-probe] armed');}catch(_){}})();</script>"
+    )
+    if not _ensure_client_patch_middleware():
+        return
+    _client_head_patches.append(patch)
+    logger.info("Client playout probe ENABLED: first-voice-onset beaconed to /client/playout "
+                "(CLIENT_PLAYOUT_PROBE=0 to disable).")
+
+
 def _restrict_ice_to_subnet() -> None:
     """Restrict WebRTC host candidates to ONE network (default: the Tailscale CGNAT range
     100.64.0.0/10), so ICE only ever offers the interface that can actually reach a remote
@@ -707,6 +763,8 @@ if __name__ == "__main__":
     # Beacon the browser's OWN getStats() -> the DISPLAYED fps, dropped/frozen frames, audio
     # concealment, and the real played A/V skew: what the user actually sees/hears. Env-gated.
     _install_client_av_stats_monitor()
+    # Real-browser voice-onset beacon (to-the-ear last mile for the measure waterfall).
+    _install_client_playout_probe()
     # Pin ICE host candidates to the Tailscale interface so the stable 100.x<->100.x pair
     # wins immediately (kills the intermittent-mic ICE pollution -- see the function docstring).
     _restrict_ice_to_subnet()
