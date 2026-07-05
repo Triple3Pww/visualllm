@@ -53,6 +53,23 @@ def test_waterfall_missing_anchor_is_unknown_and_sum_still_holds():
     assert abs(total - 2.97) < 1e-6  # last known cum (playout missing -> est. fills in caller)
 
 
+def test_waterfall_negative_anchor_is_unknown_not_negative_latency():
+    # A prior-turn artifact: llm_ttfb logged 1.34s BEFORE t0 (VAD split a synthetic mic).
+    # It must render 'unknown', never a physically-impossible -1.34s latency, and the sum
+    # must still telescope through the later real anchors.
+    anchors = dict(llm_recv=0.0, llm_ttfb=-1.34, tts_recv=0.64, tts_ttfb=1.73,
+                   bot_started=2.26, client_arrival=3.06, playout=3.46)
+    rows = build_waterfall(anchors, playout_source="est")
+    by_stage = {r["stage"]: r for r in rows}
+    assert by_stage["LLM first token"]["status"] == "unknown"
+    assert by_stage["LLM first token"]["delta"] is None  # no negative latency shown
+    ok = [r for r in rows if r["status"] == "ok"]
+    assert all(r["delta"] >= 0 for r in ok)  # every shown delta is non-negative
+    total = [r for r in rows if r["status"] == "total"][0]["cum"]
+    assert abs(sum(r["delta"] for r in ok) - total) < 1e-6
+    assert abs(total - 3.46) < 1e-6
+
+
 def test_parse_playout_beacon_offset():
     t0 = datetime.fromtimestamp(1751800000.0)
     lines = [

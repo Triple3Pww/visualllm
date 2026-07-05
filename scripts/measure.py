@@ -251,15 +251,17 @@ def build_waterfall(anchors, playout_source="est"):
     """Per-stage latency from t0 to the user's ear. anchors: dict of t0-relative offsets (s);
     a None anchor yields an 'unknown' row that does NOT corrupt the running sum (the next known
     stage's delta absorbs the gap, so ok-row deltas always telescope to the last known cum).
-    Returns ordered rows: {stage, delta, cum, source, status}; the final 'total' row carries the
-    end-to-end cum. The last stage's source is `playout_source` (browser | est).
+    A NEGATIVE anchor (logged before t0) is also 'unknown': a stage can't complete before the
+    turn starts, so it is a prior-turn artifact (e.g. VAD split a synthetic mic into two turns),
+    never a real -X.XXs latency. Returns ordered rows: {stage, delta, cum, source, status}; the
+    final 'total' row carries the end-to-end cum. The last stage's source is `playout_source`.
     """
     rows, prev = [], 0.0
     for label, key, source in _WATERFALL_STAGES:
         if key == "playout":
             source = playout_source
         end = anchors.get(key)
-        if end is None:
+        if end is None or end < 0:
             rows.append(dict(stage=label, delta=None, cum=None, source=source, status="unknown"))
             continue
         rows.append(dict(stage=label, delta=round(end - prev, 3), cum=round(end, 3),
