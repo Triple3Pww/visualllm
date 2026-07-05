@@ -166,6 +166,19 @@ class MuseTalkVideoService(FrameProcessor):
         self._suppress_until = 0.0              # drop server idle frames until here so they can't
         #   preempt the crossfade playout (the burst-flush collapse P12 hit)
 
+        # --- freeze watchdog (capture the REAL freeze the ~1s hold/offset sampling misses) ---
+        # A freeze = video frames stop reaching the transport for a beat. Track the wall-gap
+        # between EMITTED OutputImageRawFrames (every release path funnels through push_frame) and
+        # warn the instant it exceeds MUSETALK_STALL_LOG_S, classified render-starved (the server
+        # also stopped feeding us -> high arrival gap) vs delivery-side (frames buffered but not
+        # going out). A TOTAL stall emits nothing, so a poller (_watch_loop) raises it rather than
+        # the next emit. Pairs with the browser-side monitor in main.py for the transport/browser
+        # leg the server can't see. 0 disables.
+        self._stall_s = float(os.getenv("MUSETALK_STALL_LOG_S", "0.4") or "0")
+        self._last_emit_t: float | None = None   # loop.time() of the last video frame pushed out
+        self._stall_open = False                 # a freeze is currently being reported
+        self._watch_task: asyncio.Task | None = None
+
     # --- connection lifecycle ---------------------------------------------
     async def _connect(self):
         if self._recv_task is not None:
@@ -178,6 +191,8 @@ class MuseTalkVideoService(FrameProcessor):
         self._recv_task = asyncio.create_task(self._receive_loop())
         if self._feed_task is None:
             self._feed_task = asyncio.create_task(self._feed_loop())
+        if self._watch_task is None and self._stall_s > 0:
+            self._watch_task = asyncio.create_task(self._watch_loop())
 
     async def _open_ws(self):
         logger.info(f"Connecting to MuseTalk server at {self._ws_url} "
@@ -219,7 +234,7 @@ class MuseTalkVideoService(FrameProcessor):
     async def _disconnect(self):
         self._closing = True
         self._cancel_fallback()
-        for task_attr in ("_recv_task", "_feed_task"):
+        for task_attr in ("_recv_task", "_feed_task", "_watch_task"):
             task = getattr(self, task_attr)
             if task:
                 task.cancel()
@@ -532,7 +547,45 @@ class MuseTalkVideoService(FrameProcessor):
     async def push_frame(self, frame: Frame, direction: FrameDirection = FrameDirection.DOWNSTREAM):
         if direction == FrameDirection.DOWNSTREAM and isinstance(frame, TTSAudioRawFrame):
             self._align_even(frame)   # keep the downstream PCM whole-sample (anti-screech guard)
+        if direction == FrameDirection.DOWNSTREAM and isinstance(frame, OutputImageRawFrame):
+            self._note_emit()         # freeze watchdog: a video frame is leaving downstream
         await super().push_frame(frame, direction)
+
+    def _note_emit(self):
+        """Mark a video frame's departure; close out any freeze the watchdog opened (the gap
+        since the last emit IS the freeze duration, so log it before overwriting the timestamp)."""
+        if self._stall_s <= 0:
+            return
+        now = asyncio.get_running_loop().time()
+        if self._stall_open and self._last_emit_t is not None:
+            logger.warning(f"[avatar FREEZE] recovered after {(now - self._last_emit_t) * 1000:.0f}ms")
+            self._stall_open = False
+        self._last_emit_t = now
+
+    async def _watch_loop(self):
+        """Poll for a video-out stall the ~1s hold/offset logs can't see: if no frame has gone
+        downstream for MUSETALK_STALL_LOG_S while a turn is live (or its audio still draining),
+        log it ONCE with the state that localizes it (render-starved vs delivery-side)."""
+        while not self._closing:
+            await asyncio.sleep(0.2)
+            if self._last_emit_t is None or self._stall_open:
+                continue
+            if not (self._video_active or self._aidx < len(self._abuf)):
+                continue   # between turns, holding the rest pose is not a freeze
+            now = asyncio.get_running_loop().time()
+            gap = now - self._last_emit_t
+            if gap < self._stall_s:
+                continue
+            arr = (now - self._t_vid_last) if self._t_vid_last is not None else -1.0
+            cause = ("render-starved (server not sending frames)" if arr >= self._stall_s
+                     else "delivery-side (frames buffered, not going downstream)")
+            logger.warning(
+                f"[avatar FREEZE] no video out for {gap * 1000:.0f}ms -> {cause}; "
+                f"server-arrival-gap={arr * 1000:.0f}ms "
+                f"vbuf={len(self._vbuf) - self._released_idx} abuf={len(self._abuf) - self._aidx} "
+                f"active={self._video_active}"
+            )
+            self._stall_open = True
 
     # --- frame processing --------------------------------------------------
     async def process_frame(self, frame: Frame, direction: FrameDirection):

@@ -20,7 +20,7 @@ A/V-sync architecture decision (read it before touching sync).**
 | Stage | Service | Where |
 |-------|---------|-------|
 | VAD | Silero (local) | pipeline |
-| STT | Deepgram nova-2 (`en-US`/`zh-TW`/`th` by `LANGUAGE`) | cloud |
+| STT | Deepgram nova-2 (`en-US`/`zh-TW`/`th` by `LANGUAGE`) default; **local OFFLINE alt `STT_PROVIDER=sherpa`** (sherpa-onnx streaming zipformer, bilingual zh-en, in-process CPU/~0 VRAM, zh→Traditional via OpenCC) or `funasr` (SenseVoice segmented, `:8004`, untested alt) | cloud / **local CPU** |
 | LLM | `LLM_PROVIDER=openrouter` — OpenAI-compatible, so **cloud OR local Ollama** by `OPENROUTER_BASE_URL` (any model via `OPENROUTER_MODEL`); or `weather_chain` (Chinese weather bot) | cloud / local / remote |
 | TTS | **CosyVoice2-0.5B** local streaming (default, on vLLM in WSL, TTFB ~1.1s), or **MOSS-TTS-Realtime** (`TTS_PROVIDER=moss`, `:8003`) | **`:8001` cosy / `:8003` moss, both WSL** |
 | Avatar | **MuseTalk** local mouth-region talking-head (female portrait), **TensorRT render by default** (`MUSETALK_TRT=1`) | **`:8002`, `musetalk` conda env** |
@@ -45,6 +45,20 @@ now uses the fluid **"pro" AI-assistant voice** (`CosyVoice/asset/pro_ref.wav`, 
 zh ≈ English pacing. An optional zh pause-trimmer (`COSYVOICE_SILENCE_CAP_S`, `_squeeze_silence`) is **OFF by
 default** (not needed with the pro voice). Swap voices via `COSYVOICE_PROMPT_WAV`/`COSYVOICE_PROMPT_TEXT`.
 
+**vLLM CUDA graphs — CLOSED: keep EAGER (`COSYVOICE_VLLM_EAGER=1`); graphs degrade zh LIPSYNC (2026-07-05, 8th session, `docs/PROBLEMS-AND-FIXES.md` P27/P31/P32/P33):**
+`COSYVOICE_VLLM_EAGER` default is **`1`** (eager) in `run_vllm_server.sh`. P27 set it `0` (CUDA-graph capture) to cut
+TTS first-chunk avg ~2.0→~0.85s; P31 reverted it for "live inconsistency." A P32 re-investigation then measured the
+TTS side directly (`cosyvoice-local-tts/_ttfb_variance.py`) and found graphs are actually **faster + lower-variance**
+than eager — even under real MuseTalk render (96 samp: graphs 1.29/2.23/0.37s vs eager 1.94/3.43/0.64) — so the P31
+"shape-spike" mechanism did NOT reproduce. **But that measured the WRONG side.** P33: the real cost is zh **lipsync** —
+graphs ON alter the zh AUDIO (measured `cosyvoice-local-tts/_zh_audio_ab.py`: longer + more internal silence, more
+variance) because the graph decode perturbs the zh-critical **RAS** sampling (the P18 fix). MuseTalk lip-syncs off a
+**Whisper of the waveform**, so a degraded zh waveform → mouth shapes that don't track the words; en is spared (no RAS
+reliance), render fps stays ~14 (not a render-starve). **Verdict: eager — graphs win the TTS stopwatch but lose the
+avatar, and the avatar is the product** (reconciles with P31's revert; the eye caught what the TTS probe can't see).
+The independent Lever-4 poll-tighten (`model.py` 0.1→0.02) stays. Force graphs (only for an en-only / TTS-throughput
+setup) = `COSYVOICE_VLLM_EAGER=0` + relaunch, or the config panel's **CUDA graphs** toggle (rewrites the script + relaunches WSL).
+
 **Shared-GPU VRAM (why "won't talk" can mean CosyVoice crashed):** vLLM and MuseTalk share the one
 16GB card. vLLM's `gpu_memory_utilization` (env `COSYVOICE_VLLM_GPU_UTIL`, **default `0.3`**, set in
 the cosyvoice repo) must exceed vLLM's own ~4GB footprint or load crashes with "No available memory
@@ -57,28 +71,42 @@ needs the card mostly free; if you restart cosyvoice *while MuseTalk already hol
 Clean recovery = stop all three → start cosyvoice on the near-empty card (`run_vllm_server.sh`) → then
 `scripts/run.ps1` (MuseTalk + pipeline). The launcher already does this order. (`docs/PROBLEMS-AND-FIXES.md` P15.)
 
-**Chinese first-chunk is slower than English, and the two languages want DIFFERENT TTFO levers
-(2026-07-03).** CosyVoice's zh first-chunk TTFB is ~2.3s vs en ~1.1s — Chinese commits to a *bigger opening
-stream chunk*. The two levers, and why each fits one language:
-- **`COSYVOICE_FIRST_HOP_ZH=5` (baseline, set in the cosyvoice repo's `run_vllm_server.sh`) = the zh lever,
-  applied to CHINESE ONLY** (`tts_engine.py::_apply_first_hop`, per-request by `is_cjk(text)`). It emits the
-  first audio after fewer speech tokens, capping zh's big opening → zh first-chunk ~2.5s→~1.8s, whole natural
-  sentences. The old "do NOT enable — starves the avatar (lips 2s→8s)" verdict was **pre-TensorRT**; with
-  `MUSETALK_TRT=1` the render holds ≥12fps under the extra load, so hop=5 no longer starves *for zh*.
-  **Why zh-only (2026-07-03, measured):** the hop is NOT harmless on English — the earlier global
-  `COSYVOICE_FIRST_HOP=5` was found to push the **English lip-start lag ~0.70s → ~1.95s** (its extra
-  turn-start vocoder burst starves MuseTalk's *first-frame* render — the one thing TRT's mid-turn headroom
-  doesn't cover) for ~no en benefit (en's opening is already small; its long sentences make hop wait for the
-  whole sentence anyway). So English is forced to `hop=0` (`COSYVOICE_FIRST_HOP_EN`, default 0) and uses the
-  clause split instead. Verified: isolated TTFB en 3.15s (hop=0) / zh 2.00s (hop=5); live en lip-start back to
-  +0.70s, flat +0.62s offset all turn. Legacy `COSYVOICE_FIRST_HOP` still read as the zh default if set.
+**Chinese first-chunk is slower than English, and each language has its own TTFO lever (updated
+2026-07-04 — the 2026-07-03 hop_zh=5 verdict is REVERSED, see P22).** CosyVoice's first-chunk TTFB
+scales with the INPUT sentence length (it prefills the whole sentence before the first audio token). The levers:
+- **`COSYVOICE_FIRST_HOP_ZH=0` (baseline since 2026-07-04, default `:-0` in the cosyvoice repo's
+  `run_vllm_server.sh`).** hop=5 (a smaller opening TTS chunk) was the 2026-07-03 zh lever, but a live A/B
+  proved it HURTS live zh TTFO: the small chunk fills the `MUSETALK_LEAD_FRAMES=14` synced-start cushion
+  slowly → the steady-hold balloons (zh hold ~1.9–2.2s vs en ~0.85s; the entire zh-vs-en TTFO gap). hop 5→0
+  cut zh median **4.14→3.09s**, screen clean, lips-start *improved*. Its isolated-TTFB win never survives the
+  synced-start fill (P19's caveat, now resolved: `docs/PROBLEMS-AND-FIXES.md` P22). English was always hop=0
+  (`COSYVOICE_FIRST_HOP_EN`; the old global hop=5 pushed en lip-start ~0.70→~1.95s).
 - **`COSYVOICE_FIRST_PIECE` (the first-clause split, `.env`) = the en lever.** en's long sentences benefit
-  from starting speech on the first *clause* early — which hop can't do. It's a near-no-op for zh (zh sentences
-  are shorter than its char thresholds; forcing a small zh split cuts mid-word — 天氣預|報 — and was rejected).
+  from starting speech on the first *clause* early. Splits at ASCII comma/space past MIN/MAX char thresholds.
+- **`COSYVOICE_FIRST_PIECE_ZH=1` (2026-07-04) = the zh lever** (`docs/PROBLEMS-AND-FIXES.md` P23). The en
+  split never fires for zh (ASCII comma/space vs zh's full-width ，and no spaces), so a long zh opener — the
+  LLM ignores the ≤10-char-opener prompt rule on ~30% of turns — still prefilled whole (TTS TTFB ~3.1s, turn
+  ~4.8s). The zh path flushes the turn's first piece at a full-width **，；： ONLY, never a char cap** (a cap
+  cuts mid-word — 天氣預|報 — the rejected splitter; a comma boundary cannot), guarded by
+  `COSYVOICE_FIRST_PIECE_ZH_MIN_CHARS=5` CJK-counted chars (the opening piece's audio must cover the next
+  piece's synthesis or the voice pauses between clauses). Live A/B: long-opener turns **4.78→3.08s**,
+  split-fired audio gaps 59–65ms (no pause); comma-less zh + en byte-identical.
+  (`local_services/first_piece_aggregator.py`; knobs read via `os.getenv` inside the aggregator.)
 
-They coexist for free: the split only fires on long (en) sentences, hop=5 only bites short (zh) ones. The
-residual "zh starts a bit later than en" is intrinsic to the bigger zh opening; a dedicated avatar GPU is the
-only way to also spend GPU on an even more aggressive hop without any render risk.
+**zh turn-start "breathing sound" — KNOWN/ACCEPTED, no fix in baseline (2026-07-05, `docs/PROBLEMS-AND-FIXES.md`
+P34).** CosyVoice's zero-shot synth prepends a low-level breath (25–610ms, −34..−68 dB) before the first word on
+~every zh piece; the avatar lip-syncs off a Whisper of the waveform so the mouth moves over it ~0.3–0.6s before the
+answer. A start-of-turn byte-stream trim was tried and **REJECTED** (crashed the first piece on aiohttp's odd-sized
+chunks → "only speaks one sentence per turn"; user judged no-trim better). The breath is accepted as baseline; any
+re-attempt must trim **server-side in CosyVoice** (whole buffers), not in the pipecat client.
+
+`MUSETALK_LEAD_FRAMES` below 14 is a **CLOSED question (2026-07-04): REJECTED by the user's live eye.**
+lead=8 measured zh 3.03/en 2.48 median at hop=0 (the first all-under-3s config, probe-screen clean), but the
+user live-tested every value below 14 and saw delay or avatar freezes — the probe screen misses what the eye
+catches (P19's lesson, twice now). Don't re-try lower leads. The remaining TTFO levers are the TTS first-chunk
+cost, the P20 shared-GPU collision (stagger / stream-priority, untried), and the structural fix: a dedicated
+avatar GPU. NOTE: lead reaches the avatar server only via a full relaunch (launcher/`run.ps1`) — the config
+panel's Restart cycles the pipeline only, so a panel-edited lead never takes effect.
 
 Each stage is a thin single-provider factory in `pipeline/stages/` chosen by `.env` — these
 are **deliberate fallback switches, not multi-provider branching**:
@@ -114,9 +142,9 @@ default; `live` = audio-master, voice instant + lips trail ~0.75s, can never pau
 render-stall gap (`BOT_VAD_STOP_FALLBACK_SECS`); see `docs/PROBLEMS-AND-FIXES.md` P3 +
 `main.py::_relax_bot_vad_stop_timeout` and `musetalk_video.py::_align_even`. Remaining steady
 tradeoff: under a long render stall the voice briefly **pauses** then resumes clean — switch to
-`live` if that pause is worse than the lip trail), `MUSETALK_FPS` (**12** now; **keep it a divisor
-of 16000** — 8/10/16/20/25 — so frame count = audio length. The server's `samples_for_frames` ceil
-sizing makes 12 correct anyway; the old `int(16000/fps)` truncation lost ~1 frame/segment → lips
+`live` if that pause is worse than the lip trail), `MUSETALK_FPS` (**14** now (the user's pick); a divisor
+of 16000 (8/10/16/20/25) makes frame count = audio length exactly, but the server's `samples_for_frames`
+ceil sizing makes a non-divisor like 14 correct anyway; the old `int(16000/fps)` truncation lost ~1 frame/segment → lips
 finished ~1–2s early, `docs/PROBLEMS-AND-FIXES.md` P9. NOTE: the end-of-turn leftover-audio blip
 (P10) is **FIXED** — `int()`→`math.ceil` on the `audio_cap` in `musetalk_video.py::_advance` so the
 final audio sub-frame releases in step instead of waiting for the delayed `video_end` drain),
@@ -128,8 +156,8 @@ cross-dissolves the last spoken frame→rest pose over N frames, delivered **fre
 during the close") so it survives steady's non-live transport without the audio-cap stranding it; `0`
 = clean snap; needs `END_TAIL=0`; `docs/PROBLEMS-AND-FIXES.md` P12), `MUSETALK_IDLE_MOTION` (**0** = no breathing idle; the face
 holds the static neutral portrait between turns — the user's pick. `1` = the synthesized breathing
-loop. Server reads it from the OS env, so `run.ps1` propagates it), `MUSETALK_SIZE` (512 — shrinking
-it does NOT cut MuseTalk compute),
+loop. Server reads it from the OS env, so `run.ps1` propagates it), `MUSETALK_SIZE` (**256** on this box;
+code default 512 — shrinking it does NOT cut MuseTalk compute),
 `MUSETALK_TRT` (**1 = default, load-bearing for A/V sync**: TensorRT UNet+VAE render path,
 per-segment render ~389ms→~255ms so the avatar keeps ~12fps under CosyVoice's shared-GPU
 contention — where the PyTorch path drifts seconds behind the voice on long turns. Engines live in
@@ -142,9 +170,11 @@ keeps the CPU composite). Output is pixel-identical — SSIM 1.0, ≤1 LSB vs th
 if a crop_box runs off-frame. Code default off (opt-in); `app.py::_composite_gpu`. **Benchmarked: at 12fps
 it does NOT reduce A/V drift** (TRT already holds render ≥12fps, even under 100% GPU contention) — the win
 is reserve headroom + a freed CPU, judged by the live call. `docs/PROBLEMS-AND-FIXES.md` P17),
-`MUSETALK_LEAD_FRAMES` (**14, load-bearing** — it IS the synced-start delay AND a mid-turn shock absorber;
-lower starves the queue → freeze. Lowering it for TTFO was swept + REJECTED: `lead=6` alone is smooth but
-`hop=5`+`lead=6` is choppy — see `docs/PROBLEMS-AND-FIXES.md` P19),
+`MUSETALK_LEAD_FRAMES` (**14, load-bearing, CLOSED at 14** — it IS the synced-start delay AND a mid-turn
+shock absorber; lower starves the queue → freeze. The 2026-07-03 sweep rejected lowering it (P19), and on
+2026-07-04 the user live-eye tested **every value below 14** and saw delay or avatar freezes — even `lead=8`
+at hop=0, which had measured zh 3.03/en 2.48s median probe-screen clean. The probe misses what the eye
+catches; do not re-try lower leads. Server-side knob: only a full relaunch applies it, not the panel Restart),
 `COSYVOICE_PACE_RATE` (1.3, in the cosyvoice server — caps voice production so it doesn't burst
 the shared GPU), `COSYVOICE_FIRST_PIECE` (**1 = default, TTFO win**: emit a short opening CLAUSE to
 TTS first, then normal sentences. CosyVoice's first-chunk TTFB scales with the INPUT sentence length
@@ -154,7 +184,27 @@ TTS first, then normal sentences. CosyVoice's first-chunk TTFB scales with the I
 (**18/32** = tuned sweet spot: use an early comma if present, else cap at ~32 chars on a word
 boundary — enough opening audio to cover the next piece's synthesis even under shared-GPU
 contention; smaller MAX = faster start but risks a between-clause pause). `0` = off.
-`local_services/first_piece_aggregator.py`), `CLIENT_JITTER_BUFFER_MS` (raise only for a remote/WAN viewer),
+`local_services/first_piece_aggregator.py`), `COSYVOICE_FIRST_PIECE_ZH` (**1 = the zh split,
+2026-07-04**: the en split above never fires on Chinese — full-width ，vs ASCII comma, no spaces —
+so long zh openers cost ~3.1s TTFB; this flushes the first piece at a full-width ，；： ONLY, never
+a char cap, min `COSYVOICE_FIRST_PIECE_ZH_MIN_CHARS`=5 CJK chars. Long-opener turns 4.78→3.08s, no
+between-clause pause. P23), `FILLER_WORDS` (**1 = default baseline, 2026-07-05**: the turn OPENS on a
+rotated natural "thinking" phrase ("嗯，讓我想一下喔，…") synthesized through the normal TTS path — one
+continuous turn, zero screech (audio gap ~60ms) — so the avatar starts talking + lip-moving ~0.7s sooner
+(zh def 2.91→2.23s, wx 2.38→2.03s). **HONEST: a PERCEPTION win, not a speedup — TTFO counts time-to-first-SOUND
+and that sound is the filler; the real ANSWER arrives slightly LATER (queued behind it).** **zh CAVEAT (2026-07-05, P30): the filler makes zh feel DELAYED** — the avatar starts on the filler, then the
+real zh answer (chopped into short comma/sentence pieces, each ~0.8s TTFB) lags behind, and each short piece's
+audio barely covers the next piece's synth → micro-gaps read as "avatar first, voice delayed." en escapes it
+(longer fillers + char-count splitting = bigger pieces). Fix = `FILLER_WORDS=0` (confirmed smooth in zh; costs
+~0.7s TTFO) or make the filler en-only. NOT the raw TTS speed — zh TTFB ≈ en (~0.9s) once graphs were off.
+Fillers are ~1.2s
+each so the first piece fills the `MUSETALK_LEAD_FRAMES` cushion — a too-short "嗯，" ballooned the hold 0.5→1.7s
+(the fix). `FILLER_WORDS_COUNT` (**1**) chains more for a longer opener. Needs `COSYVOICE_FIRST_PIECE=1` (shares
+that aggregator); `0` = off. `local_services/first_piece_aggregator.py`, P26), `CLIENT_FORCE_SPEAKER` (**1 = default**: phone browsers play the voice
+on the LOUDSPEAKER, not the earpiece — Android Chrome flips to ear-style 'communication' routing
+while the mic is live; iOS gets a WebAudio fallback. Mobile-UA only, desktop/headphones untouched;
+the phone self-reports to `[speaker-debug]` in pipeline.log. P24),
+`CLIENT_JITTER_BUFFER_MS` (raise only for a remote/WAN viewer),
 `WEBRTC_VIDEO_BITRATE_MAX` (caps aiortc's VP8 ceiling so the video fits a WAN link), and
 `WEBRTC_ICE_SUBNET` (**`100.64.0.0/10`** = pin WebRTC ICE to the Tailscale interface; fixes the
 intermittent remote mic — `0` disables). **Full reference: `WORKFLOW.md` §8.**
@@ -296,10 +346,15 @@ audio/video drift.
   ASN1) that kills torch.hub/urllib downloads — fix = curl-cache the weights + set `SSL_CERT_FILE`
   to certifi. See the `project-visualllm-conda-ssl-weights` memory.
 - The `/client` UI is the **pipecat prebuilt bundle**, served as-is — don't add UI hacks back. The
-  **one** sanctioned injection is the receive-side jitter buffer (`_install_client_jitter_buffer()`
-  in `main.py`, gated by `CLIENT_JITTER_BUFFER_MS`): FastAPI middleware injects a `<script>` into the
-  served index before the bundle; the bundle itself is untouched. Keep new client behavior to that
-  same pattern (env-gated, bundle untouched) rather than forking the prebuilt dist.
+  **one** sanctioned mechanism is the `<head>` script injection in `main.py`: env-gated patches
+  register into the shared `_client_head_patches` list and ONE middleware serves the index with all
+  of them (two separate index-serving middlewares would shadow each other — last-added runs
+  outermost and wins). Current patches: the jitter buffer (`_install_client_jitter_buffer`,
+  `CLIENT_JITTER_BUFFER_MS`) and the phone speaker route (`_install_client_speaker_route`,
+  `CLIENT_FORCE_SPEAKER`, P24 — also handles the `POST /client/speaker-debug` beacon). The index is
+  served `Cache-Control: no-store` (a phone that cached the pre-patch page misses every fix). Keep
+  new client behavior to that same pattern (env-gated, bundle untouched) rather than forking the
+  prebuilt dist.
 - **Open the client at `/client/` WITH the trailing slash** — the prebuilt page references its
   assets relatively, so `/client` (no slash) 404s them → white screen.
 

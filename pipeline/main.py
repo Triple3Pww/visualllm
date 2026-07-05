@@ -296,6 +296,101 @@ def _configure_webrtc_video_bitrate() -> None:
     )
 
 
+# All <head> patches for the served /client page collect here and ONE middleware injects
+# them all. Why a shared list: each patch as its own middleware would race to serve the
+# index (the outermost one wins and the others' patches silently vanish); a single
+# serve-point keeps every env-gated patch additive and the prebuilt bundle untouched.
+_client_head_patches: list[str] = []
+_client_patch_middleware_installed = False
+
+
+def _ensure_client_patch_middleware() -> bool:
+    """Install (once) the middleware that serves /client with every registered head patch."""
+    global _client_patch_middleware_installed
+    if _client_patch_middleware_installed:
+        return True
+    try:
+        from pathlib import Path as _Path
+
+        import pipecat_ai_prebuilt
+        from fastapi.responses import HTMLResponse
+
+        from pipecat.runner.run import app
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Client page patch middleware skipped (import: {e!r}).")
+        return False
+    index_path = _Path(pipecat_ai_prebuilt.__file__).parent / "client" / "dist" / "index.html"
+    if not index_path.is_file():
+        logger.warning(f"Client page patch middleware skipped (no index.html at {index_path}).")
+        return False
+
+    @app.middleware("http")
+    async def _inject_client_patches(request, call_next):
+        # Debug beacon: injected client scripts POST what they observed on the device
+        # (UA, output devices, which route path fired) so a phone problem is diagnosable
+        # from pipeline.log instead of guessing what a remote browser did.
+        if request.method == "POST" and request.url.path == "/client/speaker-debug":
+            try:
+                # Pipecat's runner logger.remove()'s every sink at startup and the file sink
+                # only returns when a bot session starts (log_setup docstring) -- but the
+                # page-load beacon arrives BEFORE any connect. Re-assert the sink so no
+                # beacon is ever swallowed.
+                from log_setup import ensure_file_sink
+
+                ensure_file_sink("pipeline")
+                body = (await request.body())[:2000]
+                logger.info(f"[speaker-debug] {body.decode('utf-8', 'replace')}")
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"[speaker-debug] unreadable body: {e!r}")
+            return HTMLResponse("", status_code=204)
+        # Freeze beacon: the browser reports when the DISPLAYED avatar video stalls (the leg the
+        # server/pipeline logs can't see). Logged as WARNING so a real freeze stands out.
+        if request.method == "POST" and request.url.path == "/client/video-stall":
+            try:
+                from log_setup import ensure_file_sink
+
+                ensure_file_sink("pipeline")
+                body = (await request.body())[:2000]
+                logger.warning(f"[video-stall] {body.decode('utf-8', 'replace')}")
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"[video-stall] unreadable body: {e!r}")
+            return HTMLResponse("", status_code=204)
+        # On-screen truth beacon: the browser's OWN WebRTC getStats() -- the DISPLAYED fps,
+        # dropped/frozen frames, audio concealment, and the real played A/V skew (audio vs video
+        # estimatedPlayoutTimestamp). This is what the user actually sees/hears, downstream of
+        # everything the server can measure. INFO normally; WARNING when the sample carries a
+        # glitch (g:1 -> dropped/frozen frames or audio concealment) so it stands out.
+        if request.method == "POST" and request.url.path == "/client/av-stats":
+            try:
+                from log_setup import ensure_file_sink
+
+                ensure_file_sink("pipeline")
+                body = (await request.body())[:2000]
+                text = body.decode("utf-8", "replace")
+                if '"g":1' in text:
+                    logger.warning(f"[av-stats] {text}")
+                else:
+                    logger.info(f"[av-stats] {text}")
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"[av-stats] unreadable body: {e!r}")
+            return HTMLResponse("", status_code=204)
+        # Only the index page (exact /client or /client/); assets pass through to the mount.
+        if request.method == "GET" and request.url.path in ("/client", "/client/"):
+            try:
+                html = index_path.read_text(encoding="utf-8").replace(
+                    "<head>", "<head>" + "".join(_client_head_patches), 1
+                )
+                # no-store: a phone that cached the pre-patch index would silently miss
+                # every injected fix (bit us 2026-07-04); the page is tiny, always refetch.
+                return HTMLResponse(html, headers={"Cache-Control": "no-store"})
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"Client page patch failed; serving default page: {e!r}")
+        return await call_next(request)
+
+    _client_patch_middleware_installed = True
+    return True
+
+
 def _install_client_jitter_buffer() -> None:
     """Inject a receive-side WebRTC jitter buffer into the served /client page so EVERY
     device that opens it absorbs network jitter (a smoother avatar over a remote/WAN/Tailscale
@@ -316,20 +411,6 @@ def _install_client_jitter_buffer() -> None:
         ms = 400
     if ms <= 0:
         return
-    try:
-        from pathlib import Path as _Path
-
-        import pipecat_ai_prebuilt
-        from fastapi.responses import HTMLResponse
-
-        from pipecat.runner.run import app
-    except Exception as e:  # noqa: BLE001
-        logger.warning(f"Client jitter-buffer inject skipped (import: {e!r}).")
-        return
-    index_path = _Path(pipecat_ai_prebuilt.__file__).parent / "client" / "dist" / "index.html"
-    if not index_path.is_file():
-        logger.warning(f"Client jitter-buffer inject skipped (no index.html at {index_path}).")
-        return
     # Minified inline patch: wrap RTCPeerConnection so each receiver requests a `ms` buffer.
     patch = (
         "<script>(()=>{const T=" + str(ms) + ";const N=window.RTCPeerConnection;"
@@ -340,19 +421,192 @@ def _install_client_jitter_buffer() -> None:
         "return pc;};P.prototype=N.prototype;P.__jb=1;window.RTCPeerConnection=P;"
         "console.log('[jitter-buffer] receiver target '+T+'ms');})();</script>"
     )
-
-    @app.middleware("http")
-    async def _inject_jitter_buffer(request, call_next):
-        # Only the index page (exact /client or /client/); assets pass through to the mount.
-        if request.method == "GET" and request.url.path in ("/client", "/client/"):
-            try:
-                html = index_path.read_text(encoding="utf-8").replace("<head>", "<head>" + patch, 1)
-                return HTMLResponse(html)
-            except Exception as e:  # noqa: BLE001
-                logger.warning(f"Jitter-buffer inject failed; serving default page: {e!r}")
-        return await call_next(request)
-
+    if not _ensure_client_patch_middleware():
+        return
+    _client_head_patches.append(patch)
     logger.info(f"Client jitter buffer ENABLED: {ms}ms (CLIENT_JITTER_BUFFER_MS=0 to disable).")
+
+
+def _install_client_speaker_route() -> None:
+    """On a PHONE browser, route the bot's voice to the LOUDSPEAKER instead of the earpiece.
+
+    Why this exists: when a WebRTC page holds a live mic, Android Chrome flips the phone into
+    'communication' audio routing, which plays the remote track through the EARPIECE (quiet,
+    hold-to-your-ear phone-call routing) -- the avatar's voice is near-inaudible on a phone
+    lying on a desk. Fix = the Audio Output Devices API: find the 'Speakerphone/Speaker'
+    audiooutput device and setSinkId() every media element to it.
+
+    How (two routes, tried in order per media element -- hooked at
+    HTMLMediaElement.prototype.play so it also catches elements the bundle never attaches
+    to the DOM or hides in a shadow root, which a querySelector sweep misses):
+      1. setSinkId to the 'Speakerphone/Speaker' audiooutput device (Android Chrome).
+         Labels are empty until the mic permission is granted, so the pick re-runs on
+         each play() and on 'devicechange' (headset plug/unplug re-picks).
+      2. WebAudio fallback (iOS Safari has no setSinkId/output labels): pipe the element's
+         MediaStream through an AudioContext -- AudioContext output uses the media/playback
+         route (loudspeaker), not the earpiece 'communication' route. The element keeps
+         playing but muted (Safari needs a live sink on the stream or WebAudio goes silent),
+         and it is only muted AFTER the context is confirmed running so audio can never
+         disappear entirely; a one-shot pointerdown resume covers iOS's gesture rule.
+
+    Scope/safety: mobile user agents ONLY -- a desktop user may be on headphones, and
+    forcing the speaker sink there would yank audio away from them. Every step reports to
+    POST /client/speaker-debug -> pipeline.log, so a remote phone is diagnosable.
+    CLIENT_FORCE_SPEAKER=0 disables (default ON -- same default-on convention as the jitter
+    buffer: it self-gates to the devices that need it)."""
+    if (os.getenv("CLIENT_FORCE_SPEAKER", "1") or "1").lower() in ("0", "false", "no", "off"):
+        return
+    patch = (
+        "<script>(()=>{if(!/Android|iPhone|iPad|Mobi/i.test(navigator.userAgent))return;"
+        "const log=(...a)=>console.log('[speaker-route]',...a);"
+        "const bea=o=>{try{fetch('/client/speaker-debug',{method:'POST',"
+        "headers:{'Content-Type':'application/json'},body:JSON.stringify(o)})}catch(_){}};"
+        "let want=null,ctx=null;"
+        "async function pick(){try{const ds=await navigator.mediaDevices.enumerateDevices();"
+        "const outs=ds.filter(d=>d.kind==='audiooutput');"
+        "const s=outs.find(d=>/speaker/i.test(d.label||''));"
+        "bea({ev:'pick',outs:outs.map(d=>d.label||'?'),chose:s?s.label:null});"
+        "return s?s.deviceId:null}catch(e){bea({ev:'pick-err',err:String(e)});return null}}"
+        "async function route(el){try{"
+        "if(typeof el.setSinkId==='function'){"
+        "if(want==null)want=await pick();"
+        "if(want){if(el.sinkId!==want){await el.setSinkId(want);log('sink -> loudspeaker');"
+        "bea({ev:'setSinkId-ok'})}return}}"
+        "const ms=el.srcObject;"
+        "if(!ms||!ms.getAudioTracks||!ms.getAudioTracks().length||el.__spk)return;"
+        "el.__spk=1;ctx=ctx||new (window.AudioContext||window.webkitAudioContext)();"
+        "ctx.createMediaStreamSource(ms).connect(ctx.destination);"
+        "const fin=()=>{el.muted=true;el.volume=0;log('webaudio -> loudspeaker');"
+        "bea({ev:'webaudio-ok',state:ctx.state})};"
+        "if(ctx.state==='running')fin();"
+        "else{ctx.resume().then(fin).catch(()=>{});"
+        "document.addEventListener('pointerdown',()=>ctx.resume().then(fin).catch(()=>{}),{once:true})}"
+        "}catch(e){bea({ev:'route-err',err:String(e&&e.message||e)})}}"
+        "const P=HTMLMediaElement.prototype.play;"
+        "HTMLMediaElement.prototype.play=function(){route(this);return P.apply(this,arguments)};"
+        "if(navigator.mediaDevices&&navigator.mediaDevices.addEventListener)"
+        "navigator.mediaDevices.addEventListener('devicechange',()=>{want=null});"
+        "bea({ev:'loaded',ua:navigator.userAgent,"
+        "sink:'setSinkId' in HTMLMediaElement.prototype});})();</script>"
+    )
+    if not _ensure_client_patch_middleware():
+        return
+    _client_head_patches.append(patch)
+    logger.info("Client speaker route ENABLED: phone browsers play via the loudspeaker "
+                "(CLIENT_FORCE_SPEAKER=0 to disable).")
+
+
+def _install_client_video_stall_monitor() -> None:
+    """Beacon the avatar's REAL displayed freeze (browser side) to pipeline.log.
+
+    Why this exists: the server + pipeline logs only see up to the WebRTC send. A freeze in the
+    transport or the browser's own decode/playout is invisible there -- the 2026-07-05 gap: a
+    clean-render turn (server logs healthy, no dropped segments) still froze on screen, so the
+    cause had to be downstream of everything logged. This attaches requestVideoFrameCallback to
+    the avatar <video> and reports when the gap between DISPLAYED frames exceeds
+    CLIENT_VIDEO_STALL_MS, so a freeze is captured wherever it actually lives, with the media
+    time + UA to localize it. A poller also fires for a freeze still in progress (rVFC can't
+    report its own stall). Pairs with the pipeline-side [avatar FREEZE] watchdog.
+
+    How: the same sanctioned <head> injection as the jitter buffer + speaker route -- the
+    prebuilt bundle is untouched, and play() is hooked so it catches the <video> whenever it
+    starts (even if the bundle never attaches it to the DOM). CLIENT_VIDEO_STALL_MONITOR=0
+    disables; CLIENT_VIDEO_STALL_MS sets the gap that counts as a freeze."""
+    if (os.getenv("CLIENT_VIDEO_STALL_MONITOR", "1") or "1") == "0":
+        return
+    try:
+        thr = int(os.getenv("CLIENT_VIDEO_STALL_MS", "350") or "350")
+    except ValueError:
+        thr = 350
+    patch = (
+        "<script>(()=>{try{const T=" + str(thr) + ";"
+        "const bea=o=>{try{fetch('/client/video-stall',{method:'POST',keepalive:true,"
+        "headers:{'Content-Type':'application/json'},body:JSON.stringify(o)});}catch(_){}};"
+        "let last=0,lastMT=0,open=false,vid=null,n=0;"
+        "const attach=v=>{if(!v||v.__vsm||!v.requestVideoFrameCallback)return;v.__vsm=1;vid=v;"
+        "const cb=(now,meta)=>{if(last){const g=now-last;if(g>=T){n++;open=false;"
+        "bea({ev:'stall',gap:Math.round(g),mediaT:+(meta.mediaTime||0).toFixed(2),n:n,"
+        "ua:navigator.userAgent.slice(0,60)});}}last=now;lastMT=(meta&&meta.mediaTime)||0;"
+        "try{v.requestVideoFrameCallback(cb);}catch(_){}};"
+        "try{v.requestVideoFrameCallback(cb);}catch(_){}};"
+        "const P=HTMLMediaElement.prototype.play;HTMLMediaElement.prototype.play=function(){"
+        "if(this.tagName==='VIDEO')attach(this);return P.apply(this,arguments);};"
+        "setInterval(()=>{if(vid&&last&&!open){const g=performance.now()-last;if(g>=T){open=true;"
+        "bea({ev:'ongoing',gap:Math.round(g),mediaT:+lastMT.toFixed(2),"
+        "ua:navigator.userAgent.slice(0,60)});}}},300);"
+        "console.log('[video-stall-monitor] on (>'+T+'ms)');}catch(_){}})();</script>"
+    )
+    if not _ensure_client_patch_middleware():
+        return
+    _client_head_patches.append(patch)
+    logger.info(f"Client video-stall monitor ENABLED: displayed-frame gaps >{thr}ms beaconed to "
+                "pipeline.log (CLIENT_VIDEO_STALL_MONITOR=0 to disable).")
+
+
+def _install_client_av_stats_monitor() -> None:
+    """Beacon the browser's OWN measurement of what the user actually sees/hears.
+
+    Why this exists: the pipeline's [musetalk sync] hold=/[avatar timing] lines measure what was
+    QUEUED and SENT (server side); the rVFC monitor above catches only outright FREEZES. Neither
+    tells you the sustained DISPLAYED fps, the frames the browser dropped/froze, audio glitches,
+    or the real A/V skew as PLAYED -- exactly the "some voice delay / some lag" the eye reports
+    but the server logs can't see. WebRTC's getStats() is the authoritative source: inbound-rtp
+    gives framesPerSecond/framesDropped/freezeCount/totalFreezesDuration (video actually painted),
+    concealedSamples/concealmentEvents (audio actually stretched/hidden = glitches), and
+    estimatedPlayoutTimestamp on BOTH tracks -> their difference is the real played lip-sync
+    offset (audio ahead of video => voice ahead of lips, the server's "LIPS BEHIND", now confirmed
+    on the device). Sampled once per CLIENT_AV_STATS_MS as per-interval DELTAS, beaconed to
+    pipeline.log; a sample with dropped/frozen frames or audio concealment is flagged g:1 (logged
+    WARNING). Pairs with the freeze monitor + the pipeline-side [avatar FREEZE] watchdog.
+
+    How: capture the RTCPeerConnection by hooking its prototype.setRemoteDescription (always
+    called once during SDP exchange) to grab the instance -- the same "wrap a prototype method"
+    idiom as the speaker route's play() hook, so the global constructor + its statics stay intact
+    and the prebuilt bundle is untouched. CLIENT_AV_STATS_MONITOR=0 disables; CLIENT_AV_STATS_MS
+    sets the sample interval."""
+    if (os.getenv("CLIENT_AV_STATS_MONITOR", "1") or "1") == "0":
+        return
+    try:
+        iv = int(os.getenv("CLIENT_AV_STATS_MS", "1000") or "1000")
+    except ValueError:
+        iv = 1000
+    patch = (
+        "<script>(()=>{try{const IV=" + str(iv) + ";"
+        "const bea=o=>{try{fetch('/client/av-stats',{method:'POST',keepalive:true,"
+        "headers:{'Content-Type':'application/json'},body:JSON.stringify(o)});}catch(_){}};"
+        "const PR=(window.RTCPeerConnection||window.webkitRTCPeerConnection||{}).prototype;"
+        "if(!PR||!PR.getStats||!PR.setRemoteDescription)return;let pc=null;"
+        "const SRD=PR.setRemoteDescription;"
+        "PR.setRemoteDescription=function(){pc=this;return SRD.apply(this,arguments);};let p={};"
+        "setInterval(async()=>{if(!pc)return;let s;try{s=await pc.getStats();}catch(_){return;}"
+        "let v=null,a=null;s.forEach(r=>{if(r.type==='inbound-rtp'){"
+        "if(r.kind==='video')v=r;else if(r.kind==='audio')a=r;}});if(!v&&!a)return;"
+        "const now=performance.now(),o={};let act=false,g=false;"
+        "if(v){const dt=(now-(p.t||now))/1000,df=(v.framesDecoded||0)-(p.vfd||0);"
+        "o.fps=dt>0?+(df/dt).toFixed(1):0;if(df>0)act=true;"
+        "o.drop=(v.framesDropped||0)-(p.vdr||0);o.frz=(v.freezeCount||0)-(p.vfz||0);"
+        "o.frzS=+(((v.totalFreezesDuration||0)-(p.vfzs||0))).toFixed(2);"
+        "o.pause=(v.pauseCount||0)-(p.vpa||0);if(v.framesPerSecond!=null)o.rfps=v.framesPerSecond;"
+        "if(o.drop||o.frz)g=true;"
+        "p.vfd=v.framesDecoded;p.vdr=v.framesDropped;p.vfz=v.freezeCount;"
+        "p.vfzs=v.totalFreezesDuration;p.vpa=v.pauseCount;}"
+        "if(a){o.aconc=(a.concealedSamples||0)-(p.ac||0);o.alost=(a.packetsLost||0)-(p.al||0);"
+        "if(a.jitterBufferDelay!=null&&a.jitterBufferEmittedCount){"
+        "const dd=a.jitterBufferDelay-(p.ajd||0),de=a.jitterBufferEmittedCount-(p.aje||0);"
+        "o.ajbuf=de>0?+(dd/de).toFixed(3):0;}if(o.aconc>0||o.alost>0)g=true;"
+        "p.ac=a.concealedSamples;p.al=a.packetsLost;p.ajd=a.jitterBufferDelay;"
+        "p.aje=a.jitterBufferEmittedCount;}"
+        "if(v&&a&&v.estimatedPlayoutTimestamp&&a.estimatedPlayoutTimestamp){"
+        "o.avskew=+((a.estimatedPlayoutTimestamp-v.estimatedPlayoutTimestamp)/1000).toFixed(3);}"
+        "p.t=now;if(g)o.g=1;if(act||g)bea(o);},IV);"
+        "console.log('[av-stats-monitor] on (every '+IV+'ms)');}catch(_){}})();</script>"
+    )
+    if not _ensure_client_patch_middleware():
+        return
+    _client_head_patches.append(patch)
+    logger.info(f"Client A/V-stats monitor ENABLED: displayed fps + drops/freezes + audio "
+                f"concealment + played A/V skew sampled every {iv}ms to pipeline.log "
+                "(CLIENT_AV_STATS_MONITOR=0 to disable).")
 
 
 def _restrict_ice_to_subnet() -> None:
@@ -442,6 +696,15 @@ if __name__ == "__main__":
     # gets smoother playback automatically.
     _configure_webrtc_video_bitrate()
     _install_client_jitter_buffer()
+    # Phone browsers: play the bot's voice on the loudspeaker, not the earpiece (Android
+    # Chrome's live-mic 'communication' routing). Env-gated; bundle untouched.
+    _install_client_speaker_route()
+    # Capture the avatar's REAL displayed freeze (browser side) -> pipeline.log; the server logs
+    # only see up to the WebRTC send. Env-gated; bundle untouched.
+    _install_client_video_stall_monitor()
+    # Beacon the browser's OWN getStats() -> the DISPLAYED fps, dropped/frozen frames, audio
+    # concealment, and the real played A/V skew: what the user actually sees/hears. Env-gated.
+    _install_client_av_stats_monitor()
     # Pin ICE host candidates to the Tailscale interface so the stable 100.x<->100.x pair
     # wins immediately (kills the intermittent-mic ICE pollution -- see the function docstring).
     _restrict_ice_to_subnet()
