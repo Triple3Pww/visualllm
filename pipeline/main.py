@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 
 from loguru import logger
 
@@ -35,7 +36,7 @@ from pipeline.stages import build_avatar, build_llm, build_stt, build_tts, build
 from local_services.avatar_memory import MemoryStore
 
 
-async def run_bot(transport: BaseTransport) -> None:
+async def run_bot(transport: BaseTransport, conn=None) -> None:
     # Pipecat's runner removes loguru sinks when main() starts, dropping the file
     # sink added in __main__ -> logs/pipeline.log would miss all runtime logs. This
     # runs after the runner has configured logging, so it re-asserts the file sink.
@@ -75,21 +76,38 @@ async def run_bot(transport: BaseTransport) -> None:
     meter = TtfoMeter(target_s=config.ttfo_target_s)
 
     context = LLMContext([{"role": "system", "content": config.system_prompt}])
-    # Echo-guard: mute the mic while the bot is speaking (half-duplex) so the
-    # avatar's own voice leaking into the mic can't trigger a barge-in that wipes
-    # the in-flight render mid-turn (the self-interruption seen in the logs). Uses
-    # Pipecat's built-in AlwaysUserMuteStrategy. ECHO_GUARD=0 restores barge-in.
-    user_params = None
+    # Two independent, optional tweaks to the user aggregator, both via LLMUserAggregatorParams:
+    #   * Echo-guard (ECHO_GUARD=1): mute the mic while the bot speaks (half-duplex) via
+    #     AlwaysUserMuteStrategy. BROKEN under steady sync (P11) -> default OFF.
+    #   * No-interrupt (ALLOW_INTERRUPTIONS=0): the bot always finishes its turn; user speech
+    #     during playback never cancels it. Done by turning OFF `enable_interruptions` on the
+    #     default turn-START strategies (the flag that broadcasts the barge-in), keeping the
+    #     default smart-turn STOP strategy. No mute state machine, so it's safe under steady.
+    user_kwargs = {}
     if config.echo_guard:
+        from pipecat.turns.user_mute import AlwaysUserMuteStrategy
+
+        user_kwargs["user_mute_strategies"] = [AlwaysUserMuteStrategy()]
+        logger.info("Echo-guard ON: mic muted while the bot speaks (half-duplex).")
+    if not config.allow_interruptions:
+        from pipecat.turns.user_start import (
+            TranscriptionUserTurnStartStrategy,
+            VADUserTurnStartStrategy,
+        )
+        from pipecat.turns.user_turn_strategies import UserTurnStrategies
+
+        user_kwargs["user_turn_strategies"] = UserTurnStrategies(start=[
+            VADUserTurnStartStrategy(enable_interruptions=False),
+            TranscriptionUserTurnStartStrategy(enable_interruptions=False),
+        ])
+        logger.info("Interruptions OFF: the bot always finishes its turn (no barge-in).")
+    user_params = None
+    if user_kwargs:
         from pipecat.processors.aggregators.llm_response_universal import (
             LLMUserAggregatorParams,
         )
-        from pipecat.turns.user_mute import AlwaysUserMuteStrategy
 
-        user_params = LLMUserAggregatorParams(
-            user_mute_strategies=[AlwaysUserMuteStrategy()]
-        )
-        logger.info("Echo-guard ON: mic muted while the bot speaks (half-duplex).")
+        user_params = LLMUserAggregatorParams(**user_kwargs)
     aggregator = LLMContextAggregatorPair(context, user_params=user_params)
 
     pipeline = Pipeline([
@@ -106,13 +124,19 @@ async def run_bot(transport: BaseTransport) -> None:
 
     _relax_bot_vad_stop_timeout()   # steady-mode screech fix (see the function's docstring)
 
+    # Read-only transcript tap for the /nimbus/ chat bubbles (no pipeline structural change).
+    _transcript = _TranscriptStore()
     task = PipelineTask(
         pipeline,
         params=PipelineParams(
             enable_metrics=True,
             enable_usage_metrics=True,
         ),
+        observers=[_make_transcript_observer(_transcript)],
     )
+    global _active_task, _active_transcript
+    _active_task = task   # let the /client/measure-turn endpoint inject turns into this task
+    _active_transcript = _transcript   # served by /client/transcript for the chat bubbles
 
     async def _warmup_llm():
         # Open the HTTPS connection to the LLM now, so the TLS handshake is done
@@ -154,6 +178,12 @@ async def run_bot(transport: BaseTransport) -> None:
 
     @transport.event_handler("on_client_disconnected")
     async def _on_disconnected(transport, client):
+        global _active_task, _active_connection
+        _active_task = None
+        # Only release the single-connection slot if it's still ours -- a newer client
+        # may have already claimed it (then this disconnect is us being kicked).
+        if _active_connection is conn:
+            _active_connection = None
         logger.info(f"Client disconnected. TTFO summary: {meter.summary()}")
         if memory is not None:
             try:
@@ -210,8 +240,22 @@ async def bot(runner_args: RunnerArguments) -> None:
             vad_analyzer=build_vad_params(),
         ),
     }
+    # Single-connection policy: a fresh offer kicks the previous session BEFORE we build
+    # this one, so the single-client avatar server (:8002) is released before the new
+    # pipeline reaches for it (two live sessions fight over the one shared GPU).
+    conn = getattr(runner_args, "webrtc_connection", None)
+    global _active_connection
+    old = _active_connection
+    _active_connection = conn   # claim the slot first so the old session's disconnect handler won't clear it
+    if old is not None and old is not conn:
+        logger.info("New WebRTC offer -- disconnecting the previous session (single-connection policy).")
+        try:
+            await old.disconnect()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Kicking the previous session failed: {e!r}")
+
     transport = await create_transport(runner_args, transport_params)
-    await run_bot(transport)
+    await run_bot(transport, conn)
 
 
 def _relax_bot_vad_stop_timeout() -> None:
@@ -302,6 +346,132 @@ def _configure_webrtc_video_bitrate() -> None:
 # serve-point keeps every env-gated patch additive and the prebuilt bundle untouched.
 _client_head_patches: list[str] = []
 _client_patch_middleware_installed = False
+# Set by run_bot so the /client/measure-turn endpoint (the Measure button) can inject a turn
+# into the live pipeline. None between sessions.
+_active_task = None
+
+# Single-connection policy: the current live WebRTC connection. The avatar server is
+# single-client and two sessions fight over the one shared GPU, so a new client kicks the
+# previous one -- bot() disconnects this when a fresh offer arrives. None between sessions.
+_active_connection = None
+
+# Live conversation transcript for the custom /nimbus/ chat bubbles. The pipeline has no RTVI
+# processor in this build, so instead of a data channel we tap frames with a READ-ONLY observer
+# (no pipeline structural change) into a small ring buffer the client polls via /client/transcript.
+# Set per session by run_bot; None between sessions.
+_active_transcript = None
+
+
+class _TranscriptStore:
+    """Append-only ring buffer of {seq, role, text} the /client/transcript endpoint serves.
+
+    role is 'user' (a committed STT transcription) or 'bot' (the assistant's aggregated reply text). seq lets the
+    client poll incrementally (?since=N). Typed /say turns are echoed client-side already and never
+    produce a TranscriptionFrame, so they are not double-added here.
+    """
+
+    def __init__(self, cap: int = 200):
+        self._items: list[dict] = []
+        self._seq = 0
+        self._cap = cap
+        # The in-progress user utterance (STT interim results). Not seq'd -- it's a single
+        # slot the client renders as one live bubble that updates in place, then is cleared
+        # when the finalized TranscriptionFrame commits. See /client/transcript.
+        self._partial: dict | None = None
+
+    def add(self, role: str, text: str) -> None:
+        text = (text or "").strip()
+        if not text:
+            return
+        self._seq += 1
+        self._items.append({"seq": self._seq, "role": role, "text": text})
+        if len(self._items) > self._cap:
+            self._items = self._items[-self._cap:]
+
+    def since(self, seq: int) -> list[dict]:
+        return [it for it in self._items if it["seq"] > seq]
+
+    def set_partial(self, text: str) -> None:
+        text = (text or "").strip()
+        if not text:
+            return
+        self._partial = {"text": text, "updatedAt": time.time()}
+
+    def clear_partial(self) -> None:
+        self._partial = None
+
+    @property
+    def partial(self) -> dict | None:
+        return self._partial
+
+
+def _make_transcript_observer(store: "_TranscriptStore"):
+    """A BaseObserver that records one user bubble per turn + the bot's aggregated reply text.
+
+    Bot text arrives as a stream of LLMTextFrame tokens bracketed by LLMFullResponseStart/End;
+    we accumulate between them and commit one 'bot' entry per reply. User STT arrives as
+    InterimTranscriptionFrames (the live bubble) then one-or-more finalized TranscriptionFrames
+    (one per speech pause); we accumulate the whole turn and commit ONE 'user' entry when the
+    bot begins replying (LLMFullResponseStart). This only READS frames.
+    """
+    from pipecat.observers.base_observer import BaseObserver
+    from pipecat.frames.frames import (
+        TranscriptionFrame,
+        InterimTranscriptionFrame,
+        LLMTextFrame,
+        LLMFullResponseStartFrame,
+        LLMFullResponseEndFrame,
+    )
+
+    # No space between CJK segments (a space reads as a break mid-sentence); space for word langs.
+    sep = "" if (config.is_mandarin or config.is_thai) else " "
+
+    class _TranscriptObserver(BaseObserver):
+        def __init__(self):
+            super().__init__()
+            self._buf = ""    # bot reply, accumulated between LLMFullResponseStart/End
+            self._user = ""   # user turn, accumulated across STT segments until the bot replies
+            self._seen = set()  # dedupe: observers can see a frame pushed by multiple processors
+
+        async def on_push_frame(self, data):
+            frame = data.frame
+            fid = id(frame)
+            if fid in self._seen:
+                return
+            if isinstance(frame, LLMFullResponseStartFrame):
+                # The bot starting to reply means the user's turn is complete: commit the WHOLE
+                # accumulated turn as ONE bubble. Deepgram emits a TranscriptionFrame per speech
+                # pause, so committing per-frame produced a bubble per pause ("a lot of bubbles").
+                if self._user:
+                    store.add("user", self._user)
+                    self._user = ""
+                store.clear_partial()  # the live bubble swaps for the committed one
+                self._buf = ""
+                self._seen.add(fid)
+            elif isinstance(frame, LLMTextFrame):
+                self._buf += frame.text or ""
+                self._seen.add(fid)
+            elif isinstance(frame, LLMFullResponseEndFrame):
+                store.add("bot", self._buf)
+                self._buf = ""
+                store.clear_partial()  # backstop: drop any partial that never got a bot reply
+                self._seen.add(fid)
+            elif isinstance(frame, InterimTranscriptionFrame):
+                # In-progress segment: show finalized-so-far + this live interim in the bubble.
+                interim = (frame.text or "").strip()
+                live = (self._user + sep + interim).strip() if self._user else interim
+                store.set_partial(live)
+                self._seen.add(fid)
+            elif isinstance(frame, TranscriptionFrame):
+                # A finalized STT segment -- accumulate; the single bubble commits at turn end
+                # (LLMFullResponseStart above), not here.
+                text = (frame.text or "").strip()
+                if text:
+                    self._user = (self._user + sep + text).strip() if self._user else text
+                    store.set_partial(self._user)
+                self._seen.add(fid)
+
+    return _TranscriptObserver()
 
 
 def _ensure_client_patch_middleware() -> bool:
@@ -387,6 +557,76 @@ def _ensure_client_patch_middleware() -> bool:
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"[client-playout] unreadable body: {e!r}")
             return HTMLResponse("", status_code=204)
+        # Nimbus transcript poll: the /nimbus/ chat polls this for new conversation lines (the bot's
+        # spoken reply text + finalized user speech), captured by the read-only transcript observer.
+        # ?since=<seq> returns only newer entries, plus "partial" = the in-progress user
+        # utterance (STT interim, {"text","updatedAt"} | null) rendered as one live bubble.
+        # JSON: {"items":[{"seq","role","text"}, ...], "partial": {...} | null}.
+        if request.method == "GET" and request.url.path == "/client/transcript":
+            import json as _json
+            try:
+                since = int(request.query_params.get("since", "0"))
+            except (TypeError, ValueError):
+                since = 0
+            items = _active_transcript.since(since) if _active_transcript is not None else []
+            partial = _active_transcript.partial if _active_transcript is not None else None
+            return HTMLResponse(
+                _json.dumps({"items": items, "partial": partial}),
+                media_type="application/json",
+            )
+        # Nimbus text send: inject a TYPED user turn (from the /nimbus/ chat box) into the live
+        # pipeline as a real user message -> LLM -> TTS -> avatar speaks it. Voice-first stays the
+        # primary path; this is the keyboard alternative and reuses the same _active_task inject as
+        # the measure button. Body: {"text": "..."}.
+        if request.method == "POST" and request.url.path == "/client/say":
+            try:
+                from log_setup import ensure_file_sink
+
+                ensure_file_sink("pipeline")
+                from pipecat.frames.frames import LLMMessagesAppendFrame
+
+                import json as _json
+                raw = (await request.body())[:4000]
+                text = (_json.loads(raw or b"{}").get("text") or "").strip()
+                if not text:
+                    return HTMLResponse("empty", status_code=400)
+                if _active_task is None:
+                    logger.warning("[say] no active session (client not connected?)")
+                    return HTMLResponse("no active session", status_code=409)
+                await _active_task.queue_frames([
+                    LLMMessagesAppendFrame(messages=[{"role": "user", "content": text}], run_llm=True)
+                ])
+                logger.info(f"[say] injected typed turn: {text!r}")
+                return HTMLResponse("", status_code=204)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"[say] failed: {e!r}")
+                return HTMLResponse("error", status_code=500)
+        # Measure button: inject a real bot turn on demand (a fixed question through the full
+        # LLM->TTS->avatar path) so the browser can time click -> voice-onset WITHOUT depending on
+        # mic/VAD/STT turn-taking (which logs no [TTFO for real browser turns). See
+        # _install_measure_button.
+        if request.method == "POST" and request.url.path == "/client/measure-turn":
+            try:
+                from log_setup import ensure_file_sink
+
+                ensure_file_sink("pipeline")
+                from pipecat.frames.frames import LLMMessagesAppendFrame
+
+                q = {"zh": "什麼是人工智慧？請用一句話簡短回答。",
+                     "th": "AI คืออะไร ตอบสั้น ๆ หนึ่งประโยค",
+                     "en": "What is AI? Answer in one short sentence."}.get(
+                    config.language, "What is AI? Answer in one short sentence.")
+                if _active_task is None:
+                    logger.warning("[measure-turn] no active session (client not connected?)")
+                    return HTMLResponse("no active session", status_code=409)
+                await _active_task.queue_frames([
+                    LLMMessagesAppendFrame(messages=[{"role": "user", "content": q}], run_llm=True)
+                ])
+                logger.info(f"[measure-turn] injected turn: {q!r}")
+                return HTMLResponse("", status_code=204)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"[measure-turn] failed: {e!r}")
+                return HTMLResponse("error", status_code=500)
         # Only the index page (exact /client or /client/); assets pass through to the mount.
         if request.method == "GET" and request.url.path in ("/client", "/client/"):
             try:
@@ -667,6 +907,50 @@ def _install_client_playout_probe() -> None:
                 "(CLIENT_PLAYOUT_PROBE=0 to disable).")
 
 
+def _install_measure_button() -> None:
+    """A 'Measure turn' button (MEASURE_BUTTON=1, default OFF) — the reliable way to get the real
+    to-the-ear latency without fighting mic/VAD/STT turn-taking or a passive audio hook. On click
+    (a USER GESTURE, which lets us resume the AudioContext — the passive playout probe can't
+    guarantee that, the likely reason it never fired) it taps the played bot audio, fires ONE real
+    turn via POST /client/measure-turn, times click -> first-voice-onset and shows it in-page, and
+    beacons the onset to /client/playout so `measure.py --from-browser` fills the last-mile row."""
+    if (os.getenv("MEASURE_BUTTON", "0") or "0") == "0":
+        return
+    patch = (
+        "<script>(()=>{try{"
+        "const mk=()=>{if(document.getElementById('measBtn'))return;"
+        "const b=document.createElement('button');b.id='measBtn';b.textContent='Measure turn';"
+        "b.style.cssText='position:fixed;z-index:99999;left:12px;bottom:12px;padding:10px 14px;"
+        "font:600 14px system-ui;background:#111;color:#fff;border:1px solid #555;border-radius:8px;cursor:pointer';"
+        "const o=document.createElement('div');o.id='measOut';o.style.cssText='position:fixed;z-index:99999;"
+        "left:12px;bottom:58px;font:600 13px system-ui;color:#6f6;background:#000c;padding:6px 10px;"
+        "border-radius:6px;display:none;max-width:70vw';document.body.appendChild(b);document.body.appendChild(o);"
+        "let ctx=null,an=null;"
+        "const findS=()=>{for(const e of document.querySelectorAll('audio,video')){const s=e.srcObject;"
+        "if(s&&s.getAudioTracks&&s.getAudioTracks().length)return s;}return null;};"
+        "b.onclick=async()=>{const s=findS();"
+        "if(!s){o.style.display='block';o.textContent='Connect + allow audio first.';return;}"
+        "try{ctx=ctx||new(window.AudioContext||window.webkitAudioContext)();await ctx.resume();}catch(_){}"
+        "if(!an){try{const src=ctx.createMediaStreamSource(s);an=ctx.createAnalyser();an.fftSize=512;src.connect(an);}catch(_){}}"
+        "if(!an){o.style.display='block';o.textContent='cannot tap audio';return;}"
+        "const buf=new Float32Array(an.fftSize);o.style.display='block';o.textContent='measuring...';b.disabled=true;"
+        "const t0=Date.now();let armed=true;try{await fetch('/client/measure-turn',{method:'POST'});}catch(_){}"
+        "const dl=t0+15000;const tick=()=>{an.getFloatTimeDomainData(buf);let m=0;"
+        "for(let i=0;i<buf.length;i++)m+=buf[i]*buf[i];const rms=Math.sqrt(m/buf.length);"
+        "if(rms>0.02&&armed){armed=false;const t1=Date.now();o.textContent='heard '+(t1-t0)+' ms after click';"
+        "b.disabled=false;try{fetch('/client/playout',{method:'POST',keepalive:true,"
+        "headers:{'Content-Type':'application/json'},body:JSON.stringify({ev:'audio-onset',t:t1,src:'button'})});}catch(_){}return;}"
+        "if(Date.now()<dl)requestAnimationFrame(tick);else{o.textContent='no audio in 15s';b.disabled=false;}};tick();}};"
+        "if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',mk);else mk();"
+        "setInterval(mk,2000);console.log('[measure-button] installed');}catch(_){}})();</script>"
+    )
+    if not _ensure_client_patch_middleware():
+        return
+    _client_head_patches.append(patch)
+    logger.info("Measure button ENABLED: click 'Measure turn' to fire+time a turn "
+                "(MEASURE_BUTTON=0 to disable).")
+
+
 def _restrict_ice_to_subnet() -> None:
     """Restrict WebRTC host candidates to ONE network (default: the Tailscale CGNAT range
     100.64.0.0/10), so ICE only ever offers the interface that can actually reach a remote
@@ -731,6 +1015,42 @@ def _restrict_ice_to_subnet() -> None:
     )
 
 
+def _install_nimbus_client() -> None:
+    """Serve the custom 'Nimbus AI' UI at /nimbus/ (the figma-to-code redesign).
+
+    A self-contained vanilla-JS client (no build step) that speaks the SAME
+    SmallWebRTC signaling as the prebuilt bundle -- POST /api/offer, then the
+    avatar video + bot audio arrive as WebRTC tracks and the mic goes up the same
+    connection. This is ADDITIVE: the prebuilt bundle at /client is untouched and
+    stays the fallback. Mounted as StaticFiles so index.html + presenter.png serve
+    from one dir; served no-store so a phone never caches a stale build.
+    """
+    from pathlib import Path as _Path
+
+    client_dir = _Path(__file__).resolve().parent.parent / "local_services" / "nimbus_client"
+    if not (client_dir / "index.html").is_file():
+        logger.warning(f"Nimbus client not mounted (no index.html at {client_dir}).")
+        return
+    try:
+        from starlette.staticfiles import StaticFiles
+        from pipecat.runner.run import app
+    except Exception as e:  # pragma: no cover - only when runner app isn't importable
+        logger.warning(f"Nimbus client mount skipped ({e!r}).")
+        return
+
+    class _NoStoreStatic(StaticFiles):
+        def is_not_modified(self, *a, **k):
+            return False  # never 304 -> the phone always gets the latest build
+
+        async def get_response(self, path, scope):
+            resp = await super().get_response(path, scope)
+            resp.headers["Cache-Control"] = "no-store"
+            return resp
+
+    app.mount("/nimbus", _NoStoreStatic(directory=str(client_dir), html=True), name="nimbus")
+    logger.info("Nimbus UI mounted at /nimbus/ (custom client; /client prebuilt untouched).")
+
+
 if __name__ == "__main__":
     import sys
 
@@ -765,6 +1085,10 @@ if __name__ == "__main__":
     _install_client_av_stats_monitor()
     # Real-browser voice-onset beacon (to-the-ear last mile for the measure waterfall).
     _install_client_playout_probe()
+    # On-demand 'Measure turn' button: fire a real turn on a click + time click->voice-onset.
+    _install_measure_button()
+    # Serve the custom 'Nimbus AI' redesign at /nimbus/ (additive; /client stays the fallback).
+    _install_nimbus_client()
     # Pin ICE host candidates to the Tailscale interface so the stable 100.x<->100.x pair
     # wins immediately (kills the intermittent-mic ICE pollution -- see the function docstring).
     _restrict_ice_to_subnet()

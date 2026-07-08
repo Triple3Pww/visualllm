@@ -56,6 +56,14 @@ class Config:
     # MUSETALK_SYNC_MODE=live, where the mute strategy still tracks bot speech correctly.
     echo_guard: bool = (_get("ECHO_GUARD", "0") or "0").lower() in ("1", "true", "yes", "on")
 
+    # ALLOW_INTERRUPTIONS=1 (default) = the user can barge in and cut the bot off mid-reply
+    # (pipecat broadcasts an interruption when the user starts speaking). =0 = the bot ALWAYS
+    # finishes its turn; user speech during playback never cancels it ("can't interrupt").
+    # This is the turn-start strategy's `enable_interruptions` flag -- NOT the mic mute
+    # (that's echo_guard, which is broken under steady sync, P11); this has no mute state
+    # machine so it's safe under the default steady mode. See main.py.
+    allow_interruptions: bool = (_get("ALLOW_INTERRUPTIONS", "1") or "1").lower() in ("1", "true", "yes", "on")
+
     # --- STT (Deepgram) ---
     deepgram_api_key: str | None = _get("DEEPGRAM_API_KEY")
 

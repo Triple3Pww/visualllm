@@ -32,11 +32,16 @@ import aiohttp
 import numpy as np
 from aiortc import RTCPeerConnection, RTCSessionDescription
 from aiortc.contrib.media import MediaPlayer, MediaRecorder, MediaRelay
+from dotenv import load_dotenv
 
 # Reuse the probe's wav builder + lip-offset analyser (single source of truth).
 from scripts._webrtc_probe import build_mic_wav, lip_offset_from_mp4, wait_ice
 
 ROOT = Path(__file__).resolve().parent.parent
+# Read the SAME .env the pipeline uses, so the playout-estimate jitter buffer matches the live
+# CLIENT_JITTER_BUFFER_MS (150 here) instead of os.getenv's hardcoded 400 default -- otherwise the
+# "Browser jitter + decode + playout" waterfall row is overstated by the config delta (~250ms).
+load_dotenv(ROOT / ".env")
 LOG = ROOT / "logs" / "pipeline.log"
 OFFER_URL = "http://127.0.0.1:7860/api/offer"
 MP4 = str(ROOT / "output" / "measure_live.mp4")
@@ -163,13 +168,61 @@ def parse_turn():
     if not ttfo_idx:
         raise SystemExit("No [TTFO ...] line in pipeline.log — did a turn complete?")
     bi = ttfo_idx[-1]
-    bot_started_t, ttfo_s, ttfo_pass = lines[bi][0], None, None
+    ttfo_s = ttfo_pass = None
     mt = re.search(r"\[TTFO (OK |OVER)\] ([\d.]+)s", lines[bi][1])
     if mt:
         ttfo_pass = mt.group(1).strip() == "OK"
         ttfo_s = float(mt.group(2))
+    return _build_turn(lines, bi, lines[bi][0], ttfo_s, ttfo_pass)
 
-    # t0 = the 'User stopped speaking' / 'Generating chat' just before the TTFO.
+
+def parse_browser_turn(target_s=3.0, fresh_s=300.0):
+    """Anchor the most recent REAL BROWSER turn for --from-browser.
+
+    Browser turns don't emit a [TTFO line: pipecat's transcription turn-stop path (logged
+    'strategy: None') broadcasts no user-stop frame the TtfoMeter arms on, and a noisy real mic
+    yields no Silero VAD stop either — so parse_turn()'s [TTFO anchor would lock onto a STALE
+    headless turn. Instead we anchor on the real [client-playout] beacon: bot_started is the
+    'Bot started speaking' whose audio the beacon reports (the server emit precedes the browser
+    onset), and we compute the turn's TTFO ourselves. Returns a turn dict, or None if there is no
+    beacon / no matching bot-start (e.g. the browser page is stale and never armed the probe)."""
+    lines = _parse_lines()
+    # Anchor on the beacon's SERVER-CLOCK arrival time (its log timestamp), NOT the browser's
+    # Date.now() in the body: the client can be a DIFFERENT device whose clock is skewed from the
+    # server's (breaks the same-box assumption), but the server logs bot-start AND the beacon POST
+    # on one clock. server_arrival - bot_started = last mile + the onset->POST round-trip (~tens of
+    # ms on a LAN) — a small, honest overestimate that is robust to any client clock offset.
+    beacon = None
+    for dt, txt in reversed(lines):
+        if "[client-playout]" in txt and "audio-onset" in txt:
+            beacon = dt.timestamp()  # server-clock instant the onset beacon reached us
+            break
+    if beacon is None:
+        return None
+    # Freshness guard: reject a beacon logged minutes ago (a stale prior turn / a crafted test) so it
+    # can't fake a number — fall back with the "hard-reload + do one turn" guidance instead.
+    if time.time() - beacon > fresh_s:
+        return None
+    # The 'Bot started speaking' whose audio this beacon reports: the server emit precedes the
+    # beacon arrival by the last mile, so take the closest bot-start within a 6s window before it.
+    bi = None
+    for i in range(len(lines) - 1, -1, -1):
+        dt, txt = lines[i]
+        if "Bot started speaking" in txt and 0 <= beacon - dt.timestamp() <= 6.0:
+            bi = i
+            break
+    if bi is None:
+        return None
+    turn = _build_turn(lines, bi, lines[bi][0], None, None, target_s=target_s)
+    turn["playout_epoch"] = beacon  # server-clock beacon arrival -> the last-mile source
+    return turn
+
+
+def _build_turn(lines, bi, bot_started_t, ttfo_s, ttfo_pass, target_s=3.0):
+    """Shared anchor extraction. bi indexes the turn's 'bot start' line (a [TTFO line for the
+    headless path, a 'Bot started speaking' line for the browser path). ttfo_s=None means the
+    meter never logged it (browser turn) → we derive it as bot_started - t0."""
+    # t0 = the 'User stopped speaking' / 'Generating chat' just before the bot start.
     t0 = None
     question = None
     for dt, txt in lines[:bi][::-1]:
@@ -186,6 +239,10 @@ def parse_turn():
 
     def off(dt):
         return round((dt - t0).total_seconds(), 3)
+
+    if ttfo_s is None:  # browser turn: derive the TTFO the meter never logged
+        ttfo_s = round((bot_started_t - t0).total_seconds(), 2)
+        ttfo_pass = ttfo_s <= target_s
 
     turn = {"t0": t0, "ttfo_s": ttfo_s, "ttfo_pass": ttfo_pass,
             "bot_started": off(bot_started_t), "question": question}
@@ -527,7 +584,16 @@ async def main(args):
         pm = probe_metrics(vwall, awall, connect_t, args.fps)
 
     print("[2/3] parsing the pipeline.log delta for this turn...")
-    turn = parse_turn()
+    turn = None
+    if args.from_browser:
+        # Browser turns log no [TTFO, so anchor on the real [client-playout] beacon instead of
+        # letting parse_turn() lock onto a stale headless [TTFO turn.
+        turn = parse_browser_turn()
+        if turn is None:
+            print("  [warn] no [client-playout] beacon found — falling back to the last [TTFO turn. "
+                  "Hard-reload /client/ (so the probe injects), do ONE turn, then re-run.")
+    if turn is None:
+        turn = parse_turn()
     t0_epoch = turn["t0"].timestamp()
 
     # Last mile source 1 (headless): first ANSWER audio arriving at the client, on the log clock.
@@ -550,8 +616,13 @@ async def main(args):
     # Last mile source 2 (real browser): the [client-playout] onset beacon, if present.
     playout = None
     if args.from_browser:
-        lines_cache = _parse_lines()
-        playout = parse_playout_beacon(lines_cache, turn["t0"])
+        if turn.get("playout_epoch") is not None:
+            # Use the exact beacon parse_browser_turn anchored on (avoids re-matching a stale/bogus
+            # beacon logged after t0). Its browser onset epoch is on the same-box clock as t0.
+            playout = round(turn["playout_epoch"] - t0_epoch, 3)
+        else:
+            lines_cache = _parse_lines()
+            playout = parse_playout_beacon(lines_cache, turn["t0"])
 
     anchors = dict(
         llm_recv=0.0,

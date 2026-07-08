@@ -55,6 +55,7 @@ function Set-EnvFromDotenv([string]$key) {
 Write-Host "Avatar engine: musetalk" -ForegroundColor Cyan
 Set-EnvFromDotenv "AVATAR_REF"
 Set-EnvFromDotenv "MUSETALK_SIZE"
+Set-EnvFromDotenv "MUSETALK_BASE_MAX"
 Set-EnvFromDotenv "MUSETALK_FPS"
 Set-EnvFromDotenv "MUSETALK_LEAD_FRAMES"
 Set-EnvFromDotenv "MUSETALK_END_TAIL_FRAMES"

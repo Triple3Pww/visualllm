@@ -1,7 +1,51 @@
 # VisualLLm — Project Status & Next Steps
 
-_Last updated: 2026-07-06 (**9th session — measure system now reports TRUE latency-to-the-user's-ear via a
-per-stage waterfall; see the top HANDOFF.** Prior **8th session — local OFFLINE STT shipped + two live root-causes found.**
+_Last updated: 2026-07-08 (**12th session — the `/nimbus/` client made real: streaming STT bubble, a "no user bubble"
+bug root-caused + fixed, one-bubble-per-turn, a mic MUTE toggle, single-connection enforcement, and a no-interrupt
+mode. Then THIS WHOLE BASELINE COMMITTED + fast-forwarded to `main`. See `docs/PROBLEMS-AND-FIXES.md` P37.**
+(1) **Streaming STT bubble** — the user's speech now fills a LIVE bubble word-by-word as STT hears it (interim
+results → a `_partial` slot on the transcript store → the client polls it at 200ms and renders one growing bubble
+with a blinking caret), then swaps to the committed bubble. (2) **THE "no user bubble" BUG (P37)** — the transcript
+observer gated user commits on `frame.finalized`, but Deepgram's STREAMING path leaves `finalized=False` unless an
+explicit finalize was requested → **every** user bubble was silently dropped (only bot bubbles showed). Fixed by
+committing on the frame TYPE (any `TranscriptionFrame` is a user line; interims arrive as the separate
+`InterimTranscriptionFrame`). (3) **One bubble per turn** — Deepgram emits a `TranscriptionFrame` per speech PAUSE,
+so committing per-frame made "a lot of bubbles"; now the segments accumulate and commit as ONE user bubble at
+`LLMFullResponseStart` (the provider-independent "user turn done" signal), joined with no space for zh/th. (4) **Mic
+MUTE toggle** — clicking the mic while connected now toggles mute (disables the outgoing audio track → red ring +
+slash + "Muted"; Disconnect stays its own button), instead of tearing down. (5) **Single-connection policy** — a new
+WebRTC offer DISCONNECTS the previous session first (`_active_connection` global, `old.disconnect()` before building
+the new pipeline) so two clients never fight the single-client avatar server / shared GPU. Proven: probe #1 kicked to
+0 frames, probe #2 clean 420 frames. (6) **No-interrupt mode** — `ALLOW_INTERRUPTIONS=0` (new `.env` knob, default 1)
+makes the bot ALWAYS finish its reply; user speech during playback never cancels it. Done via the turn-START
+strategies' `enable_interruptions=False` — NOT the P11-broken mic mute, so it's safe under steady. Proven: user
+"started speaking" twice mid-reply, **zero** `broadcasting interruption`. All verified live with `scripts._webrtc_probe`.
+**Baseline is now on `main` (fast-forward from `feat/ttfo-first-clause-split`).**)_
+<!-- prior handoff -->
+_11th-session detail: (**11th session — a custom "Nimbus AI" web client shipped (figma-to-code) + the shared-GPU
+resolution ceiling nailed down. See `docs/PROBLEMS-AND-FIXES.md` P36.** (1) **New `/nimbus/` UI** — a self-contained
+vanilla-JS page (`local_services/nimbus_client/`, full-screen weather-anchor avatar + glass chat), served ADDITIVE by
+`_install_nimbus_client` (StaticFiles, no-store); speaks the same `POST /api/offer` signaling as the prebuilt bundle,
+so no build step and `/client/` stays the untouched fallback. Live A/V verified headless (offer 200, both tracks,
+frames decode); Connect/**Disconnect** buttons + loading overlay. (2) **Text send + transcript bubbles** — `POST
+/client/say` injects a typed turn (`LLMMessagesAppendFrame`→`_active_task`); `GET /client/transcript?since=N` feeds
+chat bubbles from a READ-ONLY `BaseObserver` on the task (bot `LLMTextFrame`s + user `TranscriptionFrame`s, no
+pipeline structural change). (3) **Avatar = the weather anchor** (`AVATAR_REF=assets/avatar_studio_match.png`, a
+top-anchored square-padded studio crop; MuseTalk forces square output so wide shots get padded, `object-fit:cover`
+crops the pad). (4) **LLM 429 dead-end FIXED** — `OPENROUTER_PROVIDER_ONLY` UNPINNED (empty) so a free-Groq-tier 429
+auto-fails-over to deepinfra/novita/google-vertex instead of killing the turn; gotcha — the `.env` loader does NOT
+strip an inline `#` from a value. (5) **Resolution vs sync ceiling** — `MUSETALK_SIZE` pushed to 1024 for sharpness
+but under REAL CosyVoice GPU contention render fell to ~10fps → steady-mode voice lag; reverted to **512** (the
+lag-free ceiling on this one 16GB card, 4× the original 256px). Fixed a real drift bug found en route: server was at
+`MUSETALK_FPS=14` while pipeline used `12` — one fps everywhere or drift, now aligned. Lesson (again): the isolated
+render profile passes what the live shared-GPU run rejects.)_
+<!-- prior handoff -->
+_10th-session detail: (**10th session — last mile made honest (measure.py now loads `.env` → browser est 0.40→0.15;
+corrected local turn 1.86→0.80→0.15→2.81s) + a one-click "Measure turn" button (`MEASURE_BUTTON=1`) that fires a real
+turn and times click→ear in-page; found real BROWSER turns log `[TTFO] count:0` (transcription turn-stop emits no
+user-stop frame → production TTFO blind to real users); cross-device clock handled (server-clock beacon anchor). See
+the top HANDOFF.** Prior **9th session — measure system now reports TRUE latency-to-the-user's-ear via a
+per-stage waterfall; see that HANDOFF.** Prior **8th session — local OFFLINE STT shipped + two live root-causes found.**
 (1) **Local sherpa STT integrated** onto `feat/ttfo-first-clause-split` (surgical port from `feat/offline-stt-sensevoice`,
 commits `5bacfa8`+`df278fd`; Deepgram still default, `STT_PROVIDER=sherpa` opt-in, CPU/~0 VRAM). Fixed both open
 items: `[TTFO]` count:0 (meter armed only on `UserStoppedSpeakingFrame`, sherpa drives turns with
@@ -49,6 +93,118 @@ non-hardware levers, **Lever 1 (GPU stream priority)** + **Lever 3 (stagger the 
 block below + `docs/PROBLEMS-AND-FIXES.md` P20. Prior (2nd) session: TTFO hop×lead sweep, negative, baseline
 stands (P19). (2026-07-02): Chinese TTS fixed (RAS + "pro" voice); avatar baseline `MUSETALK_TRT=1`, LLM cloud
 gemini-2.5-flash-lite; TTFO ~4.6s→~3.2s via the first-clause split `COSYVOICE_FIRST_PIECE=1`.)_
+
+## ⭐ HANDOFF → next session (2026-07-08, 12th): `/nimbus/` client made real (streaming bubble + no-bubble bugfix + one-bubble-per-turn + mic mute + single-connection + no-interrupt); BASELINE COMMITTED TO `main`
+
+**Context:** hardened the custom `/nimbus/` client into a usable UI and locked the whole baseline onto `main`.
+Everything below was verified live with `python -m scripts._webrtc_probe --mic output/_zh_q_wx.wav --lead 8` (drives a
+real turn through STT→LLM→TTS→avatar) + a fast HTTP poller of `/client/transcript`.
+
+**What shipped (all in `pipeline/main.py` + `local_services/nimbus_client/index.html`, additive; `pipeline/config.py` + `.env` for the one knob):**
+
+1. **Streaming STT bubble.** The user's in-progress speech fills a LIVE bubble word-by-word. Server: the transcript
+   store gained a `_partial` slot (`set_partial`/`clear_partial`/`partial`), set from `InterimTranscriptionFrame`s;
+   `/client/transcript` returns `"partial": {text, updatedAt} | null` beside `items`. Client: one `.msg.user.live`
+   bubble (blinking caret, 82% opacity) polled at **200ms** (was 900ms), swapped for the committed bubble on commit;
+   2s client-side staleness guard for a trailed-off partial.
+
+2. **THE "no user bubble" bug — root cause + fix (P37).** User bubbles NEVER showed (only bot). The observer gated
+   the user commit on `if getattr(frame, "finalized", True)`, but `TranscriptionFrame.finalized` **defaults False** and
+   Deepgram's streaming path only sets it True on an explicit finalize() (which this turn strategy never requests) —
+   proven live: `[transcript-dbg] FINAL finalized=False '明天'`. So every user line was dropped. **Fix:** commit on the
+   frame TYPE — any `TranscriptionFrame` is a committed user line; interims are the separate
+   `InterimTranscriptionFrame`. (pipecat's base STT DOES flip `finalized=True` for SEGMENTED providers, so the old code
+   worked for those but not streaming Deepgram — a silent provider-dependent gap.)
+
+3. **One bubble per turn.** After (2), the user reported "a lot of bubbles": Deepgram emits a `TranscriptionFrame`
+   per speech PAUSE, and we committed one bubble each. Instrumented the frame order (`[seq-dbg]`):
+   `Interim(s) → TranscriptionFrame(s) → UserStoppedSpeaking → LLMFullResponseStart`. **Fix:** accumulate all finalized
+   segments into `_user` (also feeding the live partial), and commit ONE `user` bubble at `LLMFullResponseStartFrame`
+   (the bot starting to reply = the user's turn is unambiguously done; provider-independent — `VADUserStopped` is NOT
+   a subclass of `UserStopped`, so anchoring on the stop frame would be sherpa-vs-Deepgram fragile). Segments join with
+   no separator for zh/th, a space otherwise. NOTE: a genuinely long utterance the turn-analyzer splits into two
+   *turns* (two bot replies) will still be two bubbles — correct, that's two turns.
+
+4. **Mic MUTE toggle.** `micBtn` click while connected now toggles mute via `track.enabled=false` on the outgoing
+   audio (red ring + diagonal slash, status "Muted", aria updated), NOT teardown — Disconnect is its own button. Resets
+   on connect/teardown. The bot-audio analyser's Listening/Speaking label respects the mute flag.
+
+5. **Single-connection policy.** A new `/api/offer` spawns a fresh `bot()` (pipecat runner does one per offer), which
+   would let two browsers fight the single-client avatar server. Now a module-global `_active_connection` is claimed at
+   the top of `bot()` and the PREVIOUS connection is `await old.disconnect()`'d **before** the new pipeline is built
+   (so `:8002` is released first). `run_bot(transport, conn)` takes the conn; `_on_disconnected` only clears the slot if
+   it's still ours (a newer client may have already claimed it = us being kicked). Proven: probe#1 → `video frames: 0`,
+   probe#2 → `video frames: 420` clean; log shows `New WebRTC offer -- disconnecting the previous session`.
+
+6. **No-interrupt mode (`ALLOW_INTERRUPTIONS`).** New `.env` knob (default `1` = interruptible; set to **`0`** in the
+   live `.env` per the user's ask). `0` makes the bot ALWAYS finish its reply — user speech during playback never cuts
+   it off. Implemented via the turn-START strategies' `enable_interruptions=False`
+   (`UserTurnStrategies(start=[VADUserTurnStartStrategy(enable_interruptions=False),
+   TranscriptionUserTurnStartStrategy(enable_interruptions=False)])`, default smart-turn STOP strategy preserved). This
+   is the flag that broadcasts the barge-in — **NOT** the `AlwaysUserMuteStrategy` mic mute, which is BROKEN under steady
+   sync (P11); this has no mute state machine so it's safe under steady. `main.py` now builds one
+   `LLMUserAggregatorParams` shared by echo-guard + no-interrupt. Proven: user "started speaking" twice mid-reply →
+   **zero** `broadcasting interruption` (every prior session logged one per user-start).
+
+**Git:** the whole baseline (20 branch commits + all this session's + prior uncommitted Nimbus/measure work) was
+committed on `feat/ttfo-first-clause-split` and **fast-forwarded to `main`** (main was a strict ancestor — clean ff,
+no divergence). Repo is PUBLIC (`Triple3Pww/visualllm`); `.env` is gitignored (no secrets).
+
+**Open / next:**
+- With the mic always live and no headphones, no-interrupt stops the CUT-OFF but barge-in/echo speech can still be
+  transcribed and answered AFTER the bot finishes (bot may reply to its own echo). The proper fix is a TTS-frame-based
+  mic mute (mute on `TTSStarted` / unmute on `TTSStopped`, P11's noted future option) — untried.
+- Real-mic still the user's to validate (use headphones); probes drive a synthetic wav.
+
+## ⭐ HANDOFF → next session (2026-07-06, 10th): last-mile made honest + a one-click "Measure turn" button; real browser turns are blind to `[TTFO]`
+
+**Context:** picked up the 9th-session waterfall and drove the last two columns (the last mile) to real numbers.
+Everything below is in `scripts/measure.py`, `pipeline/main.py`, `.env` — **`pipeline/metrics.py` still UNTOUCHED**.
+
+**1. The "1.26s last mile" was ~40% a MEASUREMENT ARTIFACT.**
+- `measure.py` never loaded `.env`, so `os.getenv("CLIENT_JITTER_BUFFER_MS","400")` used the hardcoded **400**, not the
+  real **150** → the browser ESTIMATE row was overstated ~250ms. Fix = `load_dotenv(ROOT/".env")`. Corrected clean
+  headless zh turn: **TTFO 1.86s → transport +0.80s (probe) → browser +0.15s (est) → ear 2.81s** (was 2.22→0.86→0.40).
+- The `transport +0.80s` is a same-box LOOPBACK number — mostly NOT network; it's WebRTC/Opus encode + the onset
+  detector waiting out CosyVoice's sub-threshold **zh leading breath** (P34). So the real improvable last mile for a
+  LOCAL viewer is small (~0.15–0.8s).
+
+**2. Real BROWSER turns log `[TTFO] count:0` — the production metric is BLIND to real users.** Confirmed root cause:
+pipecat's transcription turn-stop path (`llm_response_universal`, logged **"strategy: None"**) broadcasts NO
+user-stop frame the `TtfoMeter` arms on, and a noisy real mic yields no Silero VAD stop either (only a clean-silence
+headless WAV fires `TurnAnalyzerUserTurnStopStrategy` → `VADUserStoppedSpeakingFrame`). `TranscriptionFrame` is
+consumed by the aggregator before the meter's post-avatar position. A meter-side fix needs fragile version-specific
+pipecat turn surgery → **fixed in `measure.py` instead:** new `parse_browser_turn()` anchors `--from-browser` on the
+`[client-playout]` beacon (not a stale `[TTFO]`) and derives the turn's TTFO itself.
+
+**3. THE BUTTON (`MEASURE_BUTTON=1`, default OFF) — the robust way to measure a real browser turn.** A "Measure turn"
+button injected into `/client/`. On click (a USER GESTURE → `ctx.resume()`, the reason it works where the passive
+`CLIENT_PLAYOUT_PROBE` never fired live) it taps the played bot audio, fires ONE real turn via **`POST
+/client/measure-turn`** (server injects `LLMMessagesAppendFrame(run_llm=True)` with a fixed question into the live
+`_active_task` → full LLM→TTS→avatar turn), times **click→first-voice-onset** and shows it in-page ("heard N ms"),
+and beacons the onset to `/client/playout`. **Verified live** — the user clicked it 3× (each: `[measure-turn]
+injected turn` + `Bot started speaking` + a real `"src":"button"` beacon). A JS brace bug (missing `}` → `Unexpected
+token 'catch'` → whole script died → "no button") was caught with Playwright and fixed.
+
+**4. CROSS-DEVICE CLOCK (important).** The user views `/client/` from a **separate device over Tailscale** whose clock
+was ~14 min off the server — this breaks the whole same-box `Date.now()==time.time()` assumption (beacon−bot_started =
+−834s garbage). Fix: `parse_browser_turn` anchors the last mile on the beacon's **server-clock log-arrival time**, not
+the browser `Date.now()` in the body → offset-immune. **CAVEAT (honest):** for a REMOTE device that server-clock Δ =
+last-mile-out + the beacon's network trip BACK, so it OVER-counts and SWINGS with the link (measured 0.94s then 1.99s
+on Tailscale — real variance, not a bug). **The trustworthy figure is the button's IN-PAGE number** (click→ear, a
+single browser-clock delta — no offset, no return-trip). Remote last mile is network/jitter-buffer dominated (lever =
+`CLIENT_JITTER_BUFFER_MS` + the link), NOT the pipeline.
+
+**Files (all UNCOMMITTED):** `pipeline/main.py` (`_install_measure_button`, `/client/measure-turn`, `_active_task`
+global set in `run_bot`/cleared in `_on_disconnected`), `scripts/measure.py` (`load_dotenv`, `parse_browser_turn` +
+`_build_turn` refactor, server-clock beacon anchor + freshness guard), `.env` (`MEASURE_BUTTON=1`, `CLIENT_PLAYOUT_PROBE=1`).
+
+**OPEN:** (a) optionally beacon the button's click→ear DURATION (clock-immune) so `--from-browser` reports the accurate
+experienced latency instead of the network-inflated server-clock Δ — needs a restart + reload + click; (b) whether to
+arm the production `TtfoMeter` on the transcription turn-stop path so real-user turns log `[TTFO]` (deliberate pipecat
+work); (c) commit decision for this session's changes.
+
+---
 
 ## ⭐ HANDOFF → next session (2026-07-06, 9th): measure system now reports the TRUE per-stage latency all the way to the user's ear
 

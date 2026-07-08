@@ -156,8 +156,13 @@ cross-dissolves the last spoken frame→rest pose over N frames, delivered **fre
 during the close") so it survives steady's non-live transport without the audio-cap stranding it; `0`
 = clean snap; needs `END_TAIL=0`; `docs/PROBLEMS-AND-FIXES.md` P12), `MUSETALK_IDLE_MOTION` (**0** = no breathing idle; the face
 holds the static neutral portrait between turns — the user's pick. `1` = the synthesized breathing
-loop. Server reads it from the OS env, so `run.ps1` propagates it), `MUSETALK_SIZE` (**256** on this box;
-code default 512 — shrinking it does NOT cut MuseTalk compute),
+loop. Server reads it from the OS env, so `run.ps1` propagates it), `MUSETALK_SIZE` (**512** now — the delivered
+frame px, couples server+client+`video_out`. Bumped from 256 for a crisper studio/hair (the model still generates
+the face at a fixed 256px, so higher res only sharpens the STATIC frame, not the animated mouth). **512 is the
+lag-free ceiling on this shared GPU: 768/1024 profiled with render headroom in ISOLATION but dropped to ~10fps under
+live CosyVoice GPU contention → steady-mode voice lag** (`docs/PROBLEMS-AND-FIXES.md` P36); higher res needs a
+dedicated avatar GPU. Also pair with `MUSETALK_BASE_MAX` (source-portrait res cap, **768**; higher = sharper
+background but heavier composite) and keep `MUSETALK_FPS` identical across server+pipeline or you get drift),
 `MUSETALK_TRT` (**1 = default, load-bearing for A/V sync**: TensorRT UNet+VAE render path,
 per-segment render ~389ms→~255ms so the avatar keeps ~12fps under CosyVoice's shared-GPU
 contention — where the PyTorch path drifts seconds behind the voice on long turns. Engines live in
@@ -235,8 +240,8 @@ wsl -d Ubuntu -e bash -c "bash /mnt/e/Claude/cosyvoice-local-tts/run_vllm_server
 E:\miniconda3\envs\musetalk\python.exe -u -m local_services.musetalk_server.app
 #    (reads AVATAR_REF / MUSETALK_SIZE / MUSETALK_FPS from the OS env ONLY — no python-dotenv)
 
-# 3. Pipeline — project main env (SYSTEM Python 3.11, has pipecat — NOT a conda env); serves /client
-python -m pipeline.main                                             # http://localhost:7860/client/
+# 3. Pipeline — project main env (SYSTEM Python 3.11, has pipecat — NOT a conda env); serves /client + /nimbus
+python -m pipeline.main            # prebuilt: localhost:7860/client/  |  custom Nimbus UI: localhost:7860/nimbus/
 
 # --- or start the avatar server + pipeline together ---
 .\scripts\run.ps1
@@ -369,6 +374,22 @@ audio/video drift.
   prebuilt dist.
 - **Open the client at `/client/` WITH the trailing slash** — the prebuilt page references its
   assets relatively, so `/client` (no slash) 404s them → white screen.
+- **The custom "Nimbus AI" client lives at `/nimbus/`** (figma-to-code redesign, `docs/PROBLEMS-AND-FIXES.md`
+  P36/**P37**) — a self-contained vanilla-JS page in `local_services/nimbus_client/` (full-screen weather-anchor avatar +
+  glass chat panel), served by `_install_nimbus_client` (StaticFiles, `no-store`). It speaks the SAME SmallWebRTC
+  signaling (`POST /api/offer`) as the prebuilt bundle — no build step — so it is **additive**: `/client/` prebuilt
+  is untouched and stays the fallback. Its extras are two thin server endpoints (same `_inject_client_patches`
+  middleware pattern): **`POST /client/say {text}`** injects a typed turn via `LLMMessagesAppendFrame` into
+  `_active_task`, and **`GET /client/transcript?since=N`** serves the conversation for the chat bubbles, fed by a
+  READ-ONLY `BaseObserver` on the `PipelineTask` (`_TranscriptStore`; taps bot `LLMTextFrame`s + user
+  `TranscriptionFrame`s — no pipeline structural change). Open it WITH the trailing slash, same as `/client/`.
+  **Chat behavior (P37):** the user's speech streams into a LIVE bubble word-by-word (STT interims → the store's
+  `_partial` slot → `/client/transcript` returns `"partial"` → the client polls at 200ms), then commits as **ONE**
+  bubble per turn (segments accumulate, commit at `LLMFullResponseStart`; committing per `TranscriptionFrame` gives a
+  bubble per speech pause). The user commit keys on the frame TYPE, **NOT** `frame.finalized` (Deepgram's streaming
+  path leaves it False → gating on it dropped every user bubble). The mic button **mutes** (toggles the audio track,
+  not disconnect) once connected. **Single-connection:** a new `/api/offer` disconnects the previous session
+  (`_active_connection`) so two clients never fight the single-client avatar server.
 
 ## Conventions
 
@@ -377,7 +398,10 @@ audio/video drift.
 - Accepted tradeoffs (see `STATUS.md`): echo-guard defaults OFF (`ECHO_GUARD=0`, barge-in — use
   headphones) because the half-duplex mute (`=1`) is broken under the default `steady` sync (mic
   stuck-muted after a turn, `docs/PROBLEMS-AND-FIXES.md` P11); `=1` is valid only with
-  `MUSETALK_SYNC_MODE=live`. On the single shared GPU the
+  `MUSETALK_SYNC_MODE=live`. **`ALLOW_INTERRUPTIONS` (default `1`, live `.env` = `0`, P37):** `0` = the
+  bot always finishes its reply (user speech during playback never cancels it). This flips the
+  turn-START strategies' `enable_interruptions` (the barge-in broadcast) — NOT the P11-broken mic mute,
+  so it is safe under steady. On the single shared GPU the
   lips can trail the voice under load in `live` mode — that's the cost of `live` never freezing; the
   SAFE next lever is bounding the avatar server's `out_q`, **never** re-locking the voice (locked
   sync froze it — see STATUS.md).

@@ -1326,3 +1326,129 @@ Critical/Important. **10 commits on `feat/ttfo-first-clause-split`, NOT on `main
 commit hard-depends on held client-patch infra, so "measure only" isn't cleanly separable). Spec/plan:
 `docs/superpowers/{specs,plans}/2026-07-06-measure-end-to-end-latency*`. Full run recipe: `CLAUDE.md` Commands →
 Avatar A/V test tooling.
+
+## P36 — custom "Nimbus AI" web client (figma-to-code) + the resolution-vs-sync ceiling on the shared GPU ✅ SHIPPED (2026-07-07, 11th session)
+
+**What.** A distinct, self-contained **custom client** at **`/nimbus/`** (a figma-to-code redesign — full-screen
+weather-anchor avatar on the left 70%, glass chat panel on the right 30%), served ALONGSIDE the pipecat prebuilt
+`/client` (untouched, still the fallback). It speaks the SAME SmallWebRTC signaling — `POST /api/offer`, then avatar
+video + bot audio arrive as WebRTC tracks and the mic goes up the same PC — so **plain vanilla JS, no build step, no
+pipeline structural change**. Mounted as `StaticFiles` (`_install_nimbus_client`, served `no-store`) from
+`local_services/nimbus_client/`.
+
+**Pieces (all additive, all env-nothing / client-only unless noted):**
+- **Live A/V core** — validated headless against the running stack: offer→`200`, both tracks arrive, avatar frames
+  decode. Connect / **Disconnect** ("End") buttons + a loading→connecting→live overlay (no static poster); a
+  name-tag status dot + equalizer that animate only while the bot speaks (AnalyserNode on the bot audio).
+- **Text send** — `POST /client/say {text}` injects a TYPED turn into the live pipeline as
+  `LLMMessagesAppendFrame(run_llm=True)` (same `_active_task` inject as the measure button) → LLM→TTS→avatar speaks
+  it. The box echoes the user bubble locally + auto-connects if not yet live.
+- **Transcript bubbles** — the pipeline has no RTVI processor in this build, so instead of a data channel a
+  **READ-ONLY `BaseObserver`** on the `PipelineTask` (`observers=[...]`, no structural change) taps the bot's
+  aggregated reply (`LLMTextFrame`s bracketed by `LLMFullResponseStart/End`) + finalized user `TranscriptionFrame`s
+  into a ring buffer, served by `GET /client/transcript?since=N`; the client polls it (~0.9s) → bubbles. Typed turns
+  produce no `TranscriptionFrame`, so no double-add.
+- **Avatar = the weather anchor.** `AVATAR_REF=assets/avatar_studio_match.png` — a **square-padded** crop of the
+  studio presenter photo. MuseTalk forces a SQUARE output (`_frame_to_bytes` resize to `SIZE×SIZE`), so a wide shot
+  would horizontally squish; the padded square keeps the full studio and the panel's `object-fit:cover` crops the
+  blurred pad. **Anchored to the TOP** (real image at top, pad at bottom) + `object-position:center top` so the
+  studio top is kept and the bottom cropped (user's framing pick). NOTE the model only lip-syncs a **cropped
+  256px face** composited back into the full frame — output resolution never sharpens the animated mouth, only the
+  static studio/hair.
+
+**LLM 429 dead-end ✅ FIXED (same session).** `OPENROUTER_PROVIDER_ONLY=Groq` pinned the free Groq tier with **no
+fallback**, so an intermittent Groq `429 Too Many Requests` killed the whole turn (looked like "no response";
+compounded because replies are spoken, not yet text — the transcript above fixes the visibility). Fix = **unpin**
+(`OPENROUTER_PROVIDER_ONLY=` empty) → OpenRouter uses its full pool (`deepinfra, groq, novita, google-vertex`) with
+auto-failover off a rate-limited provider. Gotcha caught live: the `.env` loader does **NOT strip an inline `#`
+comment** from a value — `OPENROUTER_PROVIDER_ONLY=  # note` sent the comment text as the provider list → `404 No
+allowed providers`. Keep that line comment-free (comment on its own line above).
+
+**The load-bearing finding — resolution vs A/V sync on the one shared 16GB GPU.** `MUSETALK_SIZE` (output frame px,
+couples server+client+`video_out`) was pushed 256→512→768→**1024** chasing sharpness. Isolated per-segment profiles
+showed huge render headroom at every size (e.g. 1024/BASE_MAX768: ~129ms per 8-frame seg vs the 667ms/12fps budget),
+**but under REAL live load — MuseTalk sharing the card with CosyVoice's vLLM — 1024 dropped to ~10fps effective**
+(`[avatar timing] … 10.1 fps … LIPS BEHIND`), and in `steady` mode the voice is paced to the lagging video → audible
+**voice lag**. Retesting 1024 at `fps=12` + `BASE_MAX=768` + `2M` bitrate still lagged live. **Verdict: `MUSETALK_SIZE=512`
+is the practical ceiling for lag-free real-time on this box** (still 4× the pixels of the original 256; sharper studio,
+no drift). Also fixed a genuine drift source found en route: the avatar server had been relaunched at `MUSETALK_FPS=14`
+while `.env`/pipeline used `12` — **one fps everywhere is load-bearing** (server stride, client release clock,
+`video_out_framerate`), now aligned at 12. Lesson (again): the isolated render profile passes what the live shared-GPU
+run rejects — trust the live `[avatar timing]`/`hold` under contention, not the isolated per-segment cost. Structural
+fix for higher res stays the dedicated avatar GPU.
+
+**State.** All the above is **UNCOMMITTED** on `feat/ttfo-first-clause-split` (new `local_services/nimbus_client/`,
+`main.py` `_install_nimbus_client` + `/client/say` + `/client/transcript` + `_TranscriptStore`/observer, `.env` avatar
+ref + provider unpin + `MUSETALK_SIZE=512`/`BASE_MAX=768`, `run.ps1` propagates `MUSETALK_BASE_MAX`, new `assets/avatar_*`).
+Open the custom UI at **`/nimbus/`** (trailing slash); `/client/` prebuilt is the untouched fallback.
+_(Committed to `main` in the 12th session — see P37.)_
+
+---
+
+## P37 — `/nimbus/` chat: no USER bubbles (streaming-bubble work) + "a lot of bubbles" + mic mute + single-connection + no-interrupt ✅ SHIPPED (2026-07-08, 12th session)
+
+**Symptom.** The `/nimbus/` chat showed the bot's reply bubbles but **never** the user's spoken turns. Then, once
+user bubbles worked, a single spoken sentence produced **several** user bubbles. Plus two requested features: clicking
+the mic should MUTE (not disconnect), and the bot should not be interruptible.
+
+**Root cause — the missing user bubble.** The read-only transcript observer (P36) committed a user line with
+`if getattr(frame, "finalized", True): store.add("user", frame.text)`. But `TranscriptionFrame.finalized`
+**defaults to `False`**, and Deepgram's *streaming* STT only sets it `True` on an explicit `finalize()` — which the
+active turn strategy never requests. Proven live with a temp probe: `[transcript-dbg] FINAL finalized=False '明天'`. So
+the guard was False on every user frame → **every** user bubble was dropped (bot bubbles use the
+`LLMFullResponseStart/End` bracket, unaffected). Subtle trap: pipecat's base **segmented** STT DOES flip
+`finalized=True` in its `push_frame`, so the same code works for segmented providers (sherpa/funasr) but silently
+fails for streaming Deepgram — a provider-dependent gap that a unit test with a hand-built frame (default `finalized`)
+would also miss.
+
+**Fix — commit on frame TYPE, not `finalized`.** Any `TranscriptionFrame` is a committed user line; the in-progress
+text arrives as the separate `InterimTranscriptionFrame`. So: interims → `store.set_partial()` (the streaming live
+bubble); `TranscriptionFrame` → accumulate the user turn.
+
+**"A lot of bubbles" → one per turn.** Deepgram emits a `TranscriptionFrame` **per speech pause**, so committing one
+bubble per frame produced a bubble per pause. Instrumented the per-turn frame order (`[seq-dbg]`):
+`Interim(s) → TranscriptionFrame(s) → UserStoppedSpeaking → LLMFullResponseStart`. Fix: accumulate every finalized
+segment into `_user` (which also feeds `set_partial` so the live bubble keeps growing across pauses), and commit ONE
+`user` bubble at **`LLMFullResponseStartFrame`** — the bot beginning to reply is the provider-independent "user turn
+complete" signal (chosen over `UserStoppedSpeakingFrame` because sherpa's `VADUserStoppedSpeakingFrame` is NOT a
+subclass of it, so a stop-frame anchor would be fragile across STT providers). Segments join with **no separator** for
+zh/th (a space reads as a mid-sentence break), a space for word languages. Caveat: a long utterance the turn analyzer
+splits into two *turns* (two bot replies) is still two bubbles — correct.
+
+**Streaming bubble transport.** `_TranscriptStore` gained a `_partial` slot (`set_partial`/`clear_partial`/`partial`
+property, not seq'd); `/client/transcript` returns `"partial": {text, updatedAt} | null` beside `items`. Client polls
+at **200ms** (was 900ms), renders one `.msg.user.live` bubble (blinking caret via `@keyframes caretPulse`, 82%
+opacity), swaps it for the committed bubble when the `user` item arrives, and has a 2s client-side staleness guard for
+a trailed-off partial. Verified live: interim `台 → 台北明天的天 → 台北明天的天氣怎麼樣` streamed, then one committed
+`user '台北明天的天氣怎麼樣'`.
+
+**Mic MUTE toggle.** `micBtn` click while connected toggles mute via `micStream.getAudioTracks()[t].enabled=false`
+(a disabled track sends silence → STT hears nothing) with a red ring + diagonal `::after` slash + status "Muted" + aria
+update; Disconnect stays its own button. Resets on connect/teardown; the bot-audio analyser's Listening/Speaking label
+respects the mute flag.
+
+**Single-connection policy.** pipecat's runner spawns a fresh `bot()` per `/api/offer`, so two browsers would fight
+the single-client avatar server (`:8002`) on the one shared GPU. Now a module-global `_active_connection` is claimed at
+the top of `bot()` and the previous connection is `await old.disconnect()`'d **before** the new pipeline is built (so
+`:8002` is released first); `run_bot(transport, conn)` threads the conn; `_on_disconnected` clears the slot only if
+it's still ours (a newer client already claimed it = us being kicked). Proven: probe#1 → `video frames: 0` (kicked),
+probe#2 → `video frames: 420` clean; log `New WebRTC offer -- disconnecting the previous session`.
+
+**No-interrupt mode (`ALLOW_INTERRUPTIONS`).** New `.env` knob (default `1` interruptible; live `.env` set to `0`).
+`0` = the bot always finishes; user speech during playback never cancels it. The interruption is broadcast by the user
+**turn-start** strategy when `enable_interruptions` is True (`user_turn_processor._on_user_turn_started` →
+`broadcast_interruption()`), so the fix builds the default start strategies with it **off**:
+`UserTurnStrategies(start=[VADUserTurnStartStrategy(enable_interruptions=False),
+TranscriptionUserTurnStartStrategy(enable_interruptions=False)])`, keeping the default smart-turn STOP strategy. This
+is deliberately NOT the `AlwaysUserMuteStrategy` mic mute (`ECHO_GUARD`), which is broken under steady sync (P11); the
+strategy flag has no mute state machine so it's safe under steady. `main.py` now builds one shared
+`LLMUserAggregatorParams` for echo-guard + no-interrupt. Proven live: user "started speaking" twice mid-reply → **zero**
+`broadcasting interruption` (vs one per user-start in every prior session). Residual (unfixed): with a live mic + no
+headphones, barge-in/echo speech is no longer a cut-off but can still be transcribed and answered AFTER the bot
+finishes; the proper cure is a TTS-frame-based mic mute (mute on `TTSStarted`/unmute on `TTSStopped`, P11's future
+option).
+
+**State.** SHIPPED and **committed to `main`** (fast-forward from `feat/ttfo-first-clause-split`; main was a strict
+ancestor). Files: `pipeline/main.py` (observer + `_partial` + single-connection + no-interrupt),
+`pipeline/config.py` (`allow_interruptions`), `.env` (`ALLOW_INTERRUPTIONS=0`),
+`local_services/nimbus_client/index.html` (live bubble + mute). All verified with `scripts._webrtc_probe`.
