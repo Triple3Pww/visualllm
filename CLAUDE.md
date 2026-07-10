@@ -22,7 +22,7 @@ A/V-sync architecture decision (read it before touching sync).**
 | VAD | Silero (local) | pipeline |
 | STT | Deepgram nova-2 (`en-US`/`zh-TW`/`th` by `LANGUAGE`) default; **local OFFLINE alt `STT_PROVIDER=sherpa`** (sherpa-onnx streaming zipformer, bilingual zh-en, in-process CPU/~0 VRAM, zh→Traditional via OpenCC) or `funasr` (SenseVoice segmented, `:8004`, untested alt) | cloud / **local CPU** |
 | LLM | `LLM_PROVIDER=openrouter` — OpenAI-compatible, so **cloud OR local Ollama** by `OPENROUTER_BASE_URL` (any model via `OPENROUTER_MODEL`); or `weather_chain` (Chinese weather bot) | cloud / local / remote |
-| TTS | **CosyVoice2-0.5B** local streaming (default, on vLLM in WSL, TTFB ~1.1s), or **MOSS-TTS-Realtime** (`TTS_PROVIDER=moss`, `:8003`) | **`:8001` cosy / `:8003` moss, both WSL** |
+| TTS | **CosyVoice** local streaming on vLLM in WSL — `COSYVOICE_MODEL=v2` (CosyVoice2-0.5B) or **`v3`** (Fun-CosyVoice3-0.5B, **current baseline**, +flow-decoder TRT + CUDA graphs, isolated first-chunk zh~1.08/en~0.80s; graphs carry the P33 zh-lipsync caveat, safe on `en`). Or **MOSS-TTS-Realtime** (`TTS_PROVIDER=moss`, `:8003`) | **`:8001` cosy / `:8003` moss, both WSL** |
 | Avatar | **MuseTalk** local mouth-region talking-head (female portrait), **TensorRT render by default** (`MUSETALK_TRT=1`) | **`:8002`, `musetalk` conda env** |
 | Config | **Web config panel** — edit `.env` + restart the pipeline from a browser | **`:7870` (`:8444` over Tailscale)** |
 
