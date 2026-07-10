@@ -43,7 +43,7 @@ rejected — so the probe is allowed to **kill**, never to **approve**.
 
 | Piece | Change |
 |---|---|
-| `tts_engine.py` | New env `COSYVOICE_MODEL_DIR` (default = current v2 path). Swap hardcoded `CosyVoice2(...)` → `AutoModel(...)`. Drop the `load_jit` kwarg (`CosyVoice3.__init__` has no such parameter; it is `False` today). |
+| `tts_engine.py` | Swap hardcoded `CosyVoice2(...)` → `AutoModel(...)`. Drop the `load_jit` kwarg (`CosyVoice3.__init__` has no such parameter; it is `False` today). `COSYVOICE_MODEL_DIR` **already exists** at `tts_engine.py:67` — no new env var needed. |
 | weights | `Fun-CosyVoice3-0.5B-2512` → `CosyVoice/pretrained_models/Fun-CosyVoice3-0.5B-2512/` |
 | contention rig | MuseTalk server (`musetalk` env, production env vars) + `scripts/_drive_frames.py output/reply_concise.wav 12` looping. Real renderer, deterministic workload. Pipeline/WebRTC not needed for the gate. |
 | probes | `_ttfb_variance.py` (8 openers × 4 rounds = 32 samples/arm/cycle); `_zh_audio_ab.py` extended with a **leading**-silence metric (free P34 breath check). |
@@ -81,9 +81,10 @@ fix the rig. Costs one extra cycle. This is the check that would have caught the
 
 ## Risks — reported as blockers, not as results
 
-1. **`<|endofprompt|>` assertion.** `CosyVoice3LM` asserts token `151646` is present in
-   `prompt_text` (`cosyvoice/llm/llm.py:479`). Our zero-shot path likely does not inject it.
-   Expect one code tweak.
+1. ~~**`<|endofprompt|>` assertion.**~~ **RESOLVED, no code change.** `CosyVoice3LM` asserts token
+   `151646` is in `prompt_text` (`cosyvoice/llm/llm.py:591`), but `<|endofprompt|>` is already in the
+   tokenizer's `allowed_special` (`cosyvoice/tokenizer/tokenizer.py:249`) and `prompt_text` comes from
+   the `COSYVOICE_PROMPT_TEXT` env (`tts_engine.py:48`). The v3 arm sets that env with the token appended.
 2. **vLLM export may reject v3's `llm.pt`.** If it does, the fallback is v3 on PyTorch — and
    **that number is not reportable as "v3 is slow."** It is a blocked test, and must be
    reported as such, not as a rigged comparison.
