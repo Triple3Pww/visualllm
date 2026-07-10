@@ -38,19 +38,15 @@ if [ "$COSYVOICE_MODEL" = "v3" ]; then
   # LIPSYNC degrades to the EYE though the TTS stopwatch looks faster). UNVERIFIED for v3's zh lipsync.
   export COSYVOICE_FLOW_TRT=${COSYVOICE_FLOW_TRT:-1}
 fi
-# Lever 2 (CUDA graphs): EAGER by default (0 = capture graphs -> faster per-token TTS decode).
-# VERDICT 2026-07-05 (8th session): KEEP EAGER. The graph win is real but ONLY on the TTS side; the
-# COST is on the zh-audio/avatar side, which is what matters for the talking head.
-#   - A TTS-TTFB variance probe (_ttfb_variance.py) showed graphs FASTER + LOWER-variance than eager
-#     (even under real MuseTalk render) -> so from the TTS stopwatch, graphs look strictly better.
-#   - BUT the user's eye caught zh LIPSYNC degrading with graphs ON. Root cause, measured
-#     (_zh_audio_ab.py, same zh sentence x5): graphs ON alters the zh AUDIO -- longer (median
-#     8.92 vs 8.28s), MORE internal silence (worst 0.76 vs 0.68s, frac 0.30-0.36 vs 0.22-0.33),
-#     more run-variance. The graph decode perturbs the zh-critical RAS sampling (the P18 fix that
-#     stops zh looping on the silence token). MuseTalk lip-syncs off a WHISPER of that waveform, so
-#     a degraded zh waveform -> mouth shapes that don't track the words. en is spared (no RAS reliance).
-# So the "no drawback" re-investigation measured the WRONG side (TTS TTFB); P31's original revert was
-# right. Set COSYVOICE_VLLM_EAGER=0 to force graphs (fine for an en-only / TTS-throughput setup).
+# Lever 2 (CUDA graphs): default 0 = capture graphs (faster per-token TTS decode).
+# BASELINE 2026-07-10 (user decision): graphs ON, paired with v3 + flow-TRT, on LANGUAGE=en.
+# Isolated first-chunk TTFB with graphs+flow-TRT: zh 1.08s / en 0.80s.
+# KNOWN RISK, carried from the P27-P33 saga and NOT re-cleared for v3: graphs perturb the
+# zh-critical RAS sampling (P18) -> the zh AUDIO gets longer + more internal silence, and since
+# MuseTalk lip-syncs off a WHISPER of that waveform, the mouth can stop tracking the words. That
+# is why graphs were kept OFF for the v2/zh baseline (the user's eye rejected them, P33). en is
+# spared (no RAS reliance), which is why graphs-on is fine for the current en baseline. If you
+# switch to zh, re-check the lipsync by eye (or flip COSYVOICE_VLLM_EAGER=1 / the panel toggle).
 # (docs P27/P31/P32/P33; the config panel's CUDA-graphs toggle flips this + relaunches.)
 export COSYVOICE_VLLM_EAGER=${COSYVOICE_VLLM_EAGER:-0}
 # zh TTFO lever -- REVERTED to 0 (2026-07-04, live-measured twice): hop=5's isolated first-chunk
