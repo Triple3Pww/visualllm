@@ -1519,6 +1519,12 @@ the GPU + cloud LLM/STT spend with no auth. Real multi-user public = a hosted SF
 
 ## P39 — LIVE avatar "lips don't match the words" = the client buffered the server's HELD/dup frames as real (2026-07-10, 14th session)
 
+> ⚠️ **SUPERSEDED as an explanation of the symptom (see P40).** The dup-drop below is a real, correct fix for a real
+> defect (phantom held frames inflating `_vbuf`), and it stays. But it was **not** why the mouth didn't match the words —
+> the user's eye rejected the result, and the actual cause was that the avatar server was being fed **noise** (P40).
+> The trap: `_vbuf` pollution and the true bug produce a similar-sounding symptom, so P39 "confirmed" itself on a metric
+> (`end drift ±0.00s`) that could never see the real problem. Read P40 before trusting anything here as the root cause.
+
 **Symptom (a multi-session open problem).** The LIVE avatar's mouth MOTION didn't track the voice — the *shapes* looked
 wrong for the words — while the offline PRERENDER was "a lot better." The user was explicit: **our system, not the
 network** (a whole prior session chased a WAN/Tailscale theory and the user rejected it; `MUSETALK_SIZE 256` fit-the-stream
@@ -1567,3 +1573,115 @@ cumulative `asyncio.sleep(dur)` to stop the feed-side render starvation at the s
 pauses). **The user's live eye is the final gate** (the recurring lesson: the probe passes what the eye rejects) — the probe
 confirms the mechanism is fixed and drift is gone, but sign-off is the user watching a real turn. UNCOMMITTED (hold-for-live
 pattern). Offline clean reference for comparison: `output/_live_turn_pcm_ref.mp4`.
+
+---
+
+## P40 — THE avatar "same generic mouth pattern" bug: the lip-sync model was fed NOISE (odd-byte misalignment) ✅ SHIPPED (2026-07-10, 16th session)
+
+**Symptom (the multi-session "live lipsync is bad, offline is good" problem — the REAL one).** The live avatar's mouth
+opened and closed in roughly the same wordless pattern regardless of what was said, and never rested during pauses. The
+user was explicit, twice: *"it is not an A/V sync problem"* and *"the avatar keeps moving the same kind of mouth pattern."*
+The voice itself always sounded perfect.
+
+**Root cause.** Audio is int16: **two bytes per sample**. The TTS hands over `TTSAudioRawFrame` buffers with **odd byte
+counts** (CosyVoice's `iter_chunked` splits mid-sample). Two paths consume that audio:
+
+- **Downstream (what you HEAR)** — `_align_even()` **carries** the dangling odd byte into the next frame so the PCM stays
+  whole-sample. This is the old P3 anti-screech fix. The voice is therefore always clean.
+- **Avatar-bound (what the mouth is generated from)** — `_to_16k_mono_pcm()` **DROPPED** it: `if len(audio)&1: audio = audio[:-1]`.
+
+Drop one byte and the *next* buffer begins half a sample late. Every int16 after it is assembled from the **low byte of one
+sample and the high byte of the next** -> loud, constant, full-band noise. MuseTalk lip-syncs off a **Whisper of the
+waveform** (not the text, cf. P18/P33), so Whisper heard static: no words, no consonants, **no pauses** -> the UNet produced
+a continuous generic flap. **Voice clean, mouth garbage** — and completely independent of fps, `MUSETALK_SIZE`, GPU
+contention and A/V sync, which is why every earlier theory failed against it.
+
+**Evidence (same turn: `_delivered_voice.wav` 24k = what you hear, vs `_live_turn_pcm.wav` 16k = what the avatar gets):**
+
+| metric | aligned (correct) | 1-byte misaligned | ACTUAL avatar-bound | white noise |
+|---|---|---|---|---|
+| peak xcorr vs the true voice (any lag +-2s) | 1.0 | — | **0.008** | ~0 |
+| zero-crossing rate | 0.227 | 0.459 | **0.453** | ~0.5 |
+| envelope dynamic range | 8.8 dB | 0.9 dB | **0.4 dB** | ~0 |
+| quiet-10th-pct / peak (are there pauses?) | 0.006 | 0.517 | **0.349** | ~1 |
+| RMS | 4000 | 13876 | **13531** | — |
+
+A deliberate 1-byte shift of the true voice reproduces the avatar-bound signature almost exactly. The spectrum is the
+clincher: real speech is `-0.8 dB @0-1k` rolling off to `-38.5 dB @7-8k`; the avatar-bound audio is **flat**
+(`-8.3 / -5.8 / -6.2 / -6.2 / -9.5 dB`) — the signature of noise, not a voice.
+
+**FIX (`musetalk_video.py`, the `TTSAudioRawFrame` branch).** Carry the remainder across chunks, exactly as `_align_even`
+does downstream, aligned to a whole sample-FRAME (`2 * channels`, so stereo stays correct):
+
+```python
+stride = 2 * ch
+data = self._srv_carry + frame.audio
+keep = len(data) - (len(data) % stride)
+self._srv_carry = data[keep:]          # hold the remainder for the next chunk
+data = data[:keep]
+pcm = _to_16k_mono_pcm(data, sr, ch) if data else b""
+```
+
+`self._srv_carry` is initialised in `__init__` and reset in `_reset_turn()`.
+
+**Verified live** (drove a real turn with `MUSETALK_DUMP_PCM=1`, compared the avatar-bound PCM against `resample_poly` of
+the delivered 24k voice): peak xcorr **0.008 -> 0.969 @ lag 0.000s**; ZCR 0.453 -> **0.185** (target 0.189); envelope dyn
+range 0.4 -> **8.8 dB** (target 8.8); quiet/peak 0.349 -> **0.040** (target 0.043); RMS 13531 -> **4089** (target 4113); the
+spectrum became speech-shaped. Turn healthy: `audio 19.04s video 19.08s (229 frames) end drift +-0.04s`. Watchable live
+output: `output/FIXED_live_avatar.mp4`.
+
+**RESIDUAL (open, minor).** xcorr is 0.969, not 1.0, because `_to_16k_mono_pcm` still downsamples 24k->16k with bare
+`np.interp` and **no anti-aliasing low-pass**, folding everything above 8 kHz back into the speech band (that band carries
+the consonants). Fix with a streaming `resample_poly` if the visemes still look soft. This is "words slightly smeared", not
+"static" — a different order of magnitude from the bug above.
+
+### ⚠️ METROLOGY — how this stayed hidden for THREE sessions (read before writing another avatar probe)
+
+1. **"Delivered frames == offline render, byte-identical" proves only that the RENDER IS DETERMINISTIC.** It cannot catch a
+   corrupt *input*, because the offline side was fed **the same corrupt PCM** (`_live_turn_pcm.wav`). A test whose reference
+   shares the suspect input can never fail. **Always ask what the reference is actually fed.**
+2. **The "good" offline reference was accidentally repaired audio.** Earlier prerenders were fed a voice captured off
+   **WebRTC** — i.e. the *downstream* copy, which `_align_even` had already fixed. So the reference bypassed the broken code
+   path and always looked great. The user cracked the case by noticing *"offline is bad now too"* — the first time the
+   offline render had been fed the audio the avatar actually receives.
+3. **Mouth-motion vs audio-RMS correlation is USELESS** (4th time it misled). It scored the noise-driven render `0.97x` and
+   the correct one `1.07x`; it previously scored a 1:1 offline reference as `+280 ms` out of sync. Energy != phoneme shape.
+4. **Never verify A/V sync from a WebRTC capture reconstructed by ARRIVAL time.** Under `steady`, audio is released in
+   bursts paced to the render (`hold` can exceed 30 s), so arrival-order reconstruction distorts the A/V relationship and
+   the metric measures the harness, not the system. Use the uncompressed `MUSETALK_DUMP_DELIVERED` dump.
+5. **Dead theories, all disproven by the above** — do not re-open without new evidence: fps/OOD-Whisper-stride
+   (`MUSETALK_SIZE 512->256` to reach 25 fps), held-frame stalls, shared-GPU contention, VP8/transport, segmentation/Whisper
+   context. The render was correct the whole time; it was being *told* the wrong thing.
+
+---
+
+## P41 — a whole turn could lose A/V sync: the pump swallowed `video_start` on back-to-back turns ✅ SHIPPED (2026-07-10, 16th session)
+
+**Symptom.** On ~6% of turns (**22 of 364** in `pipeline.log`, across 2026-07-07..10, *including the user's own sessions*),
+the voice and lips had no relationship at all for the entire turn. Worst on **long replies** and rapid follow-ups.
+
+**Root cause — a client/server segment-boundary mismatch.** The client pairs frames to audio *positionally*
+(`_emit_pair`: frame `i` <-> audio `i/fps`), and learns when a turn's frames begin from the server's `video_start` marker.
+But the server's pump emitted `video_start` **only** on a `playing: False -> True` transition, and `video_end` **only** once
+speech had ended AND `out_q` had drained for `idle_grace`. So when a new turn's `speech_start` arrived while the server was
+still `playing` (the previous segment's render backlog not yet drained), `speaking.set()` made `not sp` false forever ->
+**no `video_end`, `playing` never returned to False, and `video_start` was never emitted for the new turn.**
+
+The client had already wiped its buffers on `TTSStartedFrame` and sat waiting for a marker that would never come:
+`_video_active` stayed `False`, so every frame took the `else` branch and was **pushed untagged, free-running** (hence a
+moving mouth), `_vbuf` stayed empty, `_advance()` released nothing (`video 0.0s`, `vbuf=0`, `hold` climbing `1.5 -> 18.16s`),
+and after `MUSETALK_SYNC_FALLBACK_S`=10 s `_fallback_watch` fired: `_unsynced=True` + `_drain_audio()` **dumped ~10 s of
+buffered voice at once**. From there the voice ran on real time and the lips free-ran at render pace.
+
+**FIX (`musetalk_server/app.py`).** `speech_start` sets `st["seg_restart"] = True`; the pump consumes the flag at the top of
+its loop -> `playing = False`, reset `real_sent`/`last_clock`/`empty_since`, and **drain the stale `out_q`** (those frames
+belong to the segment the client already discarded — delivering them would pair *old lips* with *new audio*). Deliberately
+**no `video_end`** there: the client would `_drain_audio()` the new turn's freshly-buffered voice unsynced.
+
+**Repro + verification.** Inject a turn via `POST /client/say` while the greeting is still draining. Before: the warning
+`MuseTalk sync: no video markers within 10.0s; forwarding voice unsynced for this turn` fires every time and `video`
+sticks at `0.0s`. After: **0 warnings**, video advances, `[avatar timing] end drift +-0.04s`, `held/dup 12 of 229 recv
+(server-real 228)`.
+
+**Note.** This is a genuine bug and the fix stays — but it is **not** the "generic mouth pattern" the user reported. That is
+P40. Fixing P41 first, and presenting it as the answer, is exactly the mistake to avoid.

@@ -351,6 +351,21 @@ audio/video drift.
 
 ## Environment constraints / gotchas (READ before debugging the avatar)
 
+- **The avatar-bound audio MUST stay whole-sample — carry the odd byte, never drop it** (`musetalk_video.py`,
+  `docs/PROBLEMS-AND-FIXES.md` **P40**). Audio is int16 (2 bytes/sample) and the TTS hands back **odd-byte** buffers. The
+  downstream (heard) copy is protected by `_align_even`; the avatar-bound feed is protected by `self._srv_carry`. Drop that
+  byte and every following int16 is assembled from the wrong two bytes → the server gets **loud broadband noise**, and since
+  MuseTalk lip-syncs off a **Whisper of the waveform**, the mouth flaps in a generic wordless pattern that never closes for
+  pauses (the voice still sounds perfect — that's the trap). This was THE multi-session "live lipsync is bad" bug.
+- **Debugging the avatar's mouth: your reference must not share the suspect input** (P40 metrology). Three sessions were
+  lost to tests that could not fail. "Delivered frames == offline render, byte-identical" only proves the render is
+  **deterministic** — feed both sides the same corrupt PCM and it passes. An offline render fed a voice captured off
+  **WebRTC** is fed the *repaired* downstream copy, so it bypasses the broken path and always looks good. Also: mouth-motion
+  vs audio-RMS correlation is **useless** (it has misled 4×), and never verify A/V sync from a WebRTC capture reconstructed
+  by *arrival* time (under `steady` the voice is released in bursts paced to the render). Use `MUSETALK_DUMP_PCM` +
+  `MUSETALK_DUMP_DELIVERED` (uncompressed, what the browser actually gets). **Dead theories — do not re-open without new
+  evidence:** fps/OOD-Whisper-stride (`MUSETALK_SIZE 512→256`), held-frame stalls, shared-GPU contention, VP8/transport,
+  segmentation/Whisper context.
 - **MuseTalk: `cudnn.benchmark` MUST stay `False`** (`musetalk_server/app.py`). With it `True`,
   cuDNN re-autotunes on the turn-START segment (different shape than mid-turn) → a **~16s GPU spike
   on the FIRST segment of every turn** → lips start ~5s late + the render falls behind on long

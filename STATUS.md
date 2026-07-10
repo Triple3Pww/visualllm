@@ -1,6 +1,9 @@
 # VisualLLm — Project Status & Next Steps
 
-_Last updated: 2026-07-08 (**12th session — the `/nimbus/` client made real: streaming STT bubble, a "no user bubble"
+_Last updated: 2026-07-10 (**16th session — the multi-session "live lipsync is bad" problem is SOLVED and COMMITTED: the
+avatar server was being fed **NOISE** (odd-byte misalignment on the avatar-bound audio path, `docs/PROBLEMS-AND-FIXES.md`
+**P40**), plus a separate turn-sync bug where the pump swallowed `video_start` (**P41**). Both fixed + pushed to `main`.
+See the TOP HANDOFF below.**) Prior: 2026-07-08 (**12th session — the `/nimbus/` client made real: streaming STT bubble, a "no user bubble"
 bug root-caused + fixed, one-bubble-per-turn, a mic MUTE toggle, single-connection enforcement, and a no-interrupt
 mode. Then THIS WHOLE BASELINE COMMITTED + fast-forwarded to `main`. See `docs/PROBLEMS-AND-FIXES.md` P37.**
 (1) **Streaming STT bubble** — the user's speech now fills a LIVE bubble word-by-word as STT hears it (interim
@@ -94,7 +97,45 @@ block below + `docs/PROBLEMS-AND-FIXES.md` P20. Prior (2nd) session: TTFO hop×l
 stands (P19). (2026-07-02): Chinese TTS fixed (RAS + "pro" voice); avatar baseline `MUSETALK_TRT=1`, LLM cloud
 gemini-2.5-flash-lite; TTFO ~4.6s→~3.2s via the first-clause split `COSYVOICE_FIRST_PIECE=1`.)_
 
-## ⭐ HANDOFF → next session (2026-07-10, 14th): LIVE "lips don't match the words" ROOT-CAUSED + FIXED (client dropped the server's HELD/dup frames) — awaiting the user's live-eye sign-off
+## ⭐ HANDOFF → next session (2026-07-10, 16th): the avatar was fed NOISE — "lips don't match the words" SOLVED + COMMITTED (P40/P41)
+
+**The multi-session open problem is closed.** It was never fps, resolution, GPU contention, held frames, or A/V sync — every
+one of those theories is now disproven. **The avatar server was being fed loud broadband noise.**
+
+**P40 (the real bug).** Audio is int16 = 2 bytes/sample, and the TTS hands over **odd-byte** buffers. The downstream (heard)
+path carries the stray byte across frames (`_align_even`, the P3 anti-screech fix) so the **voice is always clean**. The
+avatar-bound path **dropped** it (`_to_16k_mono_pcm`: `if len(audio)&1: audio = audio[:-1]`), so the next buffer began half a
+sample late and every int16 after it was assembled from the wrong two bytes. MuseTalk lip-syncs off a **Whisper of that
+waveform**, so Whisper heard static — no words, no consonants, **no pauses** — and the mouth flapped in a continuous generic
+pattern. **Fix:** carry the remainder across chunks (aligned to `2*channels`), `self._srv_carry`. Measured live, avatar-bound
+PCM vs the true voice: **peak xcorr 0.008 → 0.969 @ lag 0.000s**, ZCR 0.453→0.185, envelope dyn range 0.4→8.8 dB,
+quiet/peak 0.349→0.040. Watch `output/FIXED_live_avatar.mp4`.
+
+**P41 (a real, separate bug — NOT the reported symptom).** The pump emitted `video_start` only on `playing:False→True`, so a
+`speech_start` arriving while the previous segment still drained swallowed it; the client (which resets its buffer on
+`TTSStarted`) then free-ran the frames untagged and its 10s fallback dumped the buffered voice at once. Fired on **22 of 364
+turns**, worst on long replies. **Fix:** `speech_start` forces a fresh segment + drops stale `out_q` frames. Repro now logs
+**0** `no video markers`.
+
+**Committed + pushed to `main`:** `47496e3` (both fixes), `1f9d3bb` (prior sessions' uncommitted work: public WebRTC/TURN,
+measure button, nimbus, docs).
+
+**⚠️ READ THE METROLOGY SECTION IN P40 BEFORE WRITING ANOTHER AVATAR PROBE.** Three sessions were lost to tests that could
+not fail: the "offline reference" was accidentally fed the *repaired* (downstream) audio, so it always looked good; and
+"delivered frames == offline render, byte-identical" only proves the render is deterministic — it cannot see a corrupt
+input when both sides are fed the same corrupt input. The user cracked it by noticing *"offline is bad now too."*
+
+**OPEN / next:**
+- **Residual (minor, P40):** `_to_16k_mono_pcm` still resamples 24k→16k with bare `np.interp` and **no anti-alias LPF**, so
+  >8 kHz folds into the speech band (consonants). That's the 0.969-vs-1.0 xcorr. Fix with a streaming `resample_poly` if the
+  visemes still look soft. "Slightly smeared", not "static".
+- **Throughput (separate from lipsync):** on very long replies the render sustains ~11.9 fps against a 12 fps target, so
+  under `steady` the voice waits for frames and the turn stretches (`hold` reached ~33 s on a 70 s reply). In sync, but
+  latency-y.
+- The user's live eye on `output/FIXED_live_avatar.mp4` is the final gate (the recurring lesson: the probe passes what the
+  eye rejects — it did, four times).
+
+## ⭐ HANDOFF (2026-07-10, 14th) [SUPERSEDED by the 16th-session block above — the dup-drop is a real fix but was NOT the cause of the symptom; see P40]: LIVE "lips don't match the words" ROOT-CAUSED + FIXED (client dropped the server's HELD/dup frames) — awaiting the user's live-eye sign-off
 
 **The multi-session open problem** ("live avatar mouth MOTION wrong for the words; offline prerender a lot better; the user
 says OUR SYSTEM not the network") is **root-caused and fixed** (`docs/PROBLEMS-AND-FIXES.md` **P39**). Fix is UNCOMMITTED
