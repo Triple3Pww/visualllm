@@ -30,6 +30,13 @@ COSYVOICE_MODEL=${COSYVOICE_MODEL:-v2}
 if [ "$COSYVOICE_MODEL" = "v3" ]; then
   export COSYVOICE_MODEL_DIR=${COSYVOICE_MODEL_DIR:-/mnt/e/Claude/cosyvoice-local-tts/CosyVoice/pretrained_models/Fun-CosyVoice3-0.5B-2512}
   export COSYVOICE_PROMPT_TEXT=${COSYVOICE_PROMPT_TEXT:-"You are a helpful assistant.<|endofprompt|>你好，我是你的AI虚拟助手，很高兴见到你。今天天气不错，有什么我可以帮你的"}
+  # Flow-decoder TensorRT for v3's 300M DiT. Verified 2026-07-10: the fp32 ONNX->TRT engine builds
+  # in ~30s on first load (cached to flow.decoder.estimator.fp32.mygpu.plan), audio stays correct,
+  # isolated first-chunk TTFB zh 1.48->1.08s / en 1.34->0.80s WITH CUDA graphs (EAGER=0 below) also on.
+  # fp16 DiT TRT is NOT used (upstream warns of perf issues); fp32 only. Override with COSYVOICE_FLOW_TRT=0.
+  # CAVEAT: graphs are the config the project rejected for v2 (P33: graph decode perturbs RAS -> zh
+  # LIPSYNC degrades to the EYE though the TTS stopwatch looks faster). UNVERIFIED for v3's zh lipsync.
+  export COSYVOICE_FLOW_TRT=${COSYVOICE_FLOW_TRT:-1}
 fi
 # Lever 2 (CUDA graphs): EAGER by default (0 = capture graphs -> faster per-token TTS decode).
 # VERDICT 2026-07-05 (8th session): KEEP EAGER. The graph win is real but ONLY on the TTS side; the
@@ -45,7 +52,7 @@ fi
 # So the "no drawback" re-investigation measured the WRONG side (TTS TTFB); P31's original revert was
 # right. Set COSYVOICE_VLLM_EAGER=0 to force graphs (fine for an en-only / TTS-throughput setup).
 # (docs P27/P31/P32/P33; the config panel's CUDA-graphs toggle flips this + relaunches.)
-export COSYVOICE_VLLM_EAGER=${COSYVOICE_VLLM_EAGER:-1}
+export COSYVOICE_VLLM_EAGER=${COSYVOICE_VLLM_EAGER:-0}
 # zh TTFO lever -- REVERTED to 0 (2026-07-04, live-measured twice): hop=5's isolated first-chunk
 # TTFB win (~2.5s -> ~1.8s) is ERASED live in steady mode -- the SMALLER opening chunk fills the
 # MUSETALK_LEAD_FRAMES cushion slower, so the synced voice-start is DELAYED (P19 grid + a fresh
