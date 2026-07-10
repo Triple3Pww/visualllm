@@ -106,6 +106,30 @@ class TTSEngine:
             logging.warning("add_zero_shot_spk returned %r; falling back to per-call prompt", ok)
         self._spk_ready = ok is True
 
+        # Traditional -> Simplified before synthesis. CosyVoice's text frontend garbles long
+        # TRADITIONAL zh input (spoken output degrades into noise past ~10 chars; Simplified is
+        # clean -- reproduced locally 2026-07-11: the same sentence in Traditional transcribes
+        # back to garbage while its t2s twin is near-perfect, and the Traditional audio runs
+        # ~1-2s longer). Simplified and Traditional are the SAME spoken Mandarin, so the
+        # conversion is INAUDIBLE. This pipeline feeds Traditional (llama-4-scout output, sherpa
+        # STT -> Traditional), so it is on by default. COSYVOICE_T2S=0 disables; missing opencc
+        # -> no-op (old behavior), never a crash. Credit: chiashengchen/CosyVoice root-cause find.
+        self._t2s_cc = None
+        if os.environ.get("COSYVOICE_T2S", "1").lower() in ("1", "true", "yes", "on"):
+            try:
+                from opencc import OpenCC
+                self._t2s_cc = OpenCC("t2s")
+            except Exception as e:  # noqa: BLE001 -- missing opencc = keep old behavior
+                logging.warning("OpenCC unavailable, Traditional zh will NOT be converted: %r", e)
+
+    def _to_simplified(self, text: str) -> str:
+        """Traditional -> Simplified (inaudible) to dodge the frontend's long-Traditional garble.
+
+        A no-op on Latin/English text (opencc leaves non-Chinese untouched) and when the
+        converter is disabled/unavailable, so the en cross-lingual path is unaffected.
+        """
+        return self._t2s_cc.convert(text) if self._t2s_cc else text
+
     def _xlingual_text(self, text: str) -> str:
         """cross_lingual drops prompt_text, so v3's instruct prefix rides on the text instead."""
         return f"{V3_INSTRUCT}{text}" if self._is_v3 else text
@@ -137,6 +161,7 @@ class TTSEngine:
         if not text:
             raise ValueError("text is empty")
 
+        text = self._to_simplified(text)
         self._apply_first_hop(is_cjk(text))
         if is_cjk(text):
             if self._spk_ready:
@@ -211,6 +236,7 @@ class TTSEngine:
         if not text:
             raise ValueError("text is empty")
 
+        text = self._to_simplified(text)
         cjk = is_cjk(text)
         self._apply_first_hop(cjk)
         if cjk:
