@@ -48,20 +48,23 @@ Three thin changes, all behind `MUSETALK_SPLIT` (default `0`, i.e. today's behav
 
 ### 1. MuseTalk server (`local_services/musetalk_server/app.py`)
 - **Crop-mode frame output.** When split mode is on, every frame the pump sends (`ws.send_bytes`) is
-  the **bbox crop** `combine[y1:y2, x1:x2]` (blended, at the frame's native res, padded to even
-  W/H for VP8) instead of the full 512 frame. Idle/neutral frames become the mouth crop of the
-  neutral/idle portrait. `_composite` gains a "return the crop, not the full frame" path; the pump
-  loop is otherwise unchanged (markers, held-last, idle all still work — the bytes are just smaller).
+  the **bbox crop** `combine[y1:y2, x1:x2]`, **resized to a fixed square `MUSETALK_SPLIT_SIZE`
+  (default 256)** instead of the full 512 frame. The fixed square keeps the VP8 track dimensions
+  stable and known to the pipeline from env (no startup fetch to learn a per-portrait crop size); the
+  client un-stretches the square back into the bbox rect on draw, and since MuseTalk's face is 256px
+  the resize loses ~nothing. Idle/neutral frames become the same fixed-size mouth crop of the neutral
+  portrait. `_composite` gains a "return the fixed-size crop, not the full frame" path; the pump loop
+  is otherwise unchanged (markers, held-last, neutral rest all still work — the bytes are just smaller).
 - **`GET /overlay-assets`** (new). Returns the one-time compositing assets the client needs:
   `{ bg_png (base64, the pristine hi-res portrait = frame_cycle[0] at MUSETALK_BASE_MAX res),
      bbox: [x1,y1,x2,y2] in bg-image pixels, bg_size: [W,H], crop_size: [w,h] }`. Derived from the
   already-computed `frame_cycle[0]` + `coord_cycle[0]` — so it is automatic for any uploaded portrait.
 
 ### 2. Pipeline (`pipeline/main.py`, `pipeline/stages/…`)
-- Set the WebRTC `video_out_width/height` to the **crop size** (from the server) instead of
-  `avatar_size` when split mode is on. `MuseTalkVideoService` already forwards whatever bytes/size it
-  is told — pass it the crop size. One-fps-everywhere and `video_out_is_live = not sync_av` invariants
-  are unchanged.
+- Set the WebRTC `video_out_width/height` to **`MUSETALK_SPLIT_SIZE`** (a square, from env — no
+  startup fetch) instead of `avatar_size` when split mode is on. `MuseTalkVideoService` already
+  forwards whatever bytes/size it is told — pass it `(split_size, split_size)`. One-fps-everywhere and
+  `video_out_is_live = not sync_av` invariants are unchanged.
 - **`GET /client/avatar-overlay`** (new, same `_inject_client_patches` pattern as `/client/transcript`):
   proxies the server's `/overlay-assets` to `/nimbus`. `no-store`.
 
@@ -99,8 +102,9 @@ has **no visible seam** and stays in A/V sync (the sync path is reused, so sync 
 - **Seam at the hi-res boundary.** Blended-crop-over-same-portrait is seamless at equal res; against a
   *hi-res* background the resample boundary might show. Mitigation: alpha feather mask (one-time),
   already accounted for in the handshake shape.
-- **Even dimensions for VP8.** The bbox `(w,h)` must be padded to even; pad symmetrically and account
-  for it in the bbox the client draws to.
+- **VP8 dimensions.** Solved by the fixed square `MUSETALK_SPLIT_SIZE=256` (even, stable) — the crop
+  is resized to it server-side and un-stretched into the bbox rect client-side, so no per-portrait
+  padding math is needed.
 - **Idle-motion mode.** With `MUSETALK_IDLE_MOTION=1` the portrait sways, so the bbox moves per frame —
   the fixed-bbox assumption breaks. Phase 1 targets the default `MUSETALK_IDLE_MOTION=0` (static
   portrait). Split mode + idle motion is out of scope (document it; the server can refuse or fall back).
