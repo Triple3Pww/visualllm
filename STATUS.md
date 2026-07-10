@@ -1,5 +1,30 @@
 # VisualLLm — Project Status & Next Steps
 
+_Last updated: 2026-07-10 (**17th session — CosyVoice **v3** (Fun-CosyVoice3-0.5B) shipped as a selectable model and made
+the running baseline with full acceleration.**
+(1) **v3 A/B'd + latency-gated** — v3's 300M DiT flow decoder (v2's is 100M) costs only **+0.066s** first-chunk TTFB vs v2
+under live MuseTalk render (2 cycles x 32 samples; null test 0.030s, so the rig measures the model not drift). The
+affordability worry did not materialize. Full design/plan: `docs/superpowers/plans/2026-07-10-cosyvoice3-ab.md`.
+(2) **Two code changes v3 needed** (the spec's "no code change" was WRONG): `AutoModel` dispatch on the model dir so
+`COSYVOICE_MODEL=v2|v3` selects the model; and the instruct prefix `You are a helpful assistant.<|endofprompt|>` — v3's LM
+SPLITS on the marker (`llm.py:591`), so it must sit BEFORE the reference transcript in `COSYVOICE_PROMPT_TEXT` **and** ride the
+en `cross_lingual` text (which deletes `prompt_text`) or v3 hangs at startup / emits empty audio.
+(3) **All acceleration applied to v3 + verified**: LM on vLLM, **CUDA graphs ON**, **flow-decoder TensorRT** (fp32 DiT
+ONNX->TRT, builds ~30s, caches `flow.decoder.estimator.fp32.mygpu.plan`, deserialized on later launches). Isolated
+first-chunk TTFB with graphs+flow-TRT: **zh 1.08s / en 0.80s**. Audio correct (no silence-loop). MuseTalk TRT is independent.
+(4) **Model selectable in the config panel** (`:7870`/`:8444`) — a "CosyVoice model" card saves `COSYVOICE_MODEL` and
+relaunches the WSL TTS server; also fixed a latent bug where the graphs toggle silently reset a v3 user back to v2
+(`restart_cosyvoice()` now forwards the model).
+(5) **RUNNING BASELINE: `COSYVOICE_MODEL=v3` + CUDA graphs + flow-TRT, `LANGUAGE=en`, `MUSETALK_IDLE_MOTION=0`** (idle
+breathing OFF — a manual-launch regression, now fixed by relaunching MuseTalk with the full `.env` server-side set).
+**CAVEAT (UNVERIFIED for v3): CUDA graphs are the config P33 REJECTED for v2's Chinese** — graph decode perturbs the RAS
+sampling (P18) -> longer/gappier zh audio -> the mouth can stop tracking the words (MuseTalk lip-syncs off a Whisper of the
+waveform). **en is spared** (no RAS reliance), which is why graphs-on is fine for the current en baseline; **before trusting
+v3+graphs for zh, re-check the lipsync by eye** (or flip `COSYVOICE_VLLM_EAGER=1` / the panel's CUDA-graphs toggle). Phase-2
+v2-vs-v3 zh clips (`output/zh_v{2,3}_synced.mp4`) were rendered but NOT yet eye-judged. Two follow-ups still open: the RAS
+processor firing on v3 is unverified, and the P18 RAS fix lives in the gitignored `CosyVoice/` submodule (versioned nowhere).
+**Committed + pushed to `main` in both repos.**)_
+<!-- prior handoff -->
 _Last updated: 2026-07-10 (**16th session — the multi-session "live lipsync is bad" problem is SOLVED and COMMITTED: the
 avatar server was being fed **NOISE** (odd-byte misalignment on the avatar-bound audio path, `docs/PROBLEMS-AND-FIXES.md`
 **P40**), plus a separate turn-sync bug where the pump swallowed `video_start` (**P41**). Both fixed + pushed to `main`.
