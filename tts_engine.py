@@ -50,6 +50,12 @@ PROMPT_TEXT = os.environ.get(
 )
 SPK_ID = os.environ.get("COSYVOICE_SPK_ID", "weather")
 
+# CosyVoice3 only: the instruct prefix that must precede <|endofprompt|>. Upstream's own
+# cosyvoice3_example uses exactly this string (example.py:76,81). The marker SEPARATES the
+# prefix from the reference transcript (llm.py:591) -- putting it at the END of prompt_text
+# leaves an empty transcript.
+V3_INSTRUCT = os.environ.get("COSYVOICE_V3_INSTRUCT", "You are a helpful assistant.<|endofprompt|>")
+
 _CJK = re.compile(r"[㐀-鿿豈-﫿぀-ヿ]")
 
 
@@ -101,8 +107,8 @@ class TTSEngine:
         self._spk_ready = ok is True
 
     def _xlingual_text(self, text: str) -> str:
-        """cross_lingual drops prompt_text, so v3's required <|endofprompt|> rides on the text."""
-        return f"<|endofprompt|>{text}" if self._is_v3 else text
+        """cross_lingual drops prompt_text, so v3's instruct prefix rides on the text instead."""
+        return f"{V3_INSTRUCT}{text}" if self._is_v3 else text
 
     def _apply_first_hop(self, cjk: bool):
         """Per-language first-hop, set per request just before inference.

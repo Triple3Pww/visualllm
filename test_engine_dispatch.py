@@ -54,15 +54,16 @@ def _engine_with_model_class(fake_automodel, tmp_path, monkeypatch, class_name):
     return eng
 
 
-def test_v3_prepends_endofprompt_to_english_text(fake_automodel, tmp_path, monkeypatch):
-    """CosyVoice3 asserts <|endofprompt|> is in the tokens the LM sees. The cross_lingual
-    path (used for English) DELETES prompt_text, so the marker must ride on the text."""
+def test_v3_prepends_instruct_prefix_to_english_text(fake_automodel, tmp_path, monkeypatch):
+    """CosyVoice3 asserts <|endofprompt|> is in the tokens the LM sees, and SPLITS on it:
+    prefix before, real text after. cross_lingual (English) deletes prompt_text, so the whole
+    'You are a helpful assistant.<|endofprompt|>' prefix must ride on the text -- matching
+    upstream's cosyvoice3_example (example.py:81). A bare marker is not the documented form."""
     eng = _engine_with_model_class(fake_automodel, tmp_path, monkeypatch, "CosyVoice3")
     list(eng.synthesize_stream("Hello, warming up."))
 
     sent = eng.model.inference_cross_lingual.call_args.args[0]
-    assert sent.startswith("<|endofprompt|>"), sent
-    assert "Hello, warming up." in sent
+    assert sent == "You are a helpful assistant.<|endofprompt|>Hello, warming up.", sent
 
 
 def test_v2_english_text_is_untouched(fake_automodel, tmp_path, monkeypatch):
