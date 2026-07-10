@@ -588,7 +588,7 @@ def _ensure_client_patch_middleware() -> bool:
                 from log_setup import ensure_file_sink
 
                 ensure_file_sink("pipeline")
-                from pipecat.frames.frames import LLMMessagesAppendFrame
+                from pipecat.frames.frames import InterruptionFrame, LLMMessagesAppendFrame
 
                 import json as _json
                 raw = (await request.body())[:4000]
@@ -598,9 +598,20 @@ def _ensure_client_patch_middleware() -> bool:
                 if _active_task is None:
                     logger.warning("[say] no active session (client not connected?)")
                     return HTMLResponse("no active session", status_code=409)
-                await _active_task.queue_frames([
-                    LLMMessagesAppendFrame(messages=[{"role": "user", "content": text}], run_llm=True)
-                ])
+                # A typed turn arriving mid-reply must BARGE IN like a spoken one. Voice barge-in
+                # emits an InterruptionFrame (via the transport's broadcast_interruption); a typed
+                # turn does NOT, so without this the current turn plays to completion and the new
+                # answer only starts after it ends ("avatar runs until it ends"). InterruptionFrame
+                # is a SystemFrame (out-of-band), so it is processed AHEAD of the DataFrame append:
+                # it cancels the in-flight LLM/TTS, flushes the avatar, and commits the partial reply
+                # -- THEN the append starts the new turn cleanly. Gated on allow_interruptions so the
+                # shipped =0 "bot always finishes" mode still queues typed turns politely.
+                frames = []
+                if config.allow_interruptions:
+                    frames.append(InterruptionFrame())
+                frames.append(
+                    LLMMessagesAppendFrame(messages=[{"role": "user", "content": text}], run_llm=True))
+                await _active_task.queue_frames(frames)
                 logger.info(f"[say] injected typed turn: {text!r}")
                 return HTMLResponse("", status_code=204)
             except Exception as e:  # noqa: BLE001

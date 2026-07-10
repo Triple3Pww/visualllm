@@ -125,6 +125,12 @@ class MuseTalkVideoService(FrameProcessor):
         self._video_active = False    # between video_start and video_end
         self._unsynced = False        # fallback engaged this turn
         self._fallback_task: asyncio.Task | None = None
+        self._flushing = False        # barge-in flush: DROP every incoming server frame until the
+        #   next turn's TTSStartedFrame. On an InterruptionFrame the audio queue is drained and the
+        #   server told to reset, but frames it already rendered are still in flight on the ws (and
+        #   its out_q); without this they arrive with _video_active=False and get forwarded as IDLE
+        #   animation -> the avatar keeps lip-moving with NO voice, and any that land after the next
+        #   video_start bleed into the new turn. Set True on interrupt, cleared on the next TTSStarted.
 
         # --- per-turn A/V timing instrumentation (logs audio-vs-avatar offset + lip drift) ---
         self._t_audio_first: float | None = None   # loop.time() of first voice chunk this turn
@@ -328,6 +334,10 @@ class MuseTalkVideoService(FrameProcessor):
     # --- sync core --------------------------------------------------------
     async def _on_frame(self, img: bytes):
         """A rendered RGB frame from the server."""
+        if self._flushing:
+            # Post-interrupt: an old-turn frame still draining from the server (ws + out_q). Drop it
+            # entirely -- do not count it, buffer it, or forward it as idle. Cleared on next TTSStarted.
+            return
         # HELD/dup detection (see the append guard below): the server re-sends the last frame
         # byte-for-byte during a render underflow. A held frame is not new lip motion, so it must
         # neither count as delivered video nor land in the synced buffer. (single writer = this loop,
@@ -667,6 +677,7 @@ class MuseTalkVideoService(FrameProcessor):
             await self._reset_session()
             self._cancel_fallback()
             self._reset_turn()
+            self._flushing = True   # drop in-flight server frames until the next turn starts
             await self.push_frame(frame, direction)
 
         elif isinstance(frame, TTSAudioRawFrame):
@@ -715,6 +726,7 @@ class MuseTalkVideoService(FrameProcessor):
         elif isinstance(frame, TTSStartedFrame):
             self._cancel_fallback()
             self._reset_turn()
+            self._flushing = False   # new turn: stop dropping frames (end the post-interrupt flush)
             if self._dump_pcm:
                 self._pcm_dump = bytearray()
             if self._dump_deliv:

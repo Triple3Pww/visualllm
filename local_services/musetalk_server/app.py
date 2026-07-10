@@ -862,6 +862,14 @@ async def stream(ws: WebSocket):
                     audio_buf = np.zeros(0, dtype=np.float32)
                     engine.reset_idx()
                     speaking.clear()               # let the idle loop resume
+                    if kind == "reset":
+                        # Barge-in flush: DROP the frames already rendered for the interrupted turn.
+                        # reset used to leave up to MUSETALK_OUT_Q frames sitting in out_q, and the pump
+                        # kept streaming them to the client -- which showed them as idle animation, so
+                        # the avatar kept lip-moving with no voice (and stragglers bled into the next
+                        # turn). Reuse the seg_restart path: it drains out_q + resets the pump's markers
+                        # on its next tick, without emitting a spurious video_start/end.
+                        st["seg_restart"] = True
                     if kind == "speech_end":
                         logger.info(f"[stream] turn rendered {turn_frames} frames")
                         # Graceful TAIL: a few neutral frames so the avatar eases out instead of

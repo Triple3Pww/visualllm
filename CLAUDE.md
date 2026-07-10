@@ -45,6 +45,16 @@ now uses the fluid **"pro" AI-assistant voice** (`CosyVoice/asset/pro_ref.wav`, 
 zh ≈ English pacing. An optional zh pause-trimmer (`COSYVOICE_SILENCE_CAP_S`, `_squeeze_silence`) is **OFF by
 default** (not needed with the pro voice). Swap voices via `COSYVOICE_PROMPT_WAV`/`COSYVOICE_PROMPT_TEXT`.
 
+**Traditional-Chinese garble fix (2026-07-11, baked into the cosyvoice repo `bb43be1` — `docs/PROBLEMS-AND-FIXES.md` P43):**
+CosyVoice's text frontend **garbles long Traditional zh input** — spoken output degrades into noise past ~10 chars, while the
+SAME sentence in Simplified is flawless. This pipeline feeds Traditional (llama-4-scout output; sherpa STT → Traditional), so
+it was hitting the weak path; first-piece splitting (short comma-bounded pieces) hid it under the ~10-char threshold, but any
+longer comma-less clause garbled. Fix = **`COSYVOICE_T2S=1` (default on)** converts Traditional → Simplified with OpenCC
+`t2s` **before** synthesis, in `tts_engine.py` (`_to_simplified()` at the top of both `synthesize`/`synthesize_stream`, covers
+`/tts` + stream + warmup; no-op on en, and no-op if opencc is missing). **Inaudible** — T and S are the same spoken Mandarin.
+Reproduced + verified locally (transcribe-back A/B): Traditional now synthesizes as cleanly as Simplified. `COSYVOICE_T2S=0`
+disables. A distinct root cause from the RAS silence-loop (P18) above.
+
 **vLLM CUDA graphs — BASELINE NOW GRAPHS-ON for v3 + `en` (2026-07-10, 17th session); the zh caveat below STILL STANDS
 (`docs/PROBLEMS-AND-FIXES.md` P27/P31/P32/P33):** `COSYVOICE_VLLM_EAGER` default is **`0`** (graphs on) in
 `run_vllm_server.sh`, paired with `COSYVOICE_MODEL=v3` + flow-TRT on `LANGUAGE=en` (isolated first-chunk zh 1.08/en 0.80s).
@@ -432,10 +442,19 @@ audio/video drift.
 - Accepted tradeoffs (see `STATUS.md`): echo-guard defaults OFF (`ECHO_GUARD=0`, barge-in — use
   headphones) because the half-duplex mute (`=1`) is broken under the default `steady` sync (mic
   stuck-muted after a turn, `docs/PROBLEMS-AND-FIXES.md` P11); `=1` is valid only with
-  `MUSETALK_SYNC_MODE=live`. **`ALLOW_INTERRUPTIONS` (default `1`, live `.env` = `0`, P37):** `0` = the
-  bot always finishes its reply (user speech during playback never cancels it). This flips the
-  turn-START strategies' `enable_interruptions` (the barge-in broadcast) — NOT the P11-broken mic mute,
-  so it is safe under steady. On the single shared GPU the
+  `MUSETALK_SYNC_MODE=live`. **`ALLOW_INTERRUPTIONS` (default `1` = BASELINE since P44, was live `.env`
+  `0` under P37):** `0` = the bot always finishes its reply (user speech during playback never cancels
+  it; typed turns queue politely). `1` = a mid-reply interruption **flushes the current turn clean**.
+  This flips the turn-START strategies' `enable_interruptions` (the barge-in broadcast) — NOT the
+  P11-broken mic mute, so it is safe under steady. **Two interrupt fixes shipped under it (P44):** (a) a
+  clean-FLUSH — on the pipecat `InterruptionFrame` the avatar client drops in-flight server frames
+  (`_flushing`, `musetalk_video.py`) and the MuseTalk server drains its `out_q` on `reset`
+  (`app.py`, reuses the `seg_restart` path), so the avatar no longer keeps lip-moving silently / leaks
+  the old turn into the next; (b) a TYPED turn now barges in too — `/client/say` (the `/nimbus` keyboard
+  path) emits an `InterruptionFrame` before the `LLMMessagesAppendFrame` when `allow_interruptions`
+  (a typed turn otherwise emits no barge-in, so the old turn played to completion). The partial bot
+  reply is preserved in context automatically (pipecat's assistant aggregator commits it on
+  interruption). On the single shared GPU the
   lips can trail the voice under load in `live` mode — that's the cost of `live` never freezing; the
   SAFE next lever is bounding the avatar server's `out_q`, **never** re-locking the voice (locked
   sync froze it — see STATUS.md).

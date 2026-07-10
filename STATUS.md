@@ -1,5 +1,17 @@
 # VisualLLm — Project Status & Next Steps
 
+_Last updated: 2026-07-11 (**19th session — mid-turn INTERRUPT made to work, and `ALLOW_INTERRUPTIONS=1` is now the
+baseline (`docs/PROBLEMS-AND-FIXES.md` P44).** Two bugs: (1) the barge-in FLUSH was half-done — on `InterruptionFrame` the
+avatar client drained the audio queue but nothing stopped the frames the server had ALREADY rendered, so the avatar kept
+lip-moving with **no voice** to the end of the turn and old frames leaked into the next; fixed by draining the MuseTalk
+server's `out_q` on `reset` (reuses the `seg_restart` path) + a client `_flushing` gate that drops in-flight frames until the
+next `TTSStartedFrame`. (2) a TYPED turn (the way the user works — voice was unavailable) emitted NO barge-in, so `/nimbus`
+interrupts did nothing (bot finished, then answered); fixed by having `/client/say` queue an `InterruptionFrame` before the
+`LLMMessagesAppendFrame` when `allow_interruptions`. The partial bot reply stays in context automatically (pipecat commits it
+on interruption — verified). Verified offline (`archive/_interrupt_flush_test.py`, real handlers) + live by the user in
+`/nimbus/`. **Committed to `main` this session; push pending an explicit ask.** Files: `pipeline/main.py`,
+`local_services/musetalk_video.py`, `local_services/musetalk_server/app.py`, `.env`, docs, `archive/_interrupt_flush_test.py`.)_
+<!-- prior handoff -->
 _Last updated: 2026-07-10 (**17th session — CosyVoice **v3** (Fun-CosyVoice3-0.5B) shipped as a selectable model and made
 the running baseline with full acceleration.**
 (1) **v3 A/B'd + latency-gated** — v3's 300M DiT flow decoder (v2's is 100M) costs only **+0.066s** first-chunk TTFB vs v2

@@ -1724,3 +1724,82 @@ fault with the thing under test. **Always send zh through the probe transport** 
 ASCII-escaped), never a shell `curl` with literal CJK. Related: MuseTalk env drift — a hand-launch that omits
 `MUSETALK_IDLE_MOTION=0` (server default is `1`) re-enables idle breathing; launch via `run.ps1`/the launcher, which
 propagates the full `.env` server-side set.
+
+## P43 — CosyVoice garbles long TRADITIONAL Chinese input; fix = OpenCC t2s before synth (2026-07-11, 18th session)
+
+**What shipped.** `COSYVOICE_T2S=1` (default on) converts Traditional → Simplified with OpenCC `t2s` **before** synthesis,
+in `tts_engine.py`. Committed + pushed to `cosyvoice-local-tts` main (`bb43be1`); the `opencc-python-reimplemented`
+dep + a `.gitattributes` LF fix rode along (`f48a9cb`). Root-cause credit: a senior's find (`chiashengchen/CosyVoice`).
+
+**The bug.** CosyVoice's text→token frontend garbles **long Traditional zh input**: spoken output degrades into noise past
+~10 chars, while the SAME sentence in Simplified is flawless. Traditional and Simplified are the same spoken Mandarin, so
+converting T→S is **inaudible** — it just dodges the frontend's weak path. This matters here because the pipeline FEEDS
+Traditional to CosyVoice (llama-4-scout outputs Traditional; sherpa STT → Traditional via OpenCC). It stayed hidden because
+first-piece splitting chops zh into short comma-bounded pieces (min 5 CJK), so most live clauses sit under the ~10-char
+threshold; any clause longer than that with no internal comma garbles. Distinct root cause from the RAS silence-loop (P18),
+the leading breath (P34), and reference-voice choppiness — a NEW one.
+
+**Reproduced + verified locally** (`scratchpad/_t2s_ab.py`, tts-env whisper transcribe-back; 3 runs, consistent): synth the
+same sentence Traditional vs its t2s twin via `/tts` (whole string, no split), transcribe each back — garbled audio → garbage
+transcript. 8 chars: both clean. 16 chars: Simplified clean every run, Traditional garbled (once came back as romaji
+"Tekando" for 氣溫). 41 chars: Traditional heavily corrupted, Simplified near-perfect; Traditional audio also ran ~1–2s
+LONGER (noise inflation). After the fix: Traditional transcribes IDENTICALLY clean to Simplified and the duration match is
+restored. **Metric note (P42-family):** whisper writes spoken 二十八 → "28", so a naive CER false-flags BOTH variants
+equally — judge by transcript CONTENT + duration, not CER.
+
+**Placement.** Built the `OpenCC("t2s")` converter once in `TTSEngine.__init__` (gated by `COSYVOICE_T2S`; missing opencc →
+no-op, never crashes), applied via `_to_simplified()` at the top of BOTH `synthesize` and `synthesize_stream` — covers `/tts`,
+`/tts/stream`, and startup warmup. No-op on Latin/en text, so the cross-lingual path is untouched. `opencc` was pip-installed
+into the WSL `cosyvllm` env (where `app:app` runs via `/mnt/e`) and added to `requirements.txt`.
+
+**Rode-along fix — CRLF broke the WSL launch.** `run_vllm_server.sh` was CRLF **on disk**, which fails under WSL bash
+(`set: -: invalid option`, exit 2). Cause was NOT a bad commit — the repo blob is LF, but the global `core.autocrlf=true`
+rewrites `*.sh` to CRLF on every Windows-side checkout, so the working copy breaks the moment git touches the file (the
+running server survived only because it predated the last such checkout; the launcher's `bash run_vllm_server.sh` would hit
+it on the next restart). Durable fix = `.gitattributes` `*.sh text eol=lf` + a one-time renormalize, so checkouts keep shell
+scripts LF regardless of autocrlf. A plain `sed`-strip would be undone by the next checkout. Also: a WSL server started via
+`wsl bash -c … & ` (nohup) DIES when the `bash -c` exits (distro session teardown) — hold it open in a foreground/bg task.
+
+## P44 — mid-turn interrupt: avatar kept lip-moving with NO voice + old turn leaked into the next; typed turns never interrupted at all (2026-07-11, 19th session)
+
+**Symptom.** With barge-in on, interrupting a reply left the avatar **still lip-moving with no voice** until it reached the
+end of the turn, and fragments of the interrupted turn **leaked into the next** one. The user hit it by **TYPING** a new
+message mid-reply (voice input was unavailable) in the `/nimbus` client — where the interrupt did **nothing at all**: the bot
+finished its whole reply, THEN answered the typed one.
+
+**Two distinct root causes, found by reading the code (not guessing).**
+1. **The flush was half-done.** On the pipecat `InterruptionFrame` the avatar client (`musetalk_video.py`) drained the audio
+   feed-queue + told the server to `reset`, but nothing stopped the frames the server had **already rendered** and was
+   streaming back. On the **server** (`musetalk_server/app.py`), `reset` cleared only the audio buffer — it left up to
+   `MUSETALK_OUT_Q` (600) rendered frames sitting in `out_q`, and the pump kept `send_bytes`-ing them. On the **client**,
+   those in-flight frames arrived with `_video_active=False` → fell into the idle branch of `_on_frame` → were forwarded as
+   **idle animation** (the silent lip-moving); any that landed after the next `video_start` appended to `_vbuf` (the leak).
+2. **A typed turn emits no barge-in.** Voice barge-in works because the transport calls `broadcast_interruption()` →
+   `InterruptionFrame` (a `SystemFrame`) → cascades downstream, and each processor's `_start_interruption` **cancels + recreates
+   its process task** (verified in `frame_processor.py` / `tts_service.py` / `llm_service.py` — it truly kills in-flight
+   LLM+TTS generation, not just metrics). But the typed path `/client/say` (`main.py`) queued **only** an
+   `LLMMessagesAppendFrame(run_llm=True)` — a `DataFrame` that appends and queues the new run **behind** the still-playing turn.
+   No `InterruptionFrame` was ever produced, so cause #1's flush code never even ran.
+
+**Fix.**
+- **Server:** on `reset`, set `st["seg_restart"] = True` — reuse the existing `speech_start` drain, so the pump drops the
+  interrupted turn's queued frames on its next tick (no spurious `video_start`/`video_end`).
+- **Client:** a `_flushing` flag, set by the `InterruptionFrame` handler, cleared by the next `TTSStartedFrame`; `_on_frame`
+  returns immediately while flushing, so in-flight frames that beat the server drain are dropped, never shown as idle.
+- **Typed interrupt:** `/client/say` now queues an `InterruptionFrame()` **before** the append when `config.allow_interruptions`.
+  Because `InterruptionFrame` is out-of-band it is processed AHEAD of the `DataFrame` append (no race): it cancels the current
+  turn everywhere, flushes the avatar, and commits the partial reply, THEN the new turn starts. Gated on the flag so the
+  shipped-`0` "polite queue" mode is unchanged.
+- **LLM response preserved = zero code (verified, not assumed).** `_handle_interruptions` → `_trigger_assistant_turn_stopped(
+  interrupted=True)` → `push_aggregation()` writes the partial reply into context **before** `reset()`, so the interrupted
+  answer stays in conversation history for the next turn to reference.
+
+**Verified.** `archive/_interrupt_flush_test.py` drives the REAL `process_frame` handlers offline (bare `TaskManager`, no
+GPU/WebRTC): a baseline idle frame forwards → `InterruptionFrame` arms the flush → 5 in-flight frames are all dropped →
+`TTSStartedFrame` clears the flush → frames forward again. `scripts.preflight` clean. The **live** typed-interrupt path
+confirmed by the user in `/nimbus/` (the avatar + voice now cut immediately and switch to the new answer). **Baseline flipped:**
+`ALLOW_INTERRUPTIONS=1` in `.env` (code default was already `1`).
+
+**Metrology note.** The *first* fix attempt (cause #1 only) looked right in code but did nothing live — because the user
+types, and cause #2 meant the `InterruptionFrame` it hooked was never emitted. The "can't use voice, I type" detail was the
+whole diagnosis; the fix that matters most for a keyboard user is the `/client/say` interrupt, not the flush.
