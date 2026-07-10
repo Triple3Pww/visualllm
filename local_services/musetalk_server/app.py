@@ -712,6 +712,27 @@ async def stream(ws: WebSocket):
         empty_since = None
         try:
             while not closed.is_set():
+                # A new turn began (speech_start). The CLIENT reset its frame buffer on
+                # TTSStartedFrame, so this segment MUST be re-marked or the client never
+                # re-enters synced pairing. Without this, a speech_start arriving while the
+                # previous segment is still `playing` (its render backlog hasn't drained)
+                # swallows the new turn's video_start -> the client free-runs the frames
+                # untagged and its 10s fallback dumps the voice -> lips never match the voice
+                # for that whole turn. Drop the stale frames too: they belong to the previous
+                # segment, which the client has already discarded, so delivering them would
+                # pair old lips with new audio. Do NOT emit video_end here -- the client would
+                # drain the new turn's freshly-buffered voice unsynced.
+                if st.get("seg_restart"):
+                    st["seg_restart"] = False
+                    playing = False
+                    empty_since = None
+                    real_sent = 0
+                    last_clock = 0
+                    while True:
+                        try:
+                            out_q.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
                 sp = speaking.is_set()
                 # Watchdog: if a speech_end was dropped, don't stay "speaking"
                 # forever -- once the queue drains and audio has stopped, idle.
@@ -819,6 +840,7 @@ async def stream(ws: WebSocket):
                     logger.info(f"[stream] config: fps={fps}")
                 elif kind == "speech_start":
                     turn_frames = 0
+                    st["seg_restart"] = True       # force a fresh video_start for this turn
                     speaking.set()                 # pump holds, not idle, now
                     st["last_audio"] = loop.time()
                 elif kind in ("reset", "speech_end"):

@@ -135,6 +135,17 @@ class MuseTalkVideoService(FrameProcessor):
         self._last_offset_log = 0.0                 # throttle for the continuous offset trace
         self._odd_carry = b""                       # anti-screech: dangling odd byte carried between
         #   downstream audio frames so the PCM stays whole-sample (see _align_even)
+        self._srv_carry = b""                       # SAME guard for the AVATAR-bound feed. TTS hands us
+        #   odd-byte buffers; _to_16k_mono_pcm used to DROP the stray byte, so the next buffer started
+        #   half a sample late and every int16 after it was assembled from the wrong two bytes -> the
+        #   server got loud broadband NOISE. MuseTalk lip-syncs off a Whisper of that waveform, so the
+        #   mouth flapped in a generic wordless pattern and never closed for pauses (voice was fine --
+        #   _align_even protects the downstream copy only). Carry the byte instead of dropping it.
+        # EVIDENCE (viseme-mismatch hunt): server re-sends the LAST frame (byte-identical HELD/dup) on
+        # every tick it underflows mid-turn; the client can't tell it from a real frame -> it lands in
+        # _vbuf and shifts the audio<->lip mapping. Count held dups vs the server's REAL rendered count.
+        self._held_dups = 0
+        self._server_real = 0
 
         # --- smooth end-of-turn close (steady) ---
         # MuseTalk can't ease the mouth shut itself (silence renders a PARTED mouth, not closed
@@ -164,6 +175,58 @@ class MuseTalkVideoService(FrameProcessor):
         self._last_emit_t: float | None = None   # loop.time() of the last video frame pushed out
         self._stall_open = False                 # a freeze is currently being reported
         self._watch_task: asyncio.Task | None = None
+        # EVIDENCE (#1 audio-content): dump the EXACT 16k PCM this turn sent to the avatar server,
+        # so it can be rendered offline (GPU-alone) and compared -- separates a corrupt-audio cause
+        # from the pacing cause. Gated by MUSETALK_DUMP_PCM=1 (writes output/_live_turn_pcm.wav).
+        self._dump_pcm = (os.getenv("MUSETALK_DUMP_PCM", "0") or "0").lower() in ("1", "true", "yes")
+        self._pcm_dump = bytearray()
+        # EVIDENCE (fix verification): dump the EXACT A/V the client delivers DOWNSTREAM this turn
+        # (the frames + voice the transport/browser actually gets), so the fix can be watched, not just
+        # trusted from logs. Gated by MUSETALK_DUMP_DELIVERED=1 -> output/_delivered_{rgb.bin,voice.wav}
+        # + _delivered_meta.json; a scratchpad muxer builds the mp4. Off by default.
+        self._dump_deliv = (os.getenv("MUSETALK_DUMP_DELIVERED", "0") or "0").lower() in ("1", "true", "yes")
+        self._deliv_active = False
+        self._deliv_v: list[bytes] = []          # delivered RGB frame buffers, in order
+        self._deliv_a = bytearray()              # delivered voice PCM (downstream sample rate)
+        self._deliv_sr = MUSETALK_SR
+        self._deliv_ch = 1
+
+    def _write_deliv_dump(self):
+        """Write the turn's exact delivered frames + voice for offline muxing (evidence, best-effort)."""
+        import json as _json
+        try:
+            n = len(self._deliv_v)
+            side = int(round((len(self._deliv_v[0]) // 3) ** 0.5)) if n else 0
+            with open(os.path.join("output", "_delivered_rgb.bin"), "wb") as f:
+                for fr in self._deliv_v:
+                    f.write(fr)
+            import wave
+            with wave.open(os.path.join("output", "_delivered_voice.wav"), "wb") as w:
+                w.setnchannels(self._deliv_ch); w.setsampwidth(2); w.setframerate(self._deliv_sr)
+                w.writeframes(bytes(self._deliv_a))
+            with open(os.path.join("output", "_delivered_meta.json"), "w") as f:
+                _json.dump({"frames": n, "side": side, "fps": self._fps,
+                            "voice_sr": self._deliv_sr, "voice_ch": self._deliv_ch,
+                            "voice_s": len(self._deliv_a) / 2 / self._deliv_ch / self._deliv_sr}, f)
+            logger.info(f"[deliv-dump] {n} frames ({side}px) + "
+                        f"{len(self._deliv_a)/2/self._deliv_ch/self._deliv_sr:0.2f}s voice -> output/_delivered_*")
+        except Exception:  # noqa: BLE001
+            logger.exception("[deliv-dump] failed")
+
+    def _write_pcm_dump(self):
+        """Write the turn's exact server-bound 16k mono PCM to a wav (evidence, best-effort)."""
+        import wave
+        try:
+            out = os.path.join("output", "_live_turn_pcm.wav")
+            with wave.open(out, "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(MUSETALK_SR)
+                w.writeframes(bytes(self._pcm_dump))
+            logger.info(f"[pcm-dump] wrote {len(self._pcm_dump)//2} samples "
+                        f"({len(self._pcm_dump)/2/MUSETALK_SR:0.2f}s) -> {out}")
+        except Exception:  # noqa: BLE001
+            logger.exception("[pcm-dump] failed")
 
     # --- connection lifecycle ---------------------------------------------
     async def _connect(self):
@@ -265,7 +328,13 @@ class MuseTalkVideoService(FrameProcessor):
     # --- sync core --------------------------------------------------------
     async def _on_frame(self, img: bytes):
         """A rendered RGB frame from the server."""
-        if self._video_active:   # count frames + trace the live lips-vs-voice offset
+        # HELD/dup detection (see the append guard below): the server re-sends the last frame
+        # byte-for-byte during a render underflow. A held frame is not new lip motion, so it must
+        # neither count as delivered video nor land in the synced buffer. (single writer = this loop,
+        # so reading _vbuf[-1] here without the lock is safe.)
+        is_dup = (self._sync and self._video_active and not self._unsynced
+                  and bool(self._vbuf) and img == self._vbuf[-1])
+        if self._video_active and not is_dup:   # count only REAL frames + trace the offset
             now = asyncio.get_running_loop().time()
             if self._t_vid_first is None:
                 self._t_vid_first = now
@@ -291,7 +360,22 @@ class MuseTalkVideoService(FrameProcessor):
             return
         if self._video_active and not self._unsynced:
             async with self._lock:
-                self._vbuf.append(img)
+                if is_dup:
+                    # The server re-sends the LAST frame byte-for-byte to keep the WebRTC track alive
+                    # whenever its render underflows mid-turn (GPU contention with CosyVoice, or a
+                    # real-time feed briefly starving it). In steady/prerender the CLIENT re-paces video
+                    # to audio, so a held frame landing in _vbuf becomes a PHANTOM real frame: it shifts
+                    # every following viseme one frame late (a freeze, then the real frames delivered
+                    # late) -- the live "lips don't match the words" that offline prerender (GPU-alone,
+                    # no underflow) never shows. DROP it so _vbuf stays exactly the REAL rendered
+                    # sequence and audio i/fps always pairs with real lip-frame i. Under a stall the
+                    # client then holds the last real frame and the voice pauses IN SYNC (the intended
+                    # steady tradeoff) instead of drifting. Genuine consecutive render frames are never
+                    # byte-identical (the Whisper-of-waveform conditioning varies frame to frame even in
+                    # silence), so this only ever drops a true server hold. docs/PROBLEMS-AND-FIXES.md P39.
+                    self._held_dups += 1
+                else:
+                    self._vbuf.append(img)
             if self._mode == "steady":
                 await self._advance()   # release paced to frames AS they arrive (continuous)
         else:
@@ -317,7 +401,10 @@ class MuseTalkVideoService(FrameProcessor):
             # mid-reply re-segment can't desync the frame<->audio mapping.
             self._cancel_fallback()
             self._video_active = True
+            if self._dump_deliv:
+                self._deliv_active = True   # begin capturing the real speaking segment (A/V aligned)
         elif kind == "video_clock":
+            self._server_real = int(evt.get("frames", self._server_real))  # server's REAL frame count
             if not self._unsynced and self._mode == "steady":
                 await self._advance()   # heartbeat (real pacing is on frame receipt)
         elif kind == "video_end":
@@ -325,6 +412,9 @@ class MuseTalkVideoService(FrameProcessor):
             await self._advance()       # flush whatever is buffered (prerender: the whole reply)
             await self._drain_audio()   # release the turn's trailing voice
             self._log_turn_timing()
+            if self._dump_deliv and self._deliv_active:
+                self._deliv_active = False
+                self._write_deliv_dump()
             self._video_active = False
             if self._close_fade > 0 and close_start is not None and self._rest_frame is not None:
                 # Ease the mouth shut: FREE-RUN the crossfade (untagged, like the idle loop) so it
@@ -427,6 +517,9 @@ class MuseTalkVideoService(FrameProcessor):
         self._aud_dur = 0.0
         self._last_offset_log = 0.0
         self._odd_carry = b""
+        self._srv_carry = b""
+        self._held_dups = 0
+        self._server_real = 0
 
     def _log_turn_timing(self):
         """Log this turn's audio-vs-avatar timing: how long after the voice the lips started,
@@ -445,7 +538,8 @@ class MuseTalkVideoService(FrameProcessor):
             f"[avatar timing] lips start +{startup:0.2f}s after voice | "
             f"audio {self._aud_dur:0.2f}s video {vid_dur:0.2f}s "
             f"({self._vframes} frames, {eff_fps:0.1f} fps) | "
-            f"end drift +{drift:0.2f}s -> {verdict}"
+            f"end drift +{drift:0.2f}s -> {verdict} | "
+            f"held/dup {self._held_dups} of {self._vframes} recv (server-real {self._server_real})"
         )
 
     # --- fallback (marker-less server / lost markers) ---------------------
@@ -505,6 +599,13 @@ class MuseTalkVideoService(FrameProcessor):
             self._align_even(frame)   # keep the downstream PCM whole-sample (anti-screech guard)
         if direction == FrameDirection.DOWNSTREAM and isinstance(frame, OutputImageRawFrame):
             self._note_emit()         # freeze watchdog: a video frame is leaving downstream
+        if self._dump_deliv and self._deliv_active and direction == FrameDirection.DOWNSTREAM:
+            if isinstance(frame, OutputImageRawFrame):
+                self._deliv_v.append(frame.image)   # exact delivered frame, in order
+            elif isinstance(frame, TTSAudioRawFrame):
+                self._deliv_sr = getattr(frame, "sample_rate", self._deliv_sr) or self._deliv_sr
+                self._deliv_ch = getattr(frame, "num_channels", self._deliv_ch) or self._deliv_ch
+                self._deliv_a.extend(frame.audio)   # exact delivered voice (post _align_even)
         await super().push_frame(frame, direction)
 
     def _note_emit(self):
@@ -579,9 +680,20 @@ class MuseTalkVideoService(FrameProcessor):
             # ALWAYS feed the server REAL-TIME-PACED (via _feed_q) so the renderer can't build a
             # backlog from CosyVoice's faster-than-real-time output (the "voice finishes but the
             # avatar keeps going" lag). Pacing keeps the server's queue ~empty either mode.
-            pcm = _to_16k_mono_pcm(frame.audio, sr, ch)
+            # Keep the server-bound PCM whole-sample ACROSS chunks: TTS hands back odd-byte buffers,
+            # and dropping the stray byte (the old behaviour, inside _to_16k_mono_pcm) shifted every
+            # following int16 by one byte -> the avatar was fed NOISE and its mouth flapped wordlessly.
+            # Carry the remainder into the next chunk, exactly like _align_even does downstream.
+            stride = 2 * ch
+            data = self._srv_carry + frame.audio
+            keep = len(data) - (len(data) % stride)
+            self._srv_carry = data[keep:]
+            data = data[:keep]
+            pcm = _to_16k_mono_pcm(data, sr, ch) if data else b""
             if pcm:
                 self._feed_q.put_nowait(("audio", (pcm, dur)))
+                if self._dump_pcm:
+                    self._pcm_dump.extend(pcm)   # exact server-bound PCM (evidence)
             if not self._sync:
                 # AUDIO-MASTER (live): forward the voice NOW (plays at real-time, lips best-effort).
                 await self.push_frame(frame, direction)
@@ -603,6 +715,12 @@ class MuseTalkVideoService(FrameProcessor):
         elif isinstance(frame, TTSStartedFrame):
             self._cancel_fallback()
             self._reset_turn()
+            if self._dump_pcm:
+                self._pcm_dump = bytearray()
+            if self._dump_deliv:
+                self._deliv_active = False   # capture starts at video_start (skip the pre-speech neutral hold)
+                self._deliv_v = []
+                self._deliv_a = bytearray()
             # speech_start/end go through _feed_q so they order correctly with the real-time-
             # paced audio (start before the turn's audio, end after it fully drains).
             self._feed_q.put_nowait(("speech_start", None))
@@ -610,6 +728,8 @@ class MuseTalkVideoService(FrameProcessor):
 
         elif isinstance(frame, TTSStoppedFrame):
             self._feed_q.put_nowait(("speech_end", None))
+            if self._dump_pcm and self._pcm_dump:
+                self._write_pcm_dump()
             await self.push_frame(frame, direction)
 
         else:
