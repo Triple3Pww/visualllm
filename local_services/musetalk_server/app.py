@@ -77,6 +77,10 @@ PARSING_MODE = os.getenv("MUSETALK_PARSING_MODE", "jaw")
 # slows the per-frame full-frame compositing (PIL). Keeps the face well above the
 # 256px VAE crop while making blending realtime.
 BASE_MAX = int(os.getenv("MUSETALK_BASE_MAX", "768"))
+# Split mode: stream ONLY the fixed-size mouth crop and let /nimbus composite it over a
+# pristine still (crisp background, encoder budget on the mouth). Default off (full-frame).
+SPLIT = os.getenv("MUSETALK_SPLIT", "0").lower() in ("1", "true", "yes")
+SPLIT_SIZE = int(os.getenv("MUSETALK_SPLIT_SIZE", "256"))
 # How long the pump waits (queue empty + no audio) before deciding a `speech_end`
 # was dropped and reverting to the idle loop. Must comfortably exceed the largest
 # normal inter-chunk gap within one utterance, or it flips to idle mid-sentence.
@@ -178,6 +182,16 @@ class MuseTalkEngine:
 
         self._prepare_avatar()
         self._neutral = self._frame_to_bytes(self.frame_cycle[0])
+        # --- split mode (MUSETALK_SPLIT): stream only the fixed-size mouth crop ---
+        self._split = SPLIT
+        self._split_size = SPLIT_SIZE
+        self._split_bbox = self.coord_cycle[0] if self.coord_cycle else None
+        self._neutral_split = (
+            self._crop_split(self.frame_cycle[0]) if self._split and self._split_bbox else None
+        )
+        if self._split:
+            logger.info(f"[split] MUSETALK_SPLIT on: streaming {self._split_size}px mouth crop "
+                        f"(bbox={self._split_bbox}).")
         self._build_idle_loop()
         self._ready = True
         self._warmup()   # pay the first-inference cost NOW so the first real turn isn't cold
@@ -415,6 +429,8 @@ class MuseTalkEngine:
         self.idx = 0
 
     def neutral_frame(self) -> bytes:
+        if self._split and self._neutral_split is not None:
+            return self._neutral_split
         return self._neutral
 
     def idle_frames(self) -> list[bytes]:
@@ -437,6 +453,12 @@ class MuseTalkEngine:
         Disable with MUSETALK_IDLE_MOTION=0.
         """
         import cv2
+
+        if getattr(self, "_split", False):
+            # Split mode targets a STATIC portrait (fixed bbox); an idle sway would move the
+            # bbox and break the fixed-crop mapping. Rest on the neutral mouth crop instead.
+            self._idle_loop = []
+            return
 
         if os.getenv("MUSETALK_IDLE_MOTION", "1").lower() not in ("1", "true", "yes"):
             self._idle_loop = []
@@ -493,6 +515,17 @@ class MuseTalkEngine:
             feats.append(af)
         return feats, len(audio)
 
+    def _crop_split(self, frame_bgr) -> bytes:
+        """Fixed-size RGB mouth crop for split mode: crop the bbox region of a full BGR
+        frame and resize to split_size square. The client un-stretches it into the bbox
+        rect. Keeps the VP8 track a stable known size (the pipeline sets it from env)."""
+        import cv2
+        x1, y1, x2, y2 = self._split_bbox
+        crop = frame_bgr[y1:y2, x1:x2]
+        out = cv2.resize(crop, (self._split_size, self._split_size), interpolation=cv2.INTER_AREA)
+        rgb = cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
+        return np.ascontiguousarray(rgb, dtype=np.uint8).tobytes()
+
     def _composite(self, res_bgr: np.ndarray, idx: int) -> bytes:
         import cv2
         from musetalk.utils.blending import get_image_blending
@@ -504,6 +537,8 @@ class MuseTalkEngine:
         combine = get_image_blending(
             ori, face, bbox, self.mask_cycle[idx], self.mask_coords_cycle[idx]
         )
+        if self._split and self._split_bbox is not None:
+            return self._crop_split(combine)   # fixed-size mouth crop (split mode)
         return self._frame_to_bytes(combine)
 
     def _init_gpu_composite(self):
@@ -900,6 +935,31 @@ async def stream(ws: WebSocket):
     finally:
         closed.set()
         await asyncio.gather(pump_task, return_exceptions=True)
+
+
+@app.get("/overlay-assets")
+def overlay_assets():
+    """One-time compositing assets for the split-mode /nimbus client: the pristine
+    background portrait + the bbox the mouth crop maps into. Derived from the already-
+    prepared frame_cycle[0]/coord_cycle[0], so it is automatic for any AVATAR_REF image."""
+    import base64
+    import cv2
+    from fastapi.responses import JSONResponse
+    if not getattr(engine, "_split", False) or engine._split_bbox is None:
+        return JSONResponse({"split": False}, status_code=404)
+    bg = engine.frame_cycle[0]                       # BGR native portrait
+    h, w = bg.shape[:2]
+    ok, buf = cv2.imencode(".png", bg)               # cv2 writes correct color from BGR
+    if not ok:
+        return JSONResponse({"error": "encode"}, status_code=500)
+    x1, y1, x2, y2 = [int(v) for v in engine._split_bbox]
+    return JSONResponse({
+        "split": True,
+        "bg_png": base64.b64encode(buf.tobytes()).decode("ascii"),
+        "bbox": [x1, y1, x2, y2],
+        "bg_size": [int(w), int(h)],
+        "split_size": int(engine._split_size),
+    })
 
 
 @app.get("/health")
