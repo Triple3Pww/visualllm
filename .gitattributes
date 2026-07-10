@@ -1,0 +1,5 @@
+# Shell scripts must stay LF on disk: they run under WSL/Linux bash, which chokes on
+# CRLF line endings ("set: -: invalid option", syntax error). This overrides the global
+# core.autocrlf=true, which was rewriting run_vllm_server.sh to CRLF on Windows-side
+# checkouts and breaking the WSL CosyVoice TTS launch (and the launcher's bash call).
+*.sh text eol=lf
