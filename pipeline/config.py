@@ -168,6 +168,18 @@ class Config:
         return int(_get("MUSETALK_SIZE", "512") or "512")
 
     @property
+    def avatar_split(self) -> bool:
+        """Split mode (MUSETALK_SPLIT): the avatar server streams only the mouth crop and
+        /nimbus composites it over a pristine still. Default off (full-frame, /client works)."""
+        return (_get("MUSETALK_SPLIT", "0") or "0").lower() in ("1", "true", "yes", "on")
+
+    @property
+    def avatar_split_size(self) -> int:
+        """Fixed square px of the streamed mouth crop in split mode (MUSETALK_SPLIT_SIZE).
+        MUST equal the avatar server's value; the WebRTC track is sized to it."""
+        return int(_get("MUSETALK_SPLIT_SIZE", "256") or "256")
+
+    @property
     def avatar_fps(self) -> float:
         """Output fps the avatar server pushes (MUSETALK_FPS, ~20 sustainable); main.py
         couples video_out_framerate to it (and avatar.py passes it to the client) so

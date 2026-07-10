@@ -27,6 +27,11 @@ def build_avatar(cfg: Config):
     size = cfg.avatar_size
     _warn_if_server_down(cfg.avatar_url)
 
+    if cfg.avatar_split:
+        s = cfg.avatar_split_size
+        logger.info(f"Avatar: MuseTalk SPLIT at {cfg.avatar_url} (fps={fps}, crop={s}px)")
+        return MuseTalkVideoService(base_url=cfg.avatar_url, fps=int(fps), image_size=(s, s))
+
     logger.info(f"Avatar: local MuseTalk at {cfg.avatar_url} (output fps={fps}, size={size})")
     return MuseTalkVideoService(base_url=cfg.avatar_url, fps=int(fps), image_size=(size, size))
 

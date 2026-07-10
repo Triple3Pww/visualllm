@@ -217,6 +217,10 @@ async def bot(runner_args: RunnerArguments) -> None:
     # untagged either way and animate via `_set_video_image`.
     sync_av = config.avatar_sync_with_audio
 
+    # Split mode streams a fixed-size square mouth crop (config.avatar_split_size); the WebRTC
+    # track MUST match those frame dimensions. Off = the full square portrait (avatar_size).
+    _vout = config.avatar_split_size if config.avatar_split else config.avatar_size
+
     transport_params = {
         "webrtc": lambda: TransportParams(
             audio_in_enabled=True,
@@ -228,8 +232,8 @@ async def bot(runner_args: RunnerArguments) -> None:
             # Square portrait; MUST equal the avatar server's MUSETALK_SIZE and the
             # service's image_size (config.avatar_size couples all three off MUSETALK_SIZE,
             # same discipline as MUSETALK_FPS below). Smaller = far less WAN bandwidth.
-            video_out_width=config.avatar_size,
-            video_out_height=config.avatar_size,
+            video_out_width=_vout,
+            video_out_height=_vout,
             # MUST equal the rate the avatar server PUSHES frames, or playout starves/
             # piles up and the face drifts behind the audio (the "laggy/desynced" drift,
             # then a freeze). The server pumps frames at config.avatar_fps (MuseTalk ~20 --
@@ -579,6 +583,23 @@ def _ensure_client_patch_middleware() -> bool:
                 _json.dumps({"items": items, "partial": partial}),
                 media_type="application/json",
             )
+        # Nimbus split-mode overlay: proxy the avatar server's one-time compositing assets
+        # (pristine background PNG + bbox) so /nimbus can paint the crisp background and
+        # composite the streamed mouth crop over it. 404 when MUSETALK_SPLIT is off.
+        if request.method == "GET" and request.url.path == "/client/avatar-overlay":
+            import aiohttp
+            url = config.avatar_url.rstrip("/") + "/overlay-assets"
+            try:
+                async with aiohttp.ClientSession() as sess:
+                    async with sess.get(url, timeout=aiohttp.ClientTimeout(total=5)) as r:
+                        body = await r.read()
+                        return HTMLResponse(body.decode("utf-8", "replace"),
+                                            status_code=r.status,
+                                            media_type="application/json")
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"[avatar-overlay] proxy failed: {e!r}")
+                return HTMLResponse('{"split": false}', status_code=502,
+                                    media_type="application/json")
         # Nimbus text send: inject a TYPED user turn (from the /nimbus/ chat box) into the live
         # pipeline as a real user message -> LLM -> TTS -> avatar speaks it. Voice-first stays the
         # primary path; this is the keyboard alternative and reuses the same _active_task inject as
