@@ -62,7 +62,7 @@ class TTSEngine:
     def __init__(self, model_dir: str | None = None, fp16: bool = False, load_vllm: bool = False,
                  load_trt: bool = False):
         import torch
-        from cosyvoice.cli.cosyvoice import CosyVoice2
+        from cosyvoice.cli.cosyvoice import AutoModel
 
         self.model_dir = model_dir or os.environ.get("COSYVOICE_MODEL_DIR", DEFAULT_MODEL_DIR)
         if not os.path.exists(self.model_dir):
@@ -75,13 +75,16 @@ class TTSEngine:
         # CosyVoice2 uses CUDA when available, else CPU. MPS is not used by the
         # upstream model, so on Apple Silicon this runs on CPU.
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        logging.info("Loading CosyVoice2 from %s (device=%s)", self.model_dir, self.device)
+        logging.info("Loading CosyVoice from %s (device=%s)", self.model_dir, self.device)
 
         # load_vllm: swap the autoregressive LLM onto vLLM (the real fix for first-chunk latency
         # -- the LLM token-gen is the ~3s bottleneck). Off by default (COSYVOICE_VLLM=1 to enable);
         # the Windows server stays on the PyTorch path. Requires the vLLM env (Linux/WSL).
-        self.model = CosyVoice2(self.model_dir, load_jit=False, load_trt=load_trt,
-                                load_vllm=load_vllm, fp16=fp16)
+        # AutoModel dispatches on the yaml in model_dir, so COSYVOICE_MODEL_DIR alone selects
+        # CosyVoice2 vs CosyVoice3. No load_jit: CosyVoice3.__init__ has no such parameter, and
+        # this passed False for it anyway.
+        self.model = AutoModel(model_dir=self.model_dir, load_trt=load_trt,
+                               load_vllm=load_vllm, fp16=fp16)
         self.sample_rate = self.model.sample_rate
 
         # Register the reference voice once; subsequent calls reuse it by id.
