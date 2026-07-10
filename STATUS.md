@@ -1,5 +1,19 @@
 # VisualLLm — Project Status & Next Steps
 
+_Last updated: 2026-07-11 (**later same day — mouth-crop OVERLAY prototype (`MUSETALK_SPLIT`), on branch
+`feat/mouth-crop-overlay`, NOT merged.** Goal: a sharper avatar PICTURE. In split mode the MuseTalk server streams only a
+fixed 256px mouth crop over the existing WebRTC track (verified: every delivered frame is exactly 256×256×3) and exposes
+`GET /overlay-assets` (pristine 768px background PNG + bbox); the pipeline sizes the video track to the crop and proxies the
+assets at `GET /client/avatar-overlay`; `/nimbus` canvas-composites the crop over the crisp background. The A/V-sync
+machinery is REUSED verbatim (frame-content-agnostic). **Verified** offline (seamless composite + a clear background
+sharpness A/B, `output/_split_preview.png` / `_bg_sharpness_ab.png`) AND live in a real headless browser (`/nimbus` fetched
+assets, WebRTC track = 256², canvas painted the 768 bg, no JS errors, `output/_nimbus_split_smoke.png`). Honest limit: the
+BACKGROUND gets genuinely sharp, but the animated mouth stays MuseTalk's 256px (a model cap, not transport). Default OFF
+(`MUSETALK_SPLIT=0`) reproduces today's exact behavior; `/client` stays the untouched full-frame fallback. Files:
+`local_services/musetalk_server/app.py`, `pipeline/{config,main}.py`, `pipeline/stages/avatar.py`,
+`local_services/nimbus_client/index.html`, docs. Spec+plan: `docs/superpowers/{specs,plans}/2026-07-11-mouth-crop-overlay*`.
+Next: the user's own live eyeball on `/nimbus`, then decide merge; a feather-mask is the follow-up only if a seam shows.)_
+<!-- prior handoff -->
 _Last updated: 2026-07-11 (**19th session — mid-turn INTERRUPT made to work, and `ALLOW_INTERRUPTIONS=1` is now the
 baseline (`docs/PROBLEMS-AND-FIXES.md` P44).** Two bugs: (1) the barge-in FLUSH was half-done — on `InterruptionFrame` the
 avatar client drained the audio queue but nothing stopped the frames the server had ALREADY rendered, so the avatar kept

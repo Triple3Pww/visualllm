@@ -183,6 +183,20 @@ lag-free ceiling on this shared GPU: 768/1024 profiled with render headroom in I
 live CosyVoice GPU contention → steady-mode voice lag** (`docs/PROBLEMS-AND-FIXES.md` P36); higher res needs a
 dedicated avatar GPU. Also pair with `MUSETALK_BASE_MAX` (source-portrait res cap, **768**; higher = sharper
 background but heavier composite) and keep `MUSETALK_FPS` identical across server+pipeline or you get drift),
+`MUSETALK_SPLIT` (**0 = default, full-frame**; `1` = stream ONLY a fixed-size mouth crop and let `/nimbus`
+composite it over a pristine, never-video-compressed background still → crisp picture, VP8 budget concentrated
+on the mouth. **`/nimbus` ONLY** — the prebuilt `/client` can't composite and is unsupported while on (it would
+show a floating crop); `/client` stays the untouched full-frame fallback at `=0`. **The BACKGROUND gets genuinely
+sharp; the animated mouth stays MuseTalk's 256px** (a model limit, not transport — removing VP8 blur helps but it
+never goes photo-crisp). A/V sync is REUSED verbatim (the sync path is frame-content-agnostic — it just pins frame
+N to audio N/fps, so a small crop changes nothing). Targets `MUSETALK_IDLE_MOTION=0` / a STATIC portrait (a moving
+bbox would break the fixed-crop mapping; split mode force-disables the idle loop). Automatic for any `AVATAR_REF` —
+the server derives the bbox+background from its existing one-time preparation. Server: `GET /overlay-assets`
+(background PNG + bbox); pipeline proxy: `GET /client/avatar-overlay`; `/nimbus` canvas-composites. Verified
+offline (seamless composite, sharper bg A/B) + live in a real browser (WebRTC track = 256², canvas paints the 768
+bg, no seam). `MUSETALK_SPLIT_SIZE` (**256** — the square px of the streamed crop; MUST match server + pipeline,
+un-stretched into the bbox rect client-side). `docs/superpowers/specs/2026-07-11-mouth-crop-overlay-design.md` +
+`docs/superpowers/plans/2026-07-11-mouth-crop-overlay.md`),
 `MUSETALK_TRT` (**1 = default, load-bearing for A/V sync**: TensorRT UNet+VAE render path,
 per-segment render ~389ms→~255ms so the avatar keeps ~12fps under CosyVoice's shared-GPU
 contention — where the PyTorch path drifts seconds behind the voice on long turns. Engines live in
