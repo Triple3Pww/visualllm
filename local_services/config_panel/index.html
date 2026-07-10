@@ -80,6 +80,21 @@
     </div>
   </div>
 
+  <div class="card" id="avatarSplitCard" style="display:none">
+    <h2>Avatar output</h2>
+    <div class="row">
+      <div class="lab"><b>Picture mode</b><span class="h">Full frame = today (both <code>/client</code> and
+        <code>/nimbus</code>). Split mouth-crop = crisp pristine background + only the mouth streamed,
+        composited in <code>/nimbus</code> ONLY (<code>/client</code> won't work). Applying RESTARTS the
+        avatar server (~1&nbsp;min) AND the pipeline. Needs a static portrait (Idle motion = 0). The
+        background gets sharp; the animated mouth stays 256&nbsp;px (model limit).</span></div>
+      <div>
+        <select id="splitSel"><option value="off">Full frame</option><option value="on">Split mouth-crop (/nimbus)</option></select>
+        <button class="restart" id="splitApply" style="margin-top:8px; width:100%">Apply + restart avatar</button>
+      </div>
+    </div>
+  </div>
+
   <details id="advWrap"><summary>Advanced settings</summary><div id="advanced"></div></details>
 </div>
 
@@ -91,7 +106,7 @@
 
 <script>
 const $=s=>document.querySelector(s);
-let FIELDS=[], VALUES={}, dirty={}, GRAPHS=null, COSYMODEL="v2";
+let FIELDS=[], VALUES={}, dirty={}, GRAPHS=null, COSYMODEL="v2", SPLIT=false;
 
 function renderGraphs(){
   if(GRAPHS===null){ $("#graphsCard").style.display="none"; return; }
@@ -102,6 +117,11 @@ function renderGraphs(){
 function renderModel(){
   $("#modelCard").style.display="";
   $("#modelSel").value = COSYMODEL;
+}
+
+function renderSplit(){
+  $("#avatarSplitCard").style.display="";
+  $("#splitSel").value = SPLIT ? "on" : "off";
 }
 
 function fieldRow(f){
@@ -140,8 +160,8 @@ function render(){
 
 async function load(){
   const c = await (await fetch("/config")).json();
-  FIELDS=c.fields; VALUES=c.values; dirty={}; GRAPHS=c.graphs; COSYMODEL=c.cosyModel||"v2";
-  render(); renderGraphs(); renderModel();
+  FIELDS=c.fields; VALUES=c.values; dirty={}; GRAPHS=c.graphs; COSYMODEL=c.cosyModel||"v2"; SPLIT=!!c.split;
+  render(); renderGraphs(); renderModel(); renderSplit();
   $("#saveBtn").disabled=true; $("#msg").textContent="";
 }
 
@@ -203,6 +223,23 @@ $("#modelApply").addEventListener("click", async ()=>{
     $("#msg").textContent = r.message || (r.ok?"applied":"failed");
   }catch(e){ $("#msg").textContent="model request error"; }
   $("#modelApply").disabled=false; $("#modelApply").textContent="Apply + restart CosyVoice";
+  refreshStatus();
+});
+
+$("#splitApply").addEventListener("click", async ()=>{
+  const on = $("#splitSel").value==="on";
+  if(on===SPLIT){ $("#msg").textContent="Avatar already "+(on?"split mouth-crop":"full frame"); return; }
+  if(!confirm((on?"ENABLE split mouth-crop (/nimbus ONLY -- /client stops working)":"Return to full frame")+"? This restarts the avatar server (~1 min) AND the pipeline.")) return;
+  $("#splitApply").disabled=true; $("#splitApply").textContent="restarting avatar (~1 min)...";
+  $("#msg").textContent="saving .env + relaunching avatar server + pipeline...";
+  try{
+    const r = await (await fetch("/avatar-split",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({on})})).json();
+    if(r.split!==undefined && r.split!==null) SPLIT=r.split;
+    renderSplit();
+    $("#msg").textContent = r.message || (r.ok?"applied":"failed");
+  }catch(e){ $("#msg").textContent="split request error"; }
+  $("#splitApply").disabled=false; $("#splitApply").textContent="Apply + restart avatar";
   refreshStatus();
 });
 

@@ -25,6 +25,10 @@ REPO = Path(__file__).resolve().parents[2]   # .../visualllm
 ENV = REPO / ".env"
 _HTML = Path(__file__).parent / "index.html"
 _PIPELINE_LOG = REPO / "scratchpad_pipeline.log"
+# The MuseTalk avatar server runs in its OWN conda env (reads OS env only, no python-dotenv).
+# MUSETALK_SPLIT changes what it STREAMS, so toggling it must relaunch :8002 -- the pipeline-only
+# Restart never touches the avatar server. Path mirrors run.ps1's -MusetalkPython default.
+_MUSETALK_PY = Path(r"E:\miniconda3\envs\musetalk\python.exe")
 
 # CUDA graphs (COSYVOICE_VLLM_EAGER) live in the CosyVoice repo's WSL launch script, NOT .env, and
 # the pipeline Restart does NOT touch the WSL vLLM server. The panel toggles graphs by rewriting
@@ -214,6 +218,60 @@ def restart_pipeline() -> dict:
         return {"ok": False, "message": f"restart failed: {type(e).__name__}: {e}"}
 
 
+# --------------------------------------------------------------------------- avatar output (split)
+def read_split() -> bool:
+    """True if MUSETALK_SPLIT is on in .env (stream only the mouth crop; /nimbus composites it)."""
+    return (read_env().get("MUSETALK_SPLIT", "0") or "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _avatar_ready() -> bool:
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:8002/health", timeout=3) as r:
+            return bool(json.loads(r.read().decode("utf-8")).get("ok"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def restart_avatar() -> dict:
+    """Kill :8002 and relaunch the MuseTalk avatar server in its conda env, propagating the
+    .env values into the child (the server reads OS env ONLY -- no python-dotenv in that env).
+    A MUSETALK_SPLIT change alters what the server STREAMS, and the pipeline-only Restart never
+    touches :8002, so a split toggle needs this. Mirrors run.ps1's avatar launch."""
+    try:
+        for pid in _pids_on(8002):
+            try:
+                if os.name == "nt":
+                    PROCESS_TERMINATE = 0x0001
+                    h = ctypes.windll.kernel32.OpenProcess(PROCESS_TERMINATE, False, int(pid))
+                    if h:
+                        ctypes.windll.kernel32.TerminateProcess(h, 1)
+                        ctypes.windll.kernel32.CloseHandle(h)
+                else:
+                    os.kill(int(pid), 9)
+            except Exception:  # noqa: BLE001
+                pass
+        time.sleep(2)
+        if not _MUSETALK_PY.exists():
+            return {"ok": False, "message": "musetalk python not found at %s" % _MUSETALK_PY}
+        env = dict(os.environ)
+        env.update(read_env())   # .env values win; the avatar server reads OS env only
+        DETACHED = 0x00000008 | 0x00000200
+        (REPO / "logs").mkdir(exist_ok=True)
+        log = open(REPO / "logs" / "avatar_restart.log", "ab")
+        subprocess.Popen(
+            [str(_MUSETALK_PY), "-u", "-m", "local_services.musetalk_server.app"],
+            cwd=str(REPO), stdout=log, stderr=log, stdin=subprocess.DEVNULL,
+            creationflags=DETACHED if os.name == "nt" else 0, env=env,
+        )
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "message": f"avatar relaunch failed: {type(e).__name__}: {e}"}
+    for _ in range(90):  # model load + TRT + warmup: give ~90s
+        time.sleep(1)
+        if _avatar_ready():
+            return {"ok": True, "message": "avatar server restarted (:8002 ready)"}
+    return {"ok": False, "message": "relaunched, but :8002 not healthy in ~90s -- check logs/avatar_restart.log"}
+
+
 # --------------------------------------------------------------------------- CUDA graphs (WSL TTS)
 def read_graphs():
     """True if CUDA graphs are ON (EAGER default 0) in the WSL launch script; None if unknown."""
@@ -317,7 +375,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(204, b"", "image/x-icon")
         if self.path == "/config":
             return self._send(200, {"fields": FIELDS, "values": read_env(),
-                                    "graphs": read_graphs(), "cosyModel": read_cosy_model()})
+                                    "graphs": read_graphs(), "cosyModel": read_cosy_model(),
+                                    "split": read_split()})
         if self.path == "/status":
             return self._send(200, status())
         return self._send(404, {"error": "not found"})
@@ -344,6 +403,16 @@ class Handler(BaseHTTPRequestHandler):
             write_env({"COSYVOICE_MODEL": model})   # persist so the next full launch matches
             res = restart_cosyvoice()               # forwards COSYVOICE_MODEL from .env
             res["cosyModel"] = read_cosy_model()
+            return self._send(200, res)
+        if self.path == "/avatar-split":
+            on = bool((self._body() or {}).get("on"))
+            write_env({"MUSETALK_SPLIT": "1" if on else "0"})   # persist for the next full launch
+            res = restart_avatar()                  # relaunch :8002 with the new MUSETALK_SPLIT
+            if res.get("ok"):
+                pres = restart_pipeline()           # pipeline re-reads .env (video_out size) + reconnects
+                res["ok"] = bool(pres.get("ok"))
+                res["message"] = "%s; %s" % (res.get("message", ""), pres.get("message", ""))
+            res["split"] = read_split()
             return self._send(200, res)
         return self._send(404, {"error": "not found"})
 

@@ -192,7 +192,10 @@ never goes photo-crisp). A/V sync is REUSED verbatim (the sync path is frame-con
 N to audio N/fps, so a small crop changes nothing). Targets `MUSETALK_IDLE_MOTION=0` / a STATIC portrait (a moving
 bbox would break the fixed-crop mapping; split mode force-disables the idle loop). Automatic for any `AVATAR_REF` —
 the server derives the bbox+background from its existing one-time preparation. Server: `GET /overlay-assets`
-(background PNG + bbox); pipeline proxy: `GET /client/avatar-overlay`; `/nimbus` canvas-composites. Verified
+(background PNG + bbox); pipeline proxy: `GET /client/avatar-overlay`; `/nimbus` canvas-composites. **Toggle it in
+the config panel's "Avatar output" card** (`:7870`/`:8444`) — unlike a plain `.env` edit, that card relaunches the
+**avatar server AND the pipeline** (`restart_avatar()`), because a plain edit + the panel's pipeline-only Restart would
+resize the track to 256 while the server still streams 512 → a broken mismatch. Verified
 offline (seamless composite, sharper bg A/B) + live in a real browser (WebRTC track = 256², canvas paints the 768
 bg, no seam). `MUSETALK_SPLIT_SIZE` (**256** — the square px of the streamed crop; MUST match server + pipeline,
 un-stretched into the bbox rect client-side). `docs/superpowers/specs/2026-07-11-mouth-crop-overlay-design.md` +
