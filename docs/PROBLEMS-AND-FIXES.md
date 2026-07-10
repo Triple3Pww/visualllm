@@ -1685,3 +1685,42 @@ sticks at `0.0s`. After: **0 warnings**, video advances, `[avatar timing] end dr
 
 **Note.** This is a genuine bug and the fix stays — but it is **not** the "generic mouth pattern" the user reported. That is
 P40. Fixing P41 first, and presenting it as the answer, is exactly the mistake to avoid.
+
+## P42 — CosyVoice v3 as the accelerated, selectable baseline (2026-07-10, 17th session)
+
+**What shipped.** `Fun-CosyVoice3-0.5B` is now a selectable model (`COSYVOICE_MODEL=v2|v3`) and the running baseline,
+with vLLM + **CUDA graphs** + **flow-decoder TensorRT**. Merged + pushed to `main` in both repos (visualllm `0e27852`,
+cosyvoice-local-tts `9b3401d`). Full design/plan: `docs/superpowers/plans/2026-07-10-cosyvoice3-ab.md`.
+
+**Latency gate (the affordability question).** v3's flow decoder is a 300M **DiT** vs v2's 100M CNN — the fear was it
+would blow the first-chunk budget on the shared 16GB GPU. It did not: **+0.066s** median first-chunk TTFB vs v2 under live
+MuseTalk render (2 cycles x 32 samples; null test v2-vs-v2 = 0.030s, so the rig measures the model, not drift). With flow-TRT
++ graphs added, isolated first-chunk fell to **zh 1.08s / en 0.80s**. The bigger DiT is affordable here.
+
+**Two code changes v3 required** (the spec's "no code change" was WRONG — `tts_engine.py`): (1) build the model via
+`AutoModel(model_dir=...)` instead of a hardcoded `CosyVoice2`, so the yaml in the dir selects v2/v3. (2) The instruct
+prefix `You are a helpful assistant.<|endofprompt|>` — `CosyVoice3LM` asserts token 151646 is present and **SPLITS on it**
+(`cosyvoice/llm/llm.py:591`: prefix before, reference transcript after). So the marker must sit BEFORE the transcript in
+`COSYVOICE_PROMPT_TEXT`, **and** ride the **en** `cross_lingual` text (which deletes `prompt_text`). Miss either and v3
+hangs at the English warmup on startup or emits ~0.6s of empty/garbage audio.
+
+**Acceleration wiring.** `COSYVOICE_FLOW_TRT=1` (defaulted in the v3 block of `run_vllm_server.sh`) → `CosyVoice3.load_trt`
+builds an fp32 engine from the shipped `flow.decoder.estimator.fp32.onnx` in ~30s on first load, caches
+`flow.decoder.estimator.fp32.mygpu.plan` (deserialized on later launches; GPU/driver-specific). fp16 DiT TRT is NOT used
+(upstream warns of perf issues). Graphs = `COSYVOICE_VLLM_EAGER=0`. Selectable from the config panel's **CosyVoice model**
+card (saves `.env` + relaunches the WSL server); `restart_cosyvoice()` now forwards `COSYVOICE_MODEL` so a graphs toggle no
+longer silently resets a v3 user back to v2.
+
+**CAVEAT — graphs on zh is UNVERIFIED for v3.** Graphs are exactly the config P33 rejected for v2's Chinese (graph decode
+perturbs RAS → gappier zh audio → mouth mistracks). The baseline is graphs-on ONLY because it is also `LANGUAGE=en`, which
+is spared (no RAS reliance). Before trusting v3+graphs for zh, re-check lipsync by eye (or `COSYVOICE_VLLM_EAGER=1`). Phase-2
+v2-vs-v3 zh clips (`output/zh_v{2,3}_synced.mp4`) rendered but NOT eye-judged.
+
+**METROLOGY LESSON (cost most of the session; a P40-family trap).** Measuring zh with `curl` from git-bash MANGLES the UTF-8
+payload → the server receives non-Chinese bytes → `text_normalize` returns `[]` → synthesis silently yields **HTTP 200 with 0
+bytes** or truncated garbage. This manufactured a false "v3 is degenerate" conclusion AND a false "v2's Chinese is broken"
+scare, and sent a long hunt after the RAS processor and a benign `Qwen2ForCausalLM` export mismatch. The measurement shared a
+fault with the thing under test. **Always send zh through the probe transport** (`_zh_audio_ab.synth` = urllib + `json.dumps`,
+ASCII-escaped), never a shell `curl` with literal CJK. Related: MuseTalk env drift — a hand-launch that omits
+`MUSETALK_IDLE_MOTION=0` (server default is `1`) re-enables idle breathing; launch via `run.ps1`/the launcher, which
+propagates the full `.env` server-side set.

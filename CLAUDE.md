@@ -45,8 +45,13 @@ now uses the fluid **"pro" AI-assistant voice** (`CosyVoice/asset/pro_ref.wav`, 
 zh ≈ English pacing. An optional zh pause-trimmer (`COSYVOICE_SILENCE_CAP_S`, `_squeeze_silence`) is **OFF by
 default** (not needed with the pro voice). Swap voices via `COSYVOICE_PROMPT_WAV`/`COSYVOICE_PROMPT_TEXT`.
 
-**vLLM CUDA graphs — CLOSED: keep EAGER (`COSYVOICE_VLLM_EAGER=1`); graphs degrade zh LIPSYNC (2026-07-05, 8th session, `docs/PROBLEMS-AND-FIXES.md` P27/P31/P32/P33):**
-`COSYVOICE_VLLM_EAGER` default is **`1`** (eager) in `run_vllm_server.sh`. P27 set it `0` (CUDA-graph capture) to cut
+**vLLM CUDA graphs — BASELINE NOW GRAPHS-ON for v3 + `en` (2026-07-10, 17th session); the zh caveat below STILL STANDS
+(`docs/PROBLEMS-AND-FIXES.md` P27/P31/P32/P33):** `COSYVOICE_VLLM_EAGER` default is **`0`** (graphs on) in
+`run_vllm_server.sh`, paired with `COSYVOICE_MODEL=v3` + flow-TRT on `LANGUAGE=en` (isolated first-chunk zh 1.08/en 0.80s).
+This is SAFE ONLY because en does not rely on RAS (see below). **For `zh`, the eager verdict below holds — graphs degrade
+zh lipsync (UNVERIFIED for v3); flip `COSYVOICE_VLLM_EAGER=1` or re-check by eye before trusting v3+graphs for Chinese.**
+The full P27-P33 history (why graphs were kept eager for the v2/zh baseline):
+`COSYVOICE_VLLM_EAGER` was **`1`** (eager) for the v2 baseline. P27 set it `0` (CUDA-graph capture) to cut
 TTS first-chunk avg ~2.0→~0.85s; P31 reverted it for "live inconsistency." A P32 re-investigation then measured the
 TTS side directly (`cosyvoice-local-tts/_ttfb_variance.py`) and found graphs are actually **faster + lower-variance**
 than eager — even under real MuseTalk render (96 samp: graphs 1.29/2.23/0.37s vs eager 1.94/3.43/0.64) — so the P31
@@ -54,10 +59,11 @@ than eager — even under real MuseTalk render (96 samp: graphs 1.29/2.23/0.37s 
 graphs ON alter the zh AUDIO (measured `cosyvoice-local-tts/_zh_audio_ab.py`: longer + more internal silence, more
 variance) because the graph decode perturbs the zh-critical **RAS** sampling (the P18 fix). MuseTalk lip-syncs off a
 **Whisper of the waveform**, so a degraded zh waveform → mouth shapes that don't track the words; en is spared (no RAS
-reliance), render fps stays ~14 (not a render-starve). **Verdict: eager — graphs win the TTS stopwatch but lose the
-avatar, and the avatar is the product** (reconciles with P31's revert; the eye caught what the TTS probe can't see).
-The independent Lever-4 poll-tighten (`model.py` 0.1→0.02) stays. Force graphs (only for an en-only / TTS-throughput
-setup) = `COSYVOICE_VLLM_EAGER=0` + relaunch, or the config panel's **CUDA graphs** toggle (rewrites the script + relaunches WSL).
+reliance), render fps stays ~14 (not a render-starve). **Verdict for zh: eager — graphs win the TTS stopwatch but lose
+the avatar, and the avatar is the product** (reconciles with P31's revert; the eye caught what the TTS probe can't see).
+The independent Lever-4 poll-tighten (`model.py` 0.1→0.02) stays. **The 2026-07-10 baseline took the en escape hatch this
+section always noted** — graphs ON (`COSYVOICE_VLLM_EAGER=0`) because en is spared. Flip back to eager, or toggle it in the
+config panel's **CUDA graphs** card (rewrites the script + relaunches WSL), the moment the baseline moves to zh.
 
 **Shared-GPU VRAM (why "won't talk" can mean CosyVoice crashed):** vLLM and MuseTalk share the one
 16GB card. vLLM's `gpu_memory_utilization` (env `COSYVOICE_VLLM_GPU_UTIL`, **default `0.3`**, set in
@@ -136,6 +142,10 @@ sentence-length, felt as between-sentence stalls. Launch recipe (incl. the `CC`/
 ffmpeg-7/`nvidia-npp`/`LD_LIBRARY_PATH` fixes) is in the server's module docstring.
 
 Core `.env` knobs: `LANGUAGE` (en/zh/th), `TTFO_TARGET_SECONDS`, `TTS_PROVIDER`,
+`COSYVOICE_MODEL` (**`v3`** = current baseline, Fun-CosyVoice3-0.5B, +flow-decoder TRT + CUDA graphs; `v2` =
+CosyVoice2-0.5B. Read by `run_vllm_server.sh` + the launcher; the v3 block also defaults `COSYVOICE_FLOW_TRT=1`.
+Switchable in the config panel's **CosyVoice model** card, which relaunches the WSL TTS server — a plain `.env` edit
+needs that relaunch, NOT just the pipeline Restart. `docs/superpowers/plans/2026-07-10-cosyvoice3-ab.md`),
 `MUSETALK_SYNC_MODE` (**`steady`** = video-master, synced start, the user's pick and current
 default; `live` = audio-master, voice instant + lips trail ~0.75s, can never pause. The old
 **steady "screech" is FIXED** — it was pipecat discarding the partial audio buffer after a >3s
