@@ -387,11 +387,32 @@ assert w.getnframes() > 8000, 'suspiciously short'
 Expected: a multi-second wav. An `<|endofprompt|>` AssertionError here means the env from Step 1
 didn't reach the engine.
 
-- [ ] **Step 5: Record findings in the plan file, no code commit**
+- [x] **Step 5: Record findings in the plan file, no code commit**
 
-Append a short "Task 4 outcome" note to this plan documenting: vLLM yes/no, RAS observed/assumed,
-`gpu_util` used, and any deviation. **If `gpu_util` had to change, Task 6 must re-run v2 at the
-same value.**
+**Task 4 outcome (2026-07-10): PASS. Not a blocked test.**
+
+- **vLLM: accepted v3's checkpoint.** `Available KV cache memory: 1.74 GiB`, engine init 1.49s.
+  Note the exported `vllm/config.json` says `architectures: ["Qwen2ForCausalLM"]` for v3 but
+  `["CosyVoice2ForCausalLM"]` for v2, because `export_cosyvoice2_vllm` only rewrites the arch name
+  `if llm_decoder.bias is not None` (v3 has no bias). **Apparently benign** -- v3 produces correct
+  audio anyway. Do not treat this as a defect without new evidence.
+- **RAS: registered, firing UNVERIFIED.** No log line. With RAS on, v3 zh shows no silence loops,
+  which is consistent with it working, but that is not proof. Reported as assumed, per the plan.
+- **zh + en synth: both correct.** v3 zh median 8.04s vs v2 9.92s on the identical sentence.
+  v3 leading silence 0.44-0.50s vs v2 1.56s (early P34-breath signal, n=3).
+- **Two code changes were required, contrary to the spec's "risk 1 resolved":**
+  1. `AutoModel` dispatch (Task 1).
+  2. `V3_INSTRUCT = "You are a helpful assistant.<|endofprompt|>"` must prefix the *en*
+     cross_lingual text (which deletes `prompt_text`) and must sit *before* the reference
+     transcript in `COSYVOICE_PROMPT_TEXT` -- `llm.py:591` splits on the marker.
+- **`gpu_util` unchanged** (`COSYVOICE_VLLM_GPU_UTIL=0.16`). Both arms comparable.
+
+**METHODOLOGY ERROR, recorded so it is not repeated.** Several intermediate zh measurements were
+taken with `curl` from git-bash, which mangled the UTF-8 payload; the server then saw non-Chinese
+bytes, `text_normalize` returned `[]`, and synthesis silently produced zero audio (HTTP 200, 0
+bytes) or truncated garbage. This produced a false "v3 is degenerate" conclusion AND a false "v2
+zh is broken" scare. **Always send zh through the probe transport** (`_zh_audio_ab.synth`, which is
+`urllib` + `json.dumps` and therefore ASCII-escaped), never a shell `curl` with literal CJK.
 
 ---
 
