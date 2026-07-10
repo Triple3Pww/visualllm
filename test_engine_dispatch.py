@@ -39,3 +39,45 @@ def test_engine_dispatches_via_automodel(fake_automodel, tmp_path, monkeypatch):
     assert kwargs["model_dir"] == str(model_dir)
     assert kwargs["load_vllm"] is True
     assert "load_jit" not in kwargs, "CosyVoice3.__init__ takes no load_jit"
+
+
+def _engine_with_model_class(fake_automodel, tmp_path, monkeypatch, class_name):
+    """Build a TTSEngine whose underlying model reports the given class name."""
+    model_dir = tmp_path / class_name
+    model_dir.mkdir()
+    monkeypatch.setenv("COSYVOICE_MODEL_DIR", str(model_dir))
+    fake_automodel.return_value.__class__ = type(class_name, (), {})
+
+    import tts_engine
+    eng = tts_engine.TTSEngine()
+    eng.model.inference_cross_lingual.return_value = iter(())
+    return eng
+
+
+def test_v3_prepends_endofprompt_to_english_text(fake_automodel, tmp_path, monkeypatch):
+    """CosyVoice3 asserts <|endofprompt|> is in the tokens the LM sees. The cross_lingual
+    path (used for English) DELETES prompt_text, so the marker must ride on the text."""
+    eng = _engine_with_model_class(fake_automodel, tmp_path, monkeypatch, "CosyVoice3")
+    list(eng.synthesize_stream("Hello, warming up."))
+
+    sent = eng.model.inference_cross_lingual.call_args.args[0]
+    assert sent.startswith("<|endofprompt|>"), sent
+    assert "Hello, warming up." in sent
+
+
+def test_v2_english_text_is_untouched(fake_automodel, tmp_path, monkeypatch):
+    eng = _engine_with_model_class(fake_automodel, tmp_path, monkeypatch, "CosyVoice2")
+    list(eng.synthesize_stream("Hello, warming up."))
+
+    sent = eng.model.inference_cross_lingual.call_args.args[0]
+    assert sent == "Hello, warming up.", sent
+
+
+def test_v3_chinese_text_is_untouched(fake_automodel, tmp_path, monkeypatch):
+    """zh uses inference_zero_shot, which keeps prompt_text -- the marker is already there."""
+    eng = _engine_with_model_class(fake_automodel, tmp_path, monkeypatch, "CosyVoice3")
+    eng.model.inference_zero_shot.return_value = iter(())
+    list(eng.synthesize_stream("今天天氣晴朗。"))
+
+    sent = eng.model.inference_zero_shot.call_args.args[0]
+    assert sent == "今天天氣晴朗。", sent

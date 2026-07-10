@@ -87,11 +87,22 @@ class TTSEngine:
                                load_vllm=load_vllm, fp16=fp16)
         self.sample_rate = self.model.sample_rate
 
+        # CosyVoice3's LM asserts <|endofprompt|> is among the tokens it sees (llm.py:479).
+        # zh rides the zero_shot path, which keeps prompt_text (our COSYVOICE_PROMPT_TEXT carries
+        # the marker). en rides cross_lingual, which DELETES prompt_text -- so on v3 the marker
+        # must ride on the text itself, the way upstream's instruct strings do. v2 must never see
+        # it (unknown token, and its LM has no such requirement).
+        self._is_v3 = self.model.__class__.__name__ == "CosyVoice3"
+
         # Register the reference voice once; subsequent calls reuse it by id.
         ok = self.model.add_zero_shot_spk(PROMPT_TEXT, PROMPT_WAV, SPK_ID)
         if ok is not True:
             logging.warning("add_zero_shot_spk returned %r; falling back to per-call prompt", ok)
         self._spk_ready = ok is True
+
+    def _xlingual_text(self, text: str) -> str:
+        """cross_lingual drops prompt_text, so v3's required <|endofprompt|> rides on the text."""
+        return f"<|endofprompt|>{text}" if self._is_v3 else text
 
     def _apply_first_hop(self, cjk: bool):
         """Per-language first-hop, set per request just before inference.
@@ -134,7 +145,7 @@ class TTSEngine:
             # Cross-lingual: English target voiced with the Mandarin reference.
             spk = SPK_ID if self._spk_ready else ""
             gen = self.model.inference_cross_lingual(
-                text, PROMPT_WAV, zero_shot_spk_id=spk, stream=False, speed=speed
+                self._xlingual_text(text), PROMPT_WAV, zero_shot_spk_id=spk, stream=False, speed=speed
             )
 
         chunks = [out["tts_speech"] for out in gen]
@@ -208,7 +219,7 @@ class TTSEngine:
         else:
             spk = SPK_ID if self._spk_ready else ""
             gen = self.model.inference_cross_lingual(
-                text, PROMPT_WAV, zero_shot_spk_id=spk, stream=True, speed=speed
+                self._xlingual_text(text), PROMPT_WAV, zero_shot_spk_id=spk, stream=True, speed=speed
             )
 
         raw = ((out["tts_speech"], self.sample_rate) for out in gen)
