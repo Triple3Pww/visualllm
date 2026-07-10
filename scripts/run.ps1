@@ -62,6 +62,12 @@ Set-EnvFromDotenv "MUSETALK_END_TAIL_FRAMES"
 Set-EnvFromDotenv "MUSETALK_IDLE_MOTION"
 Set-EnvFromDotenv "MUSETALK_TRT"
 Set-EnvFromDotenv "MUSETALK_GPU_COMPOSITE"
+# Split mode: the avatar server reads MUSETALK_SPLIT from OS env only, and the pipeline reads it
+# from .env. If the launcher forwards it to the pipeline but NOT here, the pipeline sizes the video
+# track to the crop (256) while the server keeps streaming full 512 frames -- a size mismatch that
+# renders NO video (voice fine). Forward both so the two stay consistent (see MUSETALK_SPLIT docs).
+Set-EnvFromDotenv "MUSETALK_SPLIT"
+Set-EnvFromDotenv "MUSETALK_SPLIT_SIZE"
 
 # Offline-STT knobs -- the funasr server reads OS env ONLY (like the avatar server).
 # sherpa is in-process (system Python), so it needs no env propagation or server here.
