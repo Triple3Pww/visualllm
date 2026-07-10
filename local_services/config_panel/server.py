@@ -250,9 +250,12 @@ def _cosy_health_ok() -> bool:
 
 
 def restart_cosyvoice() -> dict:
-    """Kill + relaunch the WSL vLLM CosyVoice server so a graphs change takes effect. Mirrors
-    launch.ps1: a DETACHED wsl.exe running the script in the FOREGROUND (an `&`-backgrounded WSL
-    child dies when its launching shell returns). Always returns a JSON-able dict."""
+    """Kill + relaunch the WSL vLLM CosyVoice server so a graphs OR model change takes effect.
+    Mirrors launch.ps1: a DETACHED wsl.exe running the script in the FOREGROUND (an `&`-backgrounded
+    WSL child dies when its launching shell returns). Forwards COSYVOICE_MODEL from .env, so a v3
+    user's model survives a graphs restart (and vice-versa). Always returns a JSON-able dict."""
+    model = read_env().get("COSYVOICE_MODEL", "").strip() or "v2"
+    inner = "COSYVOICE_MODEL=%s bash %s" % (model, _COSY_SCRIPT_WSL)
     try:
         subprocess.run(["wsl.exe", "-d", _WSL_DISTRO, "-e", "bash", "-c", "pkill -f 'uvicorn app:app'"],
                        timeout=20)
@@ -264,18 +267,23 @@ def restart_cosyvoice() -> dict:
         log = open(REPO / "logs" / "cosyvoice_wsl.log", "ab")
         DETACHED = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
         subprocess.Popen(
-            ["wsl.exe", "-d", _WSL_DISTRO, "-e", "bash", "-c", "bash " + _COSY_SCRIPT_WSL],
+            ["wsl.exe", "-d", _WSL_DISTRO, "-e", "bash", "-c", inner],
             stdout=log, stderr=log, stdin=subprocess.DEVNULL,
             creationflags=DETACHED if os.name == "nt" else 0,
         )
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "message": f"relaunch failed: {type(e).__name__}: {e}"}
-    for _ in range(75):  # graphs capture + model load: give ~150s
+    for _ in range(75):  # graphs capture + v3 DiT load: give ~150s
         time.sleep(2)
         if _cosy_health_ok():
-            return {"ok": True, "message": "CosyVoice restarted -- graphs setting applied"}
+            return {"ok": True, "message": "CosyVoice restarted (model=%s)" % model}
     return {"ok": False, "message": "relaunched, but :8001 not healthy in ~150s -- check "
             "logs/cosyvoice_wsl.log (VRAM/load-order: start CosyVoice before MuseTalk, P15)"}
+
+
+def read_cosy_model() -> str:
+    """Current COSYVOICE_MODEL in .env (v2 | v3), default v2."""
+    return read_env().get("COSYVOICE_MODEL", "").strip() or "v2"
 
 
 # --------------------------------------------------------------------------- HTTP
@@ -308,7 +316,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/favicon.ico":
             return self._send(204, b"", "image/x-icon")
         if self.path == "/config":
-            return self._send(200, {"fields": FIELDS, "values": read_env(), "graphs": read_graphs()})
+            return self._send(200, {"fields": FIELDS, "values": read_env(),
+                                    "graphs": read_graphs(), "cosyModel": read_cosy_model()})
         if self.path == "/status":
             return self._send(200, status())
         return self._send(404, {"error": "not found"})
@@ -327,6 +336,14 @@ class Handler(BaseHTTPRequestHandler):
             write_graphs(on)
             res = restart_cosyvoice()
             res["graphs"] = read_graphs()
+            return self._send(200, res)
+        if self.path == "/cosy-model":
+            model = str((self._body() or {}).get("model", "")).strip()
+            if model not in ("v2", "v3"):
+                return self._send(400, {"ok": False, "message": "model must be v2 or v3"})
+            write_env({"COSYVOICE_MODEL": model})   # persist so the next full launch matches
+            res = restart_cosyvoice()               # forwards COSYVOICE_MODEL from .env
+            res["cosyModel"] = read_cosy_model()
             return self._send(200, res)
         return self._send(404, {"error": "not found"})
 
