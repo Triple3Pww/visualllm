@@ -77,7 +77,16 @@ if ($ttsProvider -eq "cosyvoice" -and $cosyUrl) {
         Write-Host "  already up -- reusing." -ForegroundColor Green
     } else {
         Write-Host "  starting in WSL ($WslDistro) -- a separate window will show its logs..."
-        $cmd = ('-d {0} -e bash -c "bash {1}"' -f $WslDistro, $CosyRunScript)
+        # COSYVOICE_MODEL (.env) selects the model: v2 (default) or v3 (Fun-CosyVoice3-0.5B).
+        # Forwarded as an env prefix; run_vllm_server.sh expands it into MODEL_DIR + PROMPT_TEXT.
+        $cosyModel = Get-EnvVal "COSYVOICE_MODEL"
+        if ($cosyModel) {
+            Write-Host "  COSYVOICE_MODEL=$cosyModel" -ForegroundColor DarkGray
+            $inner = "COSYVOICE_MODEL=$cosyModel bash $CosyRunScript"
+        } else {
+            $inner = "bash $CosyRunScript"
+        }
+        $cmd = ('-d {0} -e bash -c "{1}"' -f $WslDistro, $inner)
         $startedWsl = Start-Process -FilePath "wsl.exe" -ArgumentList $cmd -PassThru
         Write-Host "  loading the TTS model (this takes ~1-3 min on first start)..."
         $ok = $false
