@@ -544,8 +544,8 @@
 
     <div class="presenter">
       <div class="presenter-frame">
+        <img id="avatarBg" class="presenter-img" style="display:none" alt="">
         <video id="avatar" class="presenter-img" autoplay playsinline muted></video>
-        <canvas id="avatarCanvas" class="presenter-img" style="display:none"></canvas>
         <audio id="botAudio" autoplay playsinline></audio>
         <div class="avatar-overlay" id="avatarOverlay" data-mode="idle">
           <div class="loader" aria-hidden="true"></div>
@@ -619,13 +619,14 @@
     "use strict";
     const micBtn   = document.getElementById('micBtn');
     const avatar   = document.getElementById('avatar');
-    const avatarCanvas = document.getElementById('avatarCanvas');
-    // Split mode (MUSETALK_SPLIT): the server streams only a fixed-size mouth crop; we paint a
-    // pristine background still and draw the crop into its bbox each frame. _split stays null
-    // when off -> the plain <video> shows the full frame (fallback).
+    const avatarBg = document.getElementById('avatarBg');
+    // Split mode (MUSETALK_SPLIT): the server streams only a fixed-size mouth crop. We LAYER real
+    // DOM elements -- a pristine background <img> fills the frame, and the mouth-crop <video> is a
+    // genuinely VISIBLE element positioned over the bbox. (An earlier version drew both onto a
+    // canvas that COVERED the video; a fully-occluded <video> gets its decode throttled by Chrome,
+    // so drawImage kept reading a stale frame -> frozen mouth. A visible video always decodes.)
+    // _split stays null when off -> the plain <video> shows the full frame (fallback, unchanged).
     let _split = null;      // {bbox, bgW, bgH} once loaded, else null (full-frame fallback)
-    let _bgImg = null;      // pristine background <img>
-    let _rafId = 0;         // compositor rAF handle (distinct from the bot-audio meter's rafId)
 
     async function loadOverlay() {
       try {
@@ -633,38 +634,37 @@
         if (!r.ok) return false;
         const d = await r.json();
         if (!d || !d.split) return false;
-        _bgImg = new Image();
         await new Promise((res, rej) => {
-          _bgImg.onload = res; _bgImg.onerror = rej;
-          _bgImg.src = 'data:image/png;base64,' + d.bg_png;
+          avatarBg.onload = res; avatarBg.onerror = rej;
+          avatarBg.src = 'data:image/png;base64,' + d.bg_png;
         });
         _split = { bbox: d.bbox, bgW: d.bg_size[0], bgH: d.bg_size[1] };
         return true;
       } catch (e) { console.warn('overlay load failed', e); return false; }
     }
 
-    function startCompositor() {
-      // Draw the pristine background, then the mouth-crop video stretched into the bbox rect,
-      // every animation frame. Canvas is sized to the background's native pixels; CSS scales
-      // the whole stage (background + overlaid crop scale together, so the bbox stays aligned).
-      const c = avatarCanvas, ctx = c.getContext('2d');
-      c.width = _split.bgW; c.height = _split.bgH;
+    function layoutSplitVideo() {
+      // Position the mouth-crop <video> over the bbox, matching the background <img>'s
+      // object-fit:cover / object-position:center-top mapping so the crop sits exactly on the
+      // portrait's mouth at any frame size. Recomputed on resize.
+      const frame = document.querySelector('.presenter-frame');
+      const fw = frame.clientWidth, fh = frame.clientHeight;
+      const s = Math.max(fw / _split.bgW, fh / _split.bgH);   // cover scale
+      const offX = (fw - _split.bgW * s) / 2, offY = 0;       // center-x, top-aligned
       const [x1, y1, x2, y2] = _split.bbox;
-      // Show the canvas ON TOP of the video (both position:absolute inset:0; canvas is later in
-      // the DOM). The canvas paints an opaque background every frame, so it fully covers the
-      // <video> beneath -- we leave that video visible-but-covered (NOT display:none, which can
-      // make a browser throttle its decode and freeze drawImage) so its frames keep decoding.
-      c.style.display = '';
-      const draw = () => {
-        if (_bgImg) ctx.drawImage(_bgImg, 0, 0, c.width, c.height);
-        if (avatar.readyState >= 2 && avatar.videoWidth > 0) {
-          ctx.drawImage(avatar, x1, y1, x2 - x1, y2 - y1);  // un-stretch square crop into bbox
-        }
-        _rafId = requestAnimationFrame(draw);
-      };
-      cancelAnimationFrame(_rafId);
-      draw();
+      Object.assign(avatar.style, {
+        position: 'absolute', left: (offX + x1 * s) + 'px', top: (offY + y1 * s) + 'px',
+        right: 'auto', bottom: 'auto',
+        width: ((x2 - x1) * s) + 'px', height: ((y2 - y1) * s) + 'px',
+        objectFit: 'fill', zIndex: '2',                        // stretch the square crop into the bbox
+      });
     }
+
+    function startCompositor() {
+      avatarBg.style.display = '';   // show the pristine background
+      layoutSplitVideo();            // place the visible mouth-crop video over the bbox
+    }
+    window.addEventListener('resize', () => { if (_split) layoutSplitVideo(); });
     const botAudio = document.getElementById('botAudio');
     const nameTag  = document.getElementById('nameTag');
     const statusLabel = document.getElementById('statusLabel');
@@ -909,9 +909,9 @@
       if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
       if (pc) { try { pc.close(); } catch(_){} pc = null; }
       avatar.srcObject = null; botAudio.srcObject = null;
-      cancelAnimationFrame(_rafId); _rafId = 0;
-      avatarCanvas.style.display = 'none';
-      _split = null; _bgImg = null;
+      avatarBg.style.display = 'none'; avatarBg.removeAttribute('src');
+      avatar.style.cssText = '';   // drop the split positioning -> back to .presenter-img full-frame
+      _split = null;
     }
 
     // POST a typed message to the live pipeline (LLM -> TTS -> avatar speaks it).
