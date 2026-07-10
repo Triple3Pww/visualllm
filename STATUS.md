@@ -94,6 +94,50 @@ block below + `docs/PROBLEMS-AND-FIXES.md` P20. Prior (2nd) session: TTFO hop×l
 stands (P19). (2026-07-02): Chinese TTS fixed (RAS + "pro" voice); avatar baseline `MUSETALK_TRT=1`, LLM cloud
 gemini-2.5-flash-lite; TTFO ~4.6s→~3.2s via the first-clause split `COSYVOICE_FIRST_PIECE=1`.)_
 
+## ⭐ HANDOFF → next session (2026-07-10, 14th): LIVE "lips don't match the words" ROOT-CAUSED + FIXED (client dropped the server's HELD/dup frames) — awaiting the user's live-eye sign-off
+
+**The multi-session open problem** ("live avatar mouth MOTION wrong for the words; offline prerender a lot better; the user
+says OUR SYSTEM not the network") is **root-caused and fixed** (`docs/PROBLEMS-AND-FIXES.md` **P39**). Fix is UNCOMMITTED
+(hold-for-live) and is **already live in the running pipeline** (loaded on restart; confirmed `held/dup 4 of 24 recv
+(server-real 24)`, `end drift +-0.00s`).
+
+**Root cause = a client-side DELIVERY bug, not audio and not render.** In steady/prerender the client
+(`musetalk_video.py`) is video-master and re-paces the server's frames to audio (`audio i/fps` ↔ `_vbuf[i]`). The server
+pump (`app.py`) emits a frame every tick at fps, and when its render underflows mid-turn (shared GPU with CosyVoice; the
+real-time audio feed can also briefly starve it) it **re-sends the LAST frame byte-for-byte** to keep the WebRTC track alive.
+The client couldn't tell that HELD/dup from a real frame, so it landed in `_vbuf` as a phantom real frame → shifted every
+following viseme one frame late (freeze, then real frames delivered late). Offline prerender (GPU-alone → no underflow → no
+held frames) never had them → "a lot better." Reconciles with the prior proof that `render_segment` is byte-identical
+offline-vs-live: the RENDER was always fine; the client's frame-sequence assembly was the bug.
+
+**Proven (measurement + elimination):** (1) instrumented the client → live turns logged `held/dup 8 of 171 recv (server-real
+162)` = 4–8 phantom frames/turn polluting the synced buffer, and `[avatar timing] end drift` went negative from the
+inflation; (2) dumped the EXACT live PCM (`MUSETALK_DUMP_PCM=1`) and rendered it offline GPU-alone via the SAME server at
+fps12, burst-fed = **167 clean frames, 4 dups, +0.40s** → audio-content RULED OUT, render is clean; (3) cumulative
+`asyncio.sleep` real-time feed pacing starves the render on Windows (~15ms timer) and manufactures extra held frames
+(paced-feed offline exploded to 37 dups) — a SECONDARY cause.
+
+**Fix (client-only, surgical, no GPU restart) — `_on_frame`:** detect `is_dup` (byte-identical to last buffered frame) and
+DROP it instead of appending, so `_vbuf` == the REAL rendered sequence and audio always pairs with the right lip frame; under
+a stall the client holds the last real frame and the voice pauses IN SYNC (intended steady tradeoff) instead of drifting.
+Safe: genuine consecutive frames are never byte-identical. Held dups also excluded from `_vframes` so logs read true.
+**Verified objectively on the ACTUAL delivered output** (`MUSETALK_DUMP_DELIVERED=1` → the exact A/V the browser gets, muxed
+to `output/_delivered.mp4`): **consecutive-dup frames = 0**, video 1.67s ≈ voice 1.64s, drift −0.03s (was −0.73s polluted).
+
+**Files (UNCOMMITTED):** `local_services/musetalk_video.py` — the fix + kept diagnostics: the always-on cheap `held/dup N of
+M recv (server-real K)` field on `[avatar timing]` (the fix's health check), and two env-gated OFF dumps `MUSETALK_DUMP_PCM`
+/ `MUSETALK_DUMP_DELIVERED`. `.env` has both dump knobs at 0 (the running process still had DELIVERED=1 — harmless disk
+writes until the next restart). `docs/PROBLEMS-AND-FIXES.md` P39 + memory `project-visualllm-live-vs-prerender-wan`.
+
+**OPEN / next:** (a) **the user's live eye is the final gate** — the recurring lesson is the probe passes what the eye
+rejects; objective delivered-output is clean but visual sign-off is his. Watch: `output/_delivered.mp4` (fixed output) vs
+`output/_live_turn_pcm_ref.mp4` (offline clean ref), or just do a live turn (the fix is already loaded). (b) **Follow-on
+(not done):** repace the client `_feed_loop` with ABSOLUTE deadlines instead of cumulative `asyncio.sleep(dur)` to stop the
+feed-side render starvation at the source → fewer held frames → fewer in-sync pauses. (c) if the eye STILL rejects it, the
+remaining live-vs-offline knob is the coarse fps12 viseme phase (mouth ~110–167ms off vs native 25fps; prior-session
+measured, the user had accepted it offline). (d) commit decision. The scratchpad muxer + offline-render scripts are in this
+session's scratchpad.
+
 ## ⭐ HANDOFF → next session (2026-07-08, 12th): `/nimbus/` client made real (streaming bubble + no-bubble bugfix + one-bubble-per-turn + mic mute + single-connection + no-interrupt); BASELINE COMMITTED TO `main`
 
 **Context:** hardened the custom `/nimbus/` client into a usable UI and locked the whole baseline onto `main`.

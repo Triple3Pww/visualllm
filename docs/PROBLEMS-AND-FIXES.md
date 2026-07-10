@@ -1452,3 +1452,118 @@ option).
 ancestor). Files: `pipeline/main.py` (observer + `_partial` + single-connection + no-interrupt),
 `pipeline/config.py` (`allow_interruptions`), `.env` (`ALLOW_INTERRUPTIONS=0`),
 `local_services/nimbus_client/index.html` (live bubble + mute). All verified with `scripts._webrtc_probe`.
+
+## P38 — PUBLIC link (a stranger's browser) over Tailscale Funnel: STUN/TURN wiring + the ICE-pin saga (2026-07-09, 13th session)
+
+**Goal.** "Host and give a link everyone can use." The system is normally **tailnet-only** (`tailscale serve` at
+`https://porsche-pc.tail21bb8a.ts.net` → :7860; ICE host candidates pinned to the Tailscale interface by
+`_restrict_ice_to_subnet`, `WEBRTC_ICE_SUBNET=100.64.0.0/10`). Reaching a truly public browser has TWO independent
+walls, and Funnel only clears the first.
+
+**Wall 1 — Funnel is off + is signaling-only.** Enabling Tailscale **Funnel** is a login-gated admin-console toggle only
+the account owner can click (CLI errors with a `login.tailscale.com/f/funnel?node=…` link; `tailscale funnel reset`
+ALSO wipes the `serve` config — rebuild the 3 mappings after). And Funnel proxies only the **HTTPS page + `/api/offer`
+signaling** — the audio/video is UDP P2P over ICE and **never flows through Funnel**.
+
+**Wall 2 — the server offered no reachable media candidate.** pipecat builds the server `SmallWebRTCConnection` with
+`ice_servers=None` (the handler is `SmallWebRTCRequestHandler(esp32_mode=,host=)`), so aiortc only gathered HOST
+candidates (LAN/Tailscale IPs a stranger can't reach) — no STUN reflexive (srflx). A public browser loaded the page and
+then the mic/avatar media never connected.
+
+**Feature built (env-gated, OFF by default).** `_install_turn_ice_servers()` in `main.py` (called in `__main__`), active
+only when `WEBRTC_PUBLIC=1` **or** `TURN_URLS` is set — else a no-op, tailnet path 100% unchanged. It (a) monkeypatches
+`SmallWebRTCConnection.__init__` to inject STUN(+TURN) so the SERVER gathers srflx/relay candidates, (b) injects the same
+into the prebuilt `/client` page via the `<head>` `RTCPeerConnection` wrapper (jitter-buffer pattern), (c) serves the
+servers to the static `/nimbus` client via a new `GET /client/ice-config` (which nimbus fetches before building its pc).
+Env: `WEBRTC_PUBLIC`, `TURN_URLS` (comma-sep), `TURN_USERNAME`, `TURN_CREDENTIAL`, `STUN_URLS` (default google).
+
+**NAT reality (measured, better than feared).** aiortc gets a public srflx here and the NAT is **port-preserving (cone),
+NOT CGNAT/symmetric** (host port 63536 → srflx 63536, public 171.99.155.119). So **STUN-only (`WEBRTC_PUBLIC=1`, zero
+signup) works for many browsers** — TURN (Cloudflare Realtime / metered.ca free tier) is only the fallback for a visitor
+whose OWN NAT is symmetric. VERIFIED end-to-end: a real Android Chrome phone on **mobile data** reached
+`ICE=completed → connected`, got the spoken greeting + a lip-synced avatar (30 frames). So the video/render path was
+never the problem — every failure after was ICE.
+
+**The ICE-pin saga (systematic-debugging; the pin and public mode fight).** `_restrict_ice_to_subnet` pins host
+candidates, and that interacts with public mode three ways — the middle two were regressions I introduced and had to walk
+back with evidence:
+1. **Tailnet pin (100.64/10) alone** → aiortc derives its srflx FROM the Tailscale interface → NO internet-facing
+   candidate → a public visitor can't connect.
+2. **Advertise ALL interfaces** (first fix) → connect succeeded + greeting played, then a **marginal dead pair** (Hyper-V
+   172.x / Radmin 26.x / unreachable Tailscale host) won nomination and dropped → "Consent to send expired" / "Media
+   stream error; clearing track" → audio died + **avatar video never rendered** ("visual avatar not show"). This is the
+   very ICE pollution the pin existed to kill.
+3. **Pin to ONLY the default-route `/32`** (second fix) → fixed external/mobile but BROKE same-network + tailnet clients:
+   ICE stuck `checking`, never `completed`, client re-offered every ~20s (6 pc_ids churning, none reaching client-ready).
+   The clue that cracked it: the churning client's host candidate was `100.78.7.43` (Tailscale = `desktop-nsma4fh-1`) and
+   its srflx public IP == the SERVER's public IP `171.99.155.119` → the tester was on the **same home network**, and the
+   `/32` pin had dropped the server's Tailscale candidate `100.98.99.62`, so a tailnet/same-LAN client had no reachable
+   pair (its own public srflx needs router **hairpinning** home routers don't do). The "churn" was a SYMPTOM of ICE never
+   completing (client auto-retry), not multiple tabs.
+
+**FINAL ICE fix — keep a SET of interfaces.** In public mode `_restrict_ice_to_subnet` keeps
+`{100.64.0.0/10 (Tailscale: tailnet + same-LAN pairs) + <default-route>/32 (public srflx for externals)}`, still dropping
+Hyper-V/Radmin noise. Verified by repro: the server offers exactly `100.98.99.62` host + `192.168.1.39` host +
+`171.99.155.119` srflx, nothing else. (Default-route IP via `socket.connect(('8.8.8.8',80)).getsockname()[0]`.) LESSON:
+the `get_host_addresses` monkeypatch param names MUST stay `use_ipv4`/`use_ipv6` — aioice calls them by keyword.
+
+**Single-client + unauth caveats (unchanged).** One talker at a time (shared-GPU avatar server), and any visitor drives
+the GPU + cloud LLM/STT spend with no auth. Real multi-user public = a hosted SFU (pipecat-native Daily), not done.
+
+**State.** User reverted to the tailnet **baseline** (`tailscale funnel --https=443 off` + restore serve;
+`WEBRTC_PUBLIC=0`; pipeline restarted → ICE back to `['100.64.0.0/10']`). The public-mode code stays on disk but is
+**inert** unless `WEBRTC_PUBLIC`/`TURN_URLS` is set. UNCOMMITTED. Files: `pipeline/main.py`
+(`_install_turn_ice_servers`, `/client/ice-config`, public-mode `_restrict_ice_to_subnet`),
+`local_services/nimbus_client/index.html` (ice-config fetch), `.env.example` (knobs). Turn public back ON:
+`tailscale funnel --bg 7860` + `WEBRTC_PUBLIC=1` + restart pipeline.
+
+## P39 — LIVE avatar "lips don't match the words" = the client buffered the server's HELD/dup frames as real (2026-07-10, 14th session)
+
+**Symptom (a multi-session open problem).** The LIVE avatar's mouth MOTION didn't track the voice — the *shapes* looked
+wrong for the words — while the offline PRERENDER was "a lot better." The user was explicit: **our system, not the
+network** (a whole prior session chased a WAN/Tailscale theory and the user rejected it; `MUSETALK_SIZE 256` fit-the-stream
+fix was reverted to 512). Prior session PROVED `render_segment` is byte-identical offline-vs-live for the same audio (4
+ways), so the model, given the same audio, makes the same mouths — the divergence had to be in what reaches/leaves the
+renderer live, NOT the render.
+
+**Root cause (found by elimination + measurement).** In steady/prerender the CLIENT (`musetalk_video.py`) is video-master:
+it buffers every frame the server sends into `_vbuf` and releases them re-paced to the audio (`audio i/fps` ↔ `_vbuf[i]`).
+But the server's pump (`app.py`) emits a frame **every tick at fps**, and whenever its render underflows mid-turn (it shares
+the GPU with CosyVoice, and the client's real-time audio feed can briefly starve it) it **re-sends the LAST frame
+byte-for-byte** to keep the WebRTC track alive. The client **could not tell that held/dup frame from a real one**, so it
+landed in `_vbuf` as a PHANTOM real frame — shifting every following viseme one frame late (a freeze, then the real frames
+delivered late). Offline prerender (GPU-alone → no underflow → no held frames) never has them → "a lot better." This is a
+delivery/pacing bug, NOT audio and NOT render.
+
+**How it was proven (this session).**
+1. **Instrumented the client** to count byte-identical held frames entering `_vbuf` per turn. Live contended turns logged
+   `held/dup 8 of 171 recv (server-real 162)` — the client's synced buffer was polluted by 4–8 phantom frames/turn, and its
+   received count exceeded the server's REAL (video_clock) frame count by exactly that (the `[avatar timing]` `end drift`
+   went negative = video longer than audio because the dups inflate it).
+2. **Dumped the EXACT 16 kHz PCM the live server received** (`MUSETALK_DUMP_PCM=1` → `output/_live_turn_pcm.wav`) and
+   rendered it offline, GPU-alone, through the SAME server at the SAME fps=12. **Burst-fed (unpaced): 167 clean frames, only
+   4 held-dups, +0.40s drift** — a correct sequence. So the audio the server receives is FINE and the render of it is clean;
+   audio-content (handoff #1) is RULED OUT.
+3. **The paced-feed artifact that also cracked a contributing cause:** feeding that same PCM offline with a *cumulative*
+   `asyncio.sleep(0.02)` (like the old capture scripts + the live client's `_feed_loop`) exploded to **200 frames / 37 dups /
+   +3.15s FAKE drift** — the Windows ~15 ms timer granularity makes a cumulative-sleep feed ~40% slow, STARVING the render →
+   manufacturing held frames. So real-time feed pacing is a *secondary* manufacturer of the held frames (the primary is
+   shared-GPU contention).
+
+**FIX (client-side, surgical, no avatar-server/GPU restart) — `musetalk_video.py::_on_frame`.** Detect a received frame that
+is byte-identical to the last buffered one (`is_dup`) and **DROP it** instead of appending — so `_vbuf` stays exactly the
+REAL rendered sequence and `audio i/fps` always pairs with real lip-frame `i`. Under a genuine stall the client then holds
+the last real frame and the voice **pauses IN SYNC** (the intended, documented steady tradeoff) instead of drifting. Safe
+because genuine consecutive render frames are never byte-identical (the Whisper-of-waveform conditioning varies frame to
+frame even in silence — confirmed: the clean burst render shows dups only at the neutral tail). Held dups are also excluded
+from the `_vframes` delivery counter so the timing log reads true. **Verified:** post-fix turns log `held/dup 4 of 24 recv
+(server-real 24)` with `end drift +-0.00s` (was −0.73s on the polluted long turn) — the dups are detected and dropped, the
+synced buffer equals the real sequence.
+
+**Diagnostic scaffolding kept (env-gated, default OFF):** `MUSETALK_DUMP_PCM=1` (dump per-turn server-bound PCM) and the
+`held/dup N of M recv (server-real K)` field on the `[avatar timing]` line (always on, cheap — it's the fix's own health
+check). **Follow-on (not done, separate change):** repace the client `_feed_loop` with ABSOLUTE deadlines instead of
+cumulative `asyncio.sleep(dur)` to stop the feed-side render starvation at the source (fewer held frames → fewer in-sync
+pauses). **The user's live eye is the final gate** (the recurring lesson: the probe passes what the eye rejects) — the probe
+confirms the mechanism is fixed and drift is gone, but sign-off is the user watching a real turn. UNCOMMITTED (hold-for-live
+pattern). Offline clean reference for comparison: `output/_live_turn_pcm_ref.mp4`.

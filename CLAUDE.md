@@ -212,7 +212,16 @@ the phone self-reports to `[speaker-debug]` in pipeline.log. P24),
 `CLIENT_JITTER_BUFFER_MS` (raise only for a remote/WAN viewer),
 `WEBRTC_VIDEO_BITRATE_MAX` (caps aiortc's VP8 ceiling so the video fits a WAN link), and
 `WEBRTC_ICE_SUBNET` (**`100.64.0.0/10`** = pin WebRTC ICE to the Tailscale interface; fixes the
-intermittent remote mic — `0` disables). **Full reference: `WORKFLOW.md` §8.**
+intermittent remote mic — `0` disables), and — for a **PUBLIC link** a non-tailnet browser can use
+(over `tailscale funnel`, which proxies only the page + signaling, NEVER the WebRTC media) —
+`WEBRTC_PUBLIC` (**`0` = default, tailnet-only baseline**; `1` = advertise STUN so a public/CGNAT
+browser reaches the media. This box's NAT is port-preserving (cone), so STUN-only works with no TURN
+signup. When on, `_restrict_ice_to_subnet` keeps a SET = {Tailscale 100.64/10 for tailnet/same-LAN
+pairs + the internet-facing default-route `/32` for the public srflx}, dropping hyper-v/radmin noise —
+pinning to EITHER one alone breaks the other's clients) and `TURN_URLS`/`TURN_USERNAME`/`TURN_CREDENTIAL`
+(a relay fallback for a visitor whose own NAT is symmetric; also enables the feature). Both gate
+`_install_turn_ice_servers` (server-side ICE-server injection + `/client` head-patch + `/client/ice-config`
+for `/nimbus`). Still single-client + unauth. `docs/PROBLEMS-AND-FIXES.md` P38. **Full reference: `WORKFLOW.md` §8.**
 
 ## Commands
 

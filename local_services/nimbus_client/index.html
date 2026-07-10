@@ -796,7 +796,14 @@
       setState('connecting', 'Connecting...');
       setOverlay('connecting');
       try {
-        pc = new RTCPeerConnection();
+        // Public-WebRTC ICE config (STUN + TURN) from the server; empty over the tailnet path,
+        // where a default peer connection is correct. Lets a stranger's browser reach the media.
+        let iceCfg = {};
+        try {
+          const r = await fetch('/client/ice-config');
+          if (r.ok) { const j = await r.json(); if (j.iceServers && j.iceServers.length) iceCfg = { iceServers: j.iceServers }; }
+        } catch (_) {}
+        pc = new RTCPeerConnection(iceCfg);
         pc.ontrack = (e) => {
           const stream = e.streams[0] || new MediaStream([e.track]);
           if (e.track.kind === 'video') {

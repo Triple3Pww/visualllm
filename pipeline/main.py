@@ -346,6 +346,10 @@ def _configure_webrtc_video_bitrate() -> None:
 # serve-point keeps every env-gated patch additive and the prebuilt bundle untouched.
 _client_head_patches: list[str] = []
 _client_patch_middleware_installed = False
+# Public-WebRTC ICE servers (STUN + TURN) served to the custom /nimbus/ client via
+# GET /client/ice-config. Empty = no TURN configured -> public WebRTC off, tailnet behavior
+# unchanged. Populated by _install_turn_ice_servers() from TURN_URLS/TURN_USERNAME/TURN_CREDENTIAL.
+_ice_config_js: list[dict] = []
 # Set by run_bot so the /client/measure-turn endpoint (the Measure button) can inject a turn
 # into the live pipeline. None between sessions.
 _active_task = None
@@ -383,6 +387,7 @@ class _TranscriptStore:
         text = (text or "").strip()
         if not text:
             return
+        logger.info(f"[commit-dbg] {role} {text!r}")  # TEMP
         self._seq += 1
         self._items.append({"seq": self._seq, "role": role, "text": text})
         if len(self._items) > self._cap:
@@ -627,6 +632,17 @@ def _ensure_client_patch_middleware() -> bool:
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"[measure-turn] failed: {e!r}")
                 return HTMLResponse("error", status_code=500)
+        # Public-WebRTC ICE servers for the /nimbus/ client (served as a static file, so it
+        # can't get the <head> RTCPeerConnection wrapper the prebuilt /client page gets). It
+        # fetches this before building its peer connection. Empty list when no TURN is
+        # configured -> the client falls back to a default RTCPeerConnection (tailnet path).
+        if request.method == "GET" and request.url.path == "/client/ice-config":
+            import json as _json
+            return HTMLResponse(
+                _json.dumps({"iceServers": _ice_config_js}),
+                media_type="application/json",
+                headers={"Cache-Control": "no-store"},
+            )
         # Only the index page (exact /client or /client/); assets pass through to the mount.
         if request.method == "GET" and request.url.path in ("/client", "/client/"):
             try:
@@ -975,14 +991,46 @@ def _restrict_ice_to_subnet() -> None:
     testing is unaffected."""
     import ipaddress
 
-    subnet_str = os.getenv("WEBRTC_ICE_SUBNET", "100.64.0.0/10")
-    if not subnet_str or subnet_str == "0":
-        return
-    try:
-        net = ipaddress.ip_network(subnet_str, strict=False)
-    except ValueError:
-        logger.warning(f"WEBRTC_ICE_SUBNET={subnet_str!r} invalid; ICE restriction skipped.")
-        return
+    # We keep a SET of interfaces, not one. The classic tailnet pin (100.64/10) alone makes aiortc
+    # derive its STUN srflx FROM the Tailscale interface, so a public visitor gets no reachable
+    # candidate. But pinning to ONLY the internet-facing interface breaks the opposite clients:
+    # a tailnet peer (or a device on the SAME home network, where reaching our public srflx needs
+    # router hairpinning that home routers don't do) then has no usable pair and ICE never
+    # completes. So in PUBLIC mode we advertise BOTH: the Tailscale interface (tailnet + same-LAN
+    # clients pair on 100.x) AND the internet-facing default-route interface (its STUN srflx is the
+    # public candidate a truly-external visitor reaches). We still DROP the noise (Hyper-V 172.x,
+    # Radmin 26.x) so a marginal dead pair can't win nomination then drop ('Consent to send expired'
+    # -> 'Media stream error; clearing track' -> audio dies + avatar video never renders).
+    nets: list = []
+    if (os.getenv("WEBRTC_PUBLIC", "") or "").strip().lower() in ("1", "true", "yes", "on"):
+        import socket
+        try:
+            _s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            _s.connect(("8.8.8.8", 80))  # no packet sent; just resolves the default-route source IP
+            default_ip = _s.getsockname()[0]
+            _s.close()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"WEBRTC_PUBLIC: default-route IP undetected ({e!r}); advertising all interfaces.")
+            return
+        # Tailscale range for tailnet/same-network clients + the internet-facing /32 for externals.
+        tailnet = os.getenv("WEBRTC_ICE_SUBNET", "100.64.0.0/10") or "100.64.0.0/10"
+        for spec in (tailnet, f"{default_ip}/32"):
+            try:
+                nets.append(ipaddress.ip_network(spec, strict=False))
+            except ValueError:
+                pass
+        label = ", ".join(str(n) for n in nets)
+        logger.info(f"WEBRTC_PUBLIC on: pinning ICE to {{{label}}} -- Tailscale (tailnet/same-LAN "
+                    f"pairs) + internet-facing {default_ip} (public srflx); drops hyper-v/radmin noise.")
+    else:
+        subnet_str = os.getenv("WEBRTC_ICE_SUBNET", "100.64.0.0/10")
+        if not subnet_str or subnet_str == "0":
+            return
+        try:
+            nets.append(ipaddress.ip_network(subnet_str, strict=False))
+        except ValueError:
+            logger.warning(f"WEBRTC_ICE_SUBNET={subnet_str!r} invalid; ICE restriction skipped.")
+            return
     try:
         from aioice import ice as _ice
     except Exception as e:  # noqa: BLE001
@@ -996,13 +1044,14 @@ def _restrict_ice_to_subnet() -> None:
         kept = []
         for a in addrs:
             try:
-                if ipaddress.ip_address(a) in net:
-                    kept.append(a)
+                ip = ipaddress.ip_address(a)
             except ValueError:
                 continue  # skip anything not a plain IP (e.g. scoped IPv6)
+            if any(ip in n for n in nets):
+                kept.append(a)
         if not kept:
             logger.warning(
-                f"No host address in {subnet_str} (Tailscale down?); keeping all "
+                f"No host address in {[str(n) for n in nets]} (Tailscale down?); keeping all "
                 f"{len(addrs)} addresses so the connection still works."
             )
             return addrs
@@ -1010,8 +1059,104 @@ def _restrict_ice_to_subnet() -> None:
 
     _ice.get_host_addresses = _filtered
     logger.info(
-        f"WebRTC ICE host candidates restricted to {subnet_str} "
+        f"WebRTC ICE host candidates restricted to {[str(n) for n in nets]} "
         f"(was {len(_orig(True, False))} v4 addrs; WEBRTC_ICE_SUBNET=0 to disable)."
+    )
+
+
+def _install_turn_ice_servers() -> None:
+    """Enable PUBLIC WebRTC (a link a stranger can use) by advertising STUN + TURN.
+
+    Why this is needed: over Tailscale Funnel (or any public tunnel) only the HTTPS page +
+    /api/offer signaling is proxied -- the actual audio/video is UDP peer-to-peer over ICE and
+    never flows through the tunnel. By default pipecat builds the server SmallWebRTCConnection
+    with NO ice servers, so aiortc only gathers HOST candidates (LAN/Tailscale IPs a public
+    browser can't reach). Behind CGNAT (common on TW ISPs) even STUN isn't enough, so a TURN
+    relay is required for the media to traverse. This wires both sides to the same env-configured
+    servers:
+      * server (aiortc): monkeypatch SmallWebRTCConnection so every connection gets STUN+TURN ->
+        it gathers srflx (public) + relay candidates the browser can reach.
+      * client (prebuilt /client): the same <head> RTCPeerConnection wrapper pattern as the
+        jitter buffer, injecting iceServers into every peer connection.
+      * client (/nimbus): served statically, so it fetches GET /client/ice-config instead
+        (see the middleware) -- fed by the _ice_config_js this function populates.
+
+    GATE: active when TURN_URLS is set OR WEBRTC_PUBLIC=1. Off by default => no-op, the tailnet
+    path is 100% unchanged (host candidates stay pinned by _restrict_ice_to_subnet; nothing new
+    is advertised). WEBRTC_PUBLIC=1 alone advertises STUN only -- verified on this box the NAT is
+    port-preserving (cone), so STUN-only reaches many public browsers with zero signup; add
+    TURN_URLS as the fallback for a visitor whose NAT is symmetric. TURN creds are client-facing
+    by design (the browser must use them), so embedding them in the served page / ice-config is
+    expected. Env: WEBRTC_PUBLIC, TURN_URLS (comma-sep turn:/turns:), TURN_USERNAME,
+    TURN_CREDENTIAL, STUN_URLS (default stun:stun.l.google.com:19302)."""
+    global _ice_config_js
+    turn_urls = [u.strip() for u in (os.getenv("TURN_URLS", "") or "").split(",") if u.strip()]
+    public = (os.getenv("WEBRTC_PUBLIC", "") or "").strip().lower() in ("1", "true", "yes", "on")
+    if not turn_urls and not public:
+        return  # public WebRTC disabled; tailnet behavior unchanged.
+    turn_user = (os.getenv("TURN_USERNAME", "") or "").strip()
+    turn_cred = (os.getenv("TURN_CREDENTIAL", "") or "").strip()
+    stun_urls = [u.strip() for u in
+                 (os.getenv("STUN_URLS", "stun:stun.l.google.com:19302") or "").split(",")
+                 if u.strip()]
+
+    try:
+        from aiortc import RTCIceServer
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"TURN ICE servers skipped (aiortc import: {e!r}).")
+        return
+
+    js: list[dict] = []
+    rtc: list = []
+    if stun_urls:
+        js.append({"urls": stun_urls})
+        rtc.append(RTCIceServer(urls=stun_urls))
+    if turn_urls:
+        turn_entry: dict = {"urls": turn_urls}
+        if turn_user:
+            turn_entry["username"] = turn_user
+        if turn_cred:
+            turn_entry["credential"] = turn_cred
+        js.append(turn_entry)
+        rtc.append(RTCIceServer(urls=turn_urls, username=turn_user or None,
+                                credential=turn_cred or None))
+
+    # Server side: inject the ice servers into every SmallWebRTCConnection (pipecat creates it
+    # with ice_servers=None) so aiortc gathers srflx + relay candidates.
+    try:
+        from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"TURN ICE servers skipped (SmallWebRTCConnection import: {e!r}).")
+        return
+    if not getattr(SmallWebRTCConnection, "__turn_patched", False):
+        _orig_init = SmallWebRTCConnection.__init__
+
+        def _patched_init(self, ice_servers=None, *a, **k):
+            if not ice_servers:
+                ice_servers = list(rtc)
+            return _orig_init(self, ice_servers, *a, **k)
+
+        SmallWebRTCConnection.__init__ = _patched_init
+        SmallWebRTCConnection.__turn_patched = True
+
+    # Client side (prebuilt /client): wrap RTCPeerConnection to inject the same servers. Same
+    # synchronous <head> pattern as the jitter buffer, so it runs before the ES-module bundle.
+    _ice_config_js = js  # also served to /nimbus via GET /client/ice-config
+    import json as _json
+    ice_json = _json.dumps(js)
+    patch = (
+        "<script>(()=>{const ICE=" + ice_json + ";const N=window.RTCPeerConnection;"
+        "if(!N||N.__ice)return;const P=function(...a){const c=a[0]||{};"
+        "if(!c.iceServers||!c.iceServers.length)c.iceServers=ICE;a[0]=c;return new N(...a);};"
+        "P.prototype=N.prototype;P.__ice=1;window.RTCPeerConnection=P;"
+        "console.log('[turn] '+ICE.length+' ICE server(s) injected');})();</script>"
+    )
+    if _ensure_client_patch_middleware():
+        _client_head_patches.append(patch)
+    logger.info(
+        f"Public WebRTC ICE servers ENABLED: {len(js)} server(s), "
+        f"{'STUN+TURN (relay fallback for symmetric NAT)' if turn_urls else 'STUN only (no TURN)'}"
+        f" -> a public browser can reach the media. Unset TURN_URLS/WEBRTC_PUBLIC to disable."
     )
 
 
@@ -1092,6 +1237,9 @@ if __name__ == "__main__":
     # Pin ICE host candidates to the Tailscale interface so the stable 100.x<->100.x pair
     # wins immediately (kills the intermittent-mic ICE pollution -- see the function docstring).
     _restrict_ice_to_subnet()
+    # PUBLIC link support: if TURN_URLS is set, advertise STUN+TURN so a stranger's browser
+    # (behind CGNAT, over Funnel/a tunnel) can reach the media. No-op without TURN_URLS.
+    _install_turn_ice_servers()
     from pipecat.runner.run import main
 
     main()
