@@ -17,6 +17,20 @@ export CXX=$ENV/bin/g++
 export COSYVOICE_VLLM=1
 export VLLM_ENABLE_V1_MULTIPROCESSING=0
 export VLLM_USE_FLASHINFER_SAMPLER=0
+# --- Model selector (2026-07-10): v2 (default) | v3 = Fun-CosyVoice3-0.5B --------------------
+# COSYVOICE_MODEL=v3 switches to CosyVoice3: same 0.5B LM, a bigger 300M DiT flow decoder (v2's
+# is 100M). Measured cost is ~+0.07s first-chunk TTFB under live MuseTalk render (_ab_run, 2 x 32
+# samples) -- affordable. The engine's AutoModel dispatches on the yaml in the dir; v3 also
+# REQUIRES its instruct prefix inside the reference transcript ('...<|endofprompt|>' SEPARATES the
+# prefix from the transcript, llm.py:591 -- a bare/trailing marker yields empty/garbage audio).
+# Explicit COSYVOICE_MODEL_DIR / COSYVOICE_PROMPT_TEXT still win; this only fills their defaults.
+# NOTE: switching models needs THIS server relaunched in WSL -- the config panel's Restart cycles
+# only the pipeline (:7860), never the WSL TTS server.
+COSYVOICE_MODEL=${COSYVOICE_MODEL:-v2}
+if [ "$COSYVOICE_MODEL" = "v3" ]; then
+  export COSYVOICE_MODEL_DIR=${COSYVOICE_MODEL_DIR:-/mnt/e/Claude/cosyvoice-local-tts/CosyVoice/pretrained_models/Fun-CosyVoice3-0.5B-2512}
+  export COSYVOICE_PROMPT_TEXT=${COSYVOICE_PROMPT_TEXT:-"You are a helpful assistant.<|endofprompt|>你好，我是你的AI虚拟助手，很高兴见到你。今天天气不错，有什么我可以帮你的"}
+fi
 # Lever 2 (CUDA graphs): EAGER by default (0 = capture graphs -> faster per-token TTS decode).
 # VERDICT 2026-07-05 (8th session): KEEP EAGER. The graph win is real but ONLY on the TTS side; the
 # COST is on the zh-audio/avatar side, which is what matters for the talking head.
