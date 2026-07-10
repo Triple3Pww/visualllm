@@ -545,6 +545,7 @@
     <div class="presenter">
       <div class="presenter-frame">
         <video id="avatar" class="presenter-img" autoplay playsinline muted></video>
+        <canvas id="avatarCanvas" class="presenter-img" style="display:none"></canvas>
         <audio id="botAudio" autoplay playsinline></audio>
         <div class="avatar-overlay" id="avatarOverlay" data-mode="idle">
           <div class="loader" aria-hidden="true"></div>
@@ -618,6 +619,52 @@
     "use strict";
     const micBtn   = document.getElementById('micBtn');
     const avatar   = document.getElementById('avatar');
+    const avatarCanvas = document.getElementById('avatarCanvas');
+    // Split mode (MUSETALK_SPLIT): the server streams only a fixed-size mouth crop; we paint a
+    // pristine background still and draw the crop into its bbox each frame. _split stays null
+    // when off -> the plain <video> shows the full frame (fallback).
+    let _split = null;      // {bbox, bgW, bgH} once loaded, else null (full-frame fallback)
+    let _bgImg = null;      // pristine background <img>
+    let _rafId = 0;         // compositor rAF handle (distinct from the bot-audio meter's rafId)
+
+    async function loadOverlay() {
+      try {
+        const r = await fetch('/client/avatar-overlay', { cache: 'no-store' });
+        if (!r.ok) return false;
+        const d = await r.json();
+        if (!d || !d.split) return false;
+        _bgImg = new Image();
+        await new Promise((res, rej) => {
+          _bgImg.onload = res; _bgImg.onerror = rej;
+          _bgImg.src = 'data:image/png;base64,' + d.bg_png;
+        });
+        _split = { bbox: d.bbox, bgW: d.bg_size[0], bgH: d.bg_size[1] };
+        return true;
+      } catch (e) { console.warn('overlay load failed', e); return false; }
+    }
+
+    function startCompositor() {
+      // Draw the pristine background, then the mouth-crop video stretched into the bbox rect,
+      // every animation frame. Canvas is sized to the background's native pixels; CSS scales
+      // the whole stage (background + overlaid crop scale together, so the bbox stays aligned).
+      const c = avatarCanvas, ctx = c.getContext('2d');
+      c.width = _split.bgW; c.height = _split.bgH;
+      const [x1, y1, x2, y2] = _split.bbox;
+      // Show the canvas ON TOP of the video (both position:absolute inset:0; canvas is later in
+      // the DOM). The canvas paints an opaque background every frame, so it fully covers the
+      // <video> beneath -- we leave that video visible-but-covered (NOT display:none, which can
+      // make a browser throttle its decode and freeze drawImage) so its frames keep decoding.
+      c.style.display = '';
+      const draw = () => {
+        if (_bgImg) ctx.drawImage(_bgImg, 0, 0, c.width, c.height);
+        if (avatar.readyState >= 2 && avatar.videoWidth > 0) {
+          ctx.drawImage(avatar, x1, y1, x2 - x1, y2 - y1);  // un-stretch square crop into bbox
+        }
+        _rafId = requestAnimationFrame(draw);
+      };
+      cancelAnimationFrame(_rafId);
+      draw();
+    }
     const botAudio = document.getElementById('botAudio');
     const nameTag  = document.getElementById('nameTag');
     const statusLabel = document.getElementById('statusLabel');
@@ -803,11 +850,13 @@
           const r = await fetch('/client/ice-config');
           if (r.ok) { const j = await r.json(); if (j.iceServers && j.iceServers.length) iceCfg = { iceServers: j.iceServers }; }
         } catch (_) {}
+        await loadOverlay();   // sets _split if MUSETALK_SPLIT is on; else full-frame <video> fallback
         pc = new RTCPeerConnection(iceCfg);
         pc.ontrack = (e) => {
           const stream = e.streams[0] || new MediaStream([e.track]);
           if (e.track.kind === 'video') {
             avatar.srcObject = stream; avatar.play().catch(()=>{});
+            if (_split) startCompositor();   // draw crop over pristine bg (else <video> shows full frame)
           } else if (e.track.kind === 'audio') {
             botAudio.srcObject = stream; botAudio.play().catch(()=>{});
             watchBotAudio(stream);
@@ -860,6 +909,9 @@
       if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
       if (pc) { try { pc.close(); } catch(_){} pc = null; }
       avatar.srcObject = null; botAudio.srcObject = null;
+      cancelAnimationFrame(_rafId); _rafId = 0;
+      avatarCanvas.style.display = 'none';
+      _split = null; _bgImg = null;
     }
 
     // POST a typed message to the live pipeline (LLM -> TTS -> avatar speaks it).
