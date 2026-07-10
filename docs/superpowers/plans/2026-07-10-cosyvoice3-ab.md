@@ -673,10 +673,21 @@ Same, with the v3 env from Task 4 Step 1 → `output/zh_v3.mp4`.
 Verify from the logs that both used `pro_ref.wav` and the identical zh sentence. If not, re-capture:
 per P18, varying the reference clip means A/B-ing the voice rather than the architecture.
 
-- [ ] **Step 4: Hand the two files to the user**
+- [x] **Step 4: Hand the two files to the user**
 
-Do not summarize them as "v3 looks better." Per the spec's verdict rule and the
-`feedback-test-fix-before-handing` memory: hand over two files and let the eye decide.
+**Phase 2 outcome (2026-07-10): two matched clips delivered for the user's eye.**
+
+- `output/zh_v2_synced.mp4` and `output/zh_v3_synced.mp4` (also the raw `zh_v2.wav` / `zh_v3.wav`).
+- Controlled: identical sentence (the `_zh_audio_ab.ZH` weather line), identical `pro_ref.wav`
+  voice, identical MuseTalk (fps12 / size512 / TRT / GPU-composite / `avatar_studio_match.png`).
+  The ONLY variable is the TTS model. Both 512x512, 126 real frames, A/V drift 0.00s.
+- Rendered via `_capture_synced.py` (delivered frames the server brackets between
+  video_start/video_end), muxed at `eff_fps = frames/audio_s` so lips span the audio exactly --
+  the stock script's hardcoded 20fps caused a +2.25s drift because the server sizes frames on
+  audio length, not the config fps (P9 area); the eff_fps mux is drift-free and treats both arms
+  identically.
+- Verdict is the user's eye, per the spec. Not summarized as better/worse here.
+- Caveat handed to the user: judge on the physical machine, not over RDP (RDP desyncs A/V).
 
 ---
 
