@@ -17,14 +17,28 @@ export CXX=$ENV/bin/g++
 export COSYVOICE_VLLM=1
 export VLLM_ENABLE_V1_MULTIPROCESSING=0
 export VLLM_USE_FLASHINFER_SAMPLER=0
-# zh TTFO lever (2026-07-03): emit the first audio chunk after fewer speech tokens.
-# CosyVoice's first-chunk TTFB scales with the opening chunk size, and Chinese commits to a
-# BIGGER opening than English (~2.3s vs ~1.1s). FIRST_HOP=5 caps it -> zh first-chunk
-# ~2.5s -> ~1.8s, whole natural sentences, no avatar starvation (TensorRT holds >=12fps).
-# Harmless for English: the pipeline's first-clause split already feeds en short clauses, and
-# hop=5 on a short clause is ~unchanged. English's own TTFO win is the split (long en sentences
-# want an early-clause start, which hop can't give). Set COSYVOICE_FIRST_HOP=0 to disable.
-export COSYVOICE_FIRST_HOP=${COSYVOICE_FIRST_HOP:-5}
+# Lever 2 (CUDA graphs): EAGER by default (0 = capture graphs -> faster per-token TTS decode).
+# VERDICT 2026-07-05 (8th session): KEEP EAGER. The graph win is real but ONLY on the TTS side; the
+# COST is on the zh-audio/avatar side, which is what matters for the talking head.
+#   - A TTS-TTFB variance probe (_ttfb_variance.py) showed graphs FASTER + LOWER-variance than eager
+#     (even under real MuseTalk render) -> so from the TTS stopwatch, graphs look strictly better.
+#   - BUT the user's eye caught zh LIPSYNC degrading with graphs ON. Root cause, measured
+#     (_zh_audio_ab.py, same zh sentence x5): graphs ON alters the zh AUDIO -- longer (median
+#     8.92 vs 8.28s), MORE internal silence (worst 0.76 vs 0.68s, frac 0.30-0.36 vs 0.22-0.33),
+#     more run-variance. The graph decode perturbs the zh-critical RAS sampling (the P18 fix that
+#     stops zh looping on the silence token). MuseTalk lip-syncs off a WHISPER of that waveform, so
+#     a degraded zh waveform -> mouth shapes that don't track the words. en is spared (no RAS reliance).
+# So the "no drawback" re-investigation measured the WRONG side (TTS TTFB); P31's original revert was
+# right. Set COSYVOICE_VLLM_EAGER=0 to force graphs (fine for an en-only / TTS-throughput setup).
+# (docs P27/P31/P32/P33; the config panel's CUDA-graphs toggle flips this + relaunches.)
+export COSYVOICE_VLLM_EAGER=${COSYVOICE_VLLM_EAGER:-1}
+# zh TTFO lever -- REVERTED to 0 (2026-07-04, live-measured twice): hop=5's isolated first-chunk
+# TTFB win (~2.5s -> ~1.8s) is ERASED live in steady mode -- the SMALLER opening chunk fills the
+# MUSETALK_LEAD_FRAMES cushion slower, so the synced voice-start is DELAYED (P19 grid + a fresh
+# 2026-07-04 A/B: live zh TTFO median ~4.1s @hop=5 vs ~3.1s @hop=0, smoothness screen clean,
+# zh steady-hold 1.9-2.2s -> ~0.8s). hop>0 remains only a knob for experiments.
+# (Per-language plumbing kept: tts_engine.py::_apply_first_hop, per request, zh-only by is_cjk.)
+export COSYVOICE_FIRST_HOP_ZH=${COSYVOICE_FIRST_HOP_ZH:-0}
 # VRAM trim (2026-06-30, measured): cap max sequence length + the card fraction vLLM may use.
 # CosyVoice generates ONE short sentence of speech tokens per request, so the default KV
 # reservation (max_model_len 32768) is wildly oversized. Capping max-len to 2048 lets the

@@ -21,9 +21,11 @@ import os
 import uuid
 import time
 
+import numpy as np
+import torch
 import torchaudio
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from contextlib import asynccontextmanager
@@ -43,6 +45,16 @@ _engine = None
 async def lifespan(app: FastAPI):
     global _engine
     _engine = get_engine()  # load model once at startup
+    # Warmup: run one full synthesis so CUDA kernels compile, cuDNN autotunes, and the
+    # autoregressive/flow caches are hot BEFORE the first user turn -- otherwise the very
+    # first reply pays a one-time cold-start (seen as the extra-slow first synthesis).
+    try:
+        t0 = time.perf_counter()
+        for _wav, _sr in _engine.synthesize_stream("Hello, warming up."):
+            pass
+        print(f"[warmup] CosyVoice warm in {time.perf_counter() - t0:.2f}s", flush=True)
+    except Exception as e:  # noqa: BLE001 -- warmup is best-effort, never block startup
+        print(f"[warmup] skipped: {e!r}", flush=True)
     yield
 
 
@@ -57,6 +69,25 @@ class TTSRequest(BaseModel):
     speed: float = Field(1.0, ge=0.5, le=2.0, description="Playback speed multiplier")
 
 
+class TTSStreamRequest(BaseModel):
+    text: str = Field(..., min_length=1, description="Text to synthesize (zh-TW or English)")
+    # `voice` is accepted for the pipeline client's contract; the engine has one
+    # registered female zero-shot speaker, so it's informational here.
+    voice: str = Field("weather", description="Speaker id (engine uses its registered reference)")
+    sample_rate: int = Field(24000, ge=8000, le=48000, description="Output PCM sample rate (Hz)")
+    speed: float = Field(1.0, ge=0.5, le=2.0, description="Playback speed multiplier")
+
+
+def _to_pcm16(wav: "torch.Tensor", src_sr: int, dst_sr: int) -> bytes:
+    """CosyVoice float tensor [1, N] (or [N]) -> 16-bit PCM mono bytes, resampled if needed."""
+    audio = wav.squeeze(0) if wav.dim() == 2 else wav
+    audio = audio.detach().cpu().float()
+    if src_sr != dst_sr:
+        audio = torchaudio.functional.resample(audio, src_sr, dst_sr)
+    pcm = (audio.clamp(-1, 1).numpy() * 32767.0).astype(np.int16)
+    return pcm.tobytes()
+
+
 @app.get("/")
 def home():
     """Demo web interface."""
@@ -65,7 +96,45 @@ def home():
 
 @app.get("/info")
 def info():
-    return {"service": "Local CosyVoice2 TTS", "endpoints": ["/ (web)", "/tts (POST)", "/health"]}
+    return {"service": "Local CosyVoice2 TTS",
+            "endpoints": ["/ (web)", "/tts (POST)", "/tts/stream (POST)", "/health"]}
+
+
+@app.post("/tts/stream")
+def tts_stream(req: TTSStreamRequest):
+    """Stream raw 16-bit PCM mono as it synthesizes (audio/L16) for the realtime
+    pipeline. Lower first-chunk latency than /tts (which returns a finished wav)."""
+    if _engine is None:
+        raise HTTPException(status_code=503, detail="engine still loading")
+    if not (req.text or "").strip():
+        raise HTTPException(status_code=400, detail="text is empty")
+
+    def gen():
+        # Lever 3a (turn-start stagger): CosyVoice generates faster than real-time (RTF<1),
+        # so without pacing it FRONT-LOADS the opening audio -- a GPU burst that collides with
+        # MuseTalk's first render segment on the shared card (the "avatar moves before voice"
+        # lag). Cap the OPENING chunks to `rate`x real-time so GPU use spreads out and the
+        # avatar's first render isn't starved. NEVER delays the first chunk (that is TTFO), and
+        # stops pacing after PACE_WINDOW_S of emitted audio so long replies run free.
+        # COSYVOICE_PACE_RATE=0 (default) => off, byte-identical to the old fast path.
+        rate = float(os.getenv("COSYVOICE_PACE_RATE", "0") or "0")
+        window_s = float(os.getenv("COSYVOICE_PACE_WINDOW_S", "2.0") or "2.0")
+        t_start = None
+        emitted_s = 0.0
+        for wav, sr in _engine.synthesize_stream(req.text, speed=req.speed):
+            pcm = _to_pcm16(wav, sr, req.sample_rate)
+            if rate > 0 and emitted_s < window_s:
+                now = time.perf_counter()
+                if t_start is None:
+                    t_start = now            # clock starts at the first chunk; it is NOT delayed
+                else:
+                    target = t_start + emitted_s / rate   # earliest wall-time this chunk may emit
+                    if target > now:
+                        time.sleep(target - now)
+            yield pcm
+            emitted_s += (len(pcm) / 2) / req.sample_rate   # int16 mono: bytes/2 = samples
+
+    return StreamingResponse(gen(), media_type="audio/L16")
 
 
 @app.get("/health")
