@@ -17,21 +17,38 @@ export CXX=$ENV/bin/g++
 export COSYVOICE_VLLM=1
 export VLLM_ENABLE_V1_MULTIPROCESSING=0
 export VLLM_USE_FLASHINFER_SAMPLER=0
-# Lever 2 (CUDA graphs): EAGER by default (0 = capture graphs -> faster per-token TTS decode).
-# VERDICT 2026-07-05 (8th session): KEEP EAGER. The graph win is real but ONLY on the TTS side; the
-# COST is on the zh-audio/avatar side, which is what matters for the talking head.
-#   - A TTS-TTFB variance probe (_ttfb_variance.py) showed graphs FASTER + LOWER-variance than eager
-#     (even under real MuseTalk render) -> so from the TTS stopwatch, graphs look strictly better.
-#   - BUT the user's eye caught zh LIPSYNC degrading with graphs ON. Root cause, measured
-#     (_zh_audio_ab.py, same zh sentence x5): graphs ON alters the zh AUDIO -- longer (median
-#     8.92 vs 8.28s), MORE internal silence (worst 0.76 vs 0.68s, frac 0.30-0.36 vs 0.22-0.33),
-#     more run-variance. The graph decode perturbs the zh-critical RAS sampling (the P18 fix that
-#     stops zh looping on the silence token). MuseTalk lip-syncs off a WHISPER of that waveform, so
-#     a degraded zh waveform -> mouth shapes that don't track the words. en is spared (no RAS reliance).
-# So the "no drawback" re-investigation measured the WRONG side (TTS TTFB); P31's original revert was
-# right. Set COSYVOICE_VLLM_EAGER=0 to force graphs (fine for an en-only / TTS-throughput setup).
+# --- Model selector (2026-07-10): v2 (default) | v3 = Fun-CosyVoice3-0.5B --------------------
+# COSYVOICE_MODEL=v3 switches to CosyVoice3: same 0.5B LM, a bigger 300M DiT flow decoder (v2's
+# is 100M). Measured cost is ~+0.07s first-chunk TTFB under live MuseTalk render (_ab_run, 2 x 32
+# samples) -- affordable. The engine's AutoModel dispatches on the yaml in the dir; v3 also
+# REQUIRES its instruct prefix inside the reference transcript ('...<|endofprompt|>' SEPARATES the
+# prefix from the transcript, llm.py:591 -- a bare/trailing marker yields empty/garbage audio).
+# Explicit COSYVOICE_MODEL_DIR / COSYVOICE_PROMPT_TEXT still win; this only fills their defaults.
+# NOTE: switching models needs THIS server relaunched in WSL -- the config panel's Restart cycles
+# only the pipeline (:7860), never the WSL TTS server.
+COSYVOICE_MODEL=${COSYVOICE_MODEL:-v2}
+if [ "$COSYVOICE_MODEL" = "v3" ]; then
+  export COSYVOICE_MODEL_DIR=${COSYVOICE_MODEL_DIR:-/mnt/e/Claude/cosyvoice-local-tts/CosyVoice/pretrained_models/Fun-CosyVoice3-0.5B-2512}
+  export COSYVOICE_PROMPT_TEXT=${COSYVOICE_PROMPT_TEXT:-"You are a helpful assistant.<|endofprompt|>你好，我是你的AI虚拟助手，很高兴见到你。今天天气不错，有什么我可以帮你的"}
+  # Flow-decoder TensorRT for v3's 300M DiT. Verified 2026-07-10: the fp32 ONNX->TRT engine builds
+  # in ~30s on first load (cached to flow.decoder.estimator.fp32.mygpu.plan), audio stays correct,
+  # isolated first-chunk TTFB zh 1.48->1.08s / en 1.34->0.80s WITH CUDA graphs (EAGER=0 below) also on.
+  # fp16 DiT TRT is NOT used (upstream warns of perf issues); fp32 only. Override with COSYVOICE_FLOW_TRT=0.
+  # CAVEAT: graphs are the config the project rejected for v2 (P33: graph decode perturbs RAS -> zh
+  # LIPSYNC degrades to the EYE though the TTS stopwatch looks faster). UNVERIFIED for v3's zh lipsync.
+  export COSYVOICE_FLOW_TRT=${COSYVOICE_FLOW_TRT:-1}
+fi
+# Lever 2 (CUDA graphs): default 0 = capture graphs (faster per-token TTS decode).
+# BASELINE 2026-07-10 (user decision): graphs ON, paired with v3 + flow-TRT, on LANGUAGE=en.
+# Isolated first-chunk TTFB with graphs+flow-TRT: zh 1.08s / en 0.80s.
+# KNOWN RISK, carried from the P27-P33 saga and NOT re-cleared for v3: graphs perturb the
+# zh-critical RAS sampling (P18) -> the zh AUDIO gets longer + more internal silence, and since
+# MuseTalk lip-syncs off a WHISPER of that waveform, the mouth can stop tracking the words. That
+# is why graphs were kept OFF for the v2/zh baseline (the user's eye rejected them, P33). en is
+# spared (no RAS reliance), which is why graphs-on is fine for the current en baseline. If you
+# switch to zh, re-check the lipsync by eye (or flip COSYVOICE_VLLM_EAGER=1 / the panel toggle).
 # (docs P27/P31/P32/P33; the config panel's CUDA-graphs toggle flips this + relaunches.)
-export COSYVOICE_VLLM_EAGER=${COSYVOICE_VLLM_EAGER:-1}
+export COSYVOICE_VLLM_EAGER=${COSYVOICE_VLLM_EAGER:-0}
 # zh TTFO lever -- REVERTED to 0 (2026-07-04, live-measured twice): hop=5's isolated first-chunk
 # TTFB win (~2.5s -> ~1.8s) is ERASED live in steady mode -- the SMALLER opening chunk fills the
 # MUSETALK_LEAD_FRAMES cushion slower, so the synced voice-start is DELAYED (P19 grid + a fresh

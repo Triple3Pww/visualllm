@@ -50,6 +50,12 @@ PROMPT_TEXT = os.environ.get(
 )
 SPK_ID = os.environ.get("COSYVOICE_SPK_ID", "weather")
 
+# CosyVoice3 only: the instruct prefix that must precede <|endofprompt|>. Upstream's own
+# cosyvoice3_example uses exactly this string (example.py:76,81). The marker SEPARATES the
+# prefix from the reference transcript (llm.py:591) -- putting it at the END of prompt_text
+# leaves an empty transcript.
+V3_INSTRUCT = os.environ.get("COSYVOICE_V3_INSTRUCT", "You are a helpful assistant.<|endofprompt|>")
+
 _CJK = re.compile(r"[㐀-鿿豈-﫿぀-ヿ]")
 
 
@@ -62,7 +68,7 @@ class TTSEngine:
     def __init__(self, model_dir: str | None = None, fp16: bool = False, load_vllm: bool = False,
                  load_trt: bool = False):
         import torch
-        from cosyvoice.cli.cosyvoice import CosyVoice2
+        from cosyvoice.cli.cosyvoice import AutoModel
 
         self.model_dir = model_dir or os.environ.get("COSYVOICE_MODEL_DIR", DEFAULT_MODEL_DIR)
         if not os.path.exists(self.model_dir):
@@ -75,20 +81,34 @@ class TTSEngine:
         # CosyVoice2 uses CUDA when available, else CPU. MPS is not used by the
         # upstream model, so on Apple Silicon this runs on CPU.
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        logging.info("Loading CosyVoice2 from %s (device=%s)", self.model_dir, self.device)
+        logging.info("Loading CosyVoice from %s (device=%s)", self.model_dir, self.device)
 
         # load_vllm: swap the autoregressive LLM onto vLLM (the real fix for first-chunk latency
         # -- the LLM token-gen is the ~3s bottleneck). Off by default (COSYVOICE_VLLM=1 to enable);
         # the Windows server stays on the PyTorch path. Requires the vLLM env (Linux/WSL).
-        self.model = CosyVoice2(self.model_dir, load_jit=False, load_trt=load_trt,
-                                load_vllm=load_vllm, fp16=fp16)
+        # AutoModel dispatches on the yaml in model_dir, so COSYVOICE_MODEL_DIR alone selects
+        # CosyVoice2 vs CosyVoice3. No load_jit: CosyVoice3.__init__ has no such parameter, and
+        # this passed False for it anyway.
+        self.model = AutoModel(model_dir=self.model_dir, load_trt=load_trt,
+                               load_vllm=load_vllm, fp16=fp16)
         self.sample_rate = self.model.sample_rate
+
+        # CosyVoice3's LM asserts <|endofprompt|> is among the tokens it sees (llm.py:479).
+        # zh rides the zero_shot path, which keeps prompt_text (our COSYVOICE_PROMPT_TEXT carries
+        # the marker). en rides cross_lingual, which DELETES prompt_text -- so on v3 the marker
+        # must ride on the text itself, the way upstream's instruct strings do. v2 must never see
+        # it (unknown token, and its LM has no such requirement).
+        self._is_v3 = self.model.__class__.__name__ == "CosyVoice3"
 
         # Register the reference voice once; subsequent calls reuse it by id.
         ok = self.model.add_zero_shot_spk(PROMPT_TEXT, PROMPT_WAV, SPK_ID)
         if ok is not True:
             logging.warning("add_zero_shot_spk returned %r; falling back to per-call prompt", ok)
         self._spk_ready = ok is True
+
+    def _xlingual_text(self, text: str) -> str:
+        """cross_lingual drops prompt_text, so v3's instruct prefix rides on the text instead."""
+        return f"{V3_INSTRUCT}{text}" if self._is_v3 else text
 
     def _apply_first_hop(self, cjk: bool):
         """Per-language first-hop, set per request just before inference.
@@ -131,7 +151,7 @@ class TTSEngine:
             # Cross-lingual: English target voiced with the Mandarin reference.
             spk = SPK_ID if self._spk_ready else ""
             gen = self.model.inference_cross_lingual(
-                text, PROMPT_WAV, zero_shot_spk_id=spk, stream=False, speed=speed
+                self._xlingual_text(text), PROMPT_WAV, zero_shot_spk_id=spk, stream=False, speed=speed
             )
 
         chunks = [out["tts_speech"] for out in gen]
@@ -205,7 +225,7 @@ class TTSEngine:
         else:
             spk = SPK_ID if self._spk_ready else ""
             gen = self.model.inference_cross_lingual(
-                text, PROMPT_WAV, zero_shot_spk_id=spk, stream=True, speed=speed
+                self._xlingual_text(text), PROMPT_WAV, zero_shot_spk_id=spk, stream=True, speed=speed
             )
 
         raw = ((out["tts_speech"], self.sample_rate) for out in gen)
