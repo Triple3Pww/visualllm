@@ -18,10 +18,17 @@ in the `.py` file, so the two can never drift apart.
 
 ## Using an outside tutor
 
-`COACH-BRIEF.md` is a self-contained teaching brief you can hand to another AI (Gemini) to be
-taught a module in depth. **Order matters:** commit that module's cold pretest guesses in
-`index.html` FIRST, then go to the coach, then come back for the lab and the self-check.
-Guessing before you are taught is the mechanism — teach yourself first and you spend it for
-nothing. The brief tells the coach the same thing, and tells it not to hand you the blanks.
+`coach/` holds one self-contained teaching brief per module — paste **one file per session** into
+another AI (Gemini) to be taught that module in depth. Each repeats the rules and context, so a
+fresh chat with no memory of the others still works. Start with `coach/README.md`.
+
+**Order matters, every week:**
+
+1. Commit that module's cold pretest guesses in `index.html` **first**.
+2. Then paste `coach/0N-*.md` into the tutor and work through it.
+3. Then come back here for the lab, the falsify step, and the self-check.
+
+Guessing before you are taught is the mechanism — get taught first and you spend it for nothing.
+The briefs tell the coach the same thing, and tell it **not to hand you the blanks**.
 
 Design + evidence: `docs/superpowers/specs/2026-07-11-visualllm-study-plan-design.md`
