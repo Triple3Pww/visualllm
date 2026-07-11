@@ -1,0 +1,305 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VisualLLm — Fundamentals</title>
+<style>
+  :root{
+    --bg:#0d1117;--panel:#161b22;--line:#30363d;--ink:#e6edf3;--dim:#8b949e;
+    --acc:#58a6ff;--good:#3fb950;--warn:#d29922;--bad:#f85149;
+    --mono:ui-monospace,'Cascadia Mono','Roboto Mono',Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);line-height:1.65}
+  .wrap{max-width:820px;margin:0 auto;padding:0 24px 120px}
+  header{padding:56px 0 28px;border-bottom:1px solid var(--line);margin-bottom:32px}
+  h1{margin:0 0 6px;font-size:26px;letter-spacing:-.02em}
+  header p{margin:0;color:var(--dim);max-width:62ch}
+  .bar{display:flex;gap:4px;margin-top:22px}
+  .bar i{flex:1;height:4px;border-radius:2px;background:#21262d}
+  .bar i.on{background:var(--good)}
+  .barlbl{font-size:12px;color:var(--dim);margin-top:8px}
+
+  .mod{border:1px solid var(--line);border-radius:12px;background:var(--panel);margin-bottom:28px;overflow:hidden}
+  .mod>h2{margin:0;padding:18px 22px;font-size:17px;border-bottom:1px solid var(--line);background:#1c2128}
+  .mod>h2 small{display:block;color:var(--dim);font-size:12px;font-weight:400;margin-top:3px;letter-spacing:.04em}
+  .sec{padding:22px;border-bottom:1px solid var(--line)}
+  .sec:last-child{border-bottom:0}
+  .sec>h3{margin:0 0 4px;font-size:11px;letter-spacing:.11em;color:var(--dim);text-transform:uppercase}
+  .sec>.hint{margin:0 0 16px;font-size:13px;color:var(--dim);font-style:italic}
+  .sec p{margin:0 0 12px}
+  .sec p:last-child{margin-bottom:0}
+  code{font-family:var(--mono);font-size:12.5px;background:#0b0f14;border:1px solid var(--line);
+    padding:1px 6px;border-radius:5px;color:#a5d6ff}
+  .cmd{display:block;font-family:var(--mono);font-size:13px;background:#010409;border:1px solid var(--line);
+    border-radius:6px;padding:11px 14px;margin:10px 0;color:#7ee787;overflow-x:auto;white-space:pre}
+
+  .q{background:#0b0f14;border:1px solid var(--line);border-radius:8px;padding:16px;margin-bottom:12px}
+  .q .txt{margin-bottom:12px}
+  .q input{width:100%;padding:9px 12px;background:#010409;border:1px solid var(--line);border-radius:6px;
+    color:var(--ink);font-family:var(--mono);font-size:13px}
+  .q input:focus{outline:none;border-color:var(--acc)}
+  .q button{margin-top:10px;padding:8px 15px;background:var(--acc);color:#04121f;border:0;border-radius:6px;
+    font-weight:600;font-size:13px;cursor:pointer;font-family:inherit}
+  .q button:hover{filter:brightness(1.1)}
+  .q button:disabled{opacity:.45;cursor:not-allowed}
+  .seal{margin-top:9px;font-size:12px;color:var(--dim);font-style:italic}
+  .ans{display:none;margin-top:13px;padding:13px;border-radius:6px;font-size:14px;
+    background:rgba(210,153,34,.1);border:1px solid rgba(210,153,34,.35)}
+  .ans.show{display:block}
+  .ans b{display:block;margin-bottom:5px;color:var(--warn)}
+  .ans .you{margin-top:8px;font-family:var(--mono);font-size:12px;color:var(--dim)}
+  .locked{filter:blur(6px);pointer-events:none;user-select:none;transition:filter .4s}
+  .locked.open{filter:none;pointer-events:auto;user-select:auto}
+  .gatemsg{padding:0 22px 18px;font-size:13px;color:var(--warn)}
+  .gatemsg.done{display:none}
+
+  .trace{list-style:none;padding:0;margin:0}
+  .trace li{padding:9px 0;border-bottom:1px solid #21262d;font-size:14px}
+  .trace li:last-child{border-bottom:0}
+  .trace .f{font-family:var(--mono);font-size:12.5px;color:#a5d6ff;display:block}
+  .payoff{background:linear-gradient(180deg,#1b1206,#0b0f14);border:1px solid #6b4708;border-radius:8px;padding:16px}
+  .payoff h4{margin:0 0 8px;font-size:14px;color:var(--warn)}
+  .empty{color:var(--dim);font-size:13px;font-style:italic}
+  footer{padding:40px 0;color:var(--dim);font-size:13px;text-align:center}
+  .reset{background:none;border:1px solid var(--line);color:var(--dim);padding:6px 12px;
+    border-radius:6px;font-size:12px;cursor:pointer;font-family:inherit}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>VisualLLm — the four foundations</h1>
+    <p>One conversation turn, followed through the system. Each module teaches the layer the turn
+       crosses, then hands you the real bug it explains. Guess before you read — a wrong guess
+       beats a read answer, and that is not a metaphor, it is the finding.</p>
+    <div class="bar" id="bar"></div>
+    <div class="barlbl" id="barlbl">0 questions answered</div>
+  </header>
+
+  <main id="course"></main>
+
+  <footer>
+    Toys live in <code>learn/*.py</code> — this page never contains code, so the two can't drift.<br>
+    Design + evidence: <code>docs/superpowers/specs/2026-07-11-visualllm-study-plan-design.md</code><br><br>
+    <button class="reset" id="reset">Erase my progress</button>
+  </footer>
+</div>
+
+<script>
+/* ---------------- storage: an IMMUTABLE guess log ---------------- */
+const KEY = "visualllm-learn-v1";
+const store = JSON.parse(localStorage.getItem(KEY) || '{"guesses":{},"missed":[]}');
+function persist(){ localStorage.setItem(KEY, JSON.stringify(store)); }
+
+function saveGuess(id, text, correct){
+  if (store.guesses[id]) return;            // first guess only. never editable.
+  store.guesses[id] = { text, correct, at: new Date().toISOString() };
+  if (!correct && !store.missed.includes(id)) store.missed.push(id);
+  if (correct) store.missed = store.missed.filter(m => m !== id);
+  persist(); paintProgress();
+}
+
+/* A guess is "correct" if the expected answer appears in it, letters and digits only.
+   Deliberately loose: this is retrieval practice, not an exam. */
+function judge(given, expected){
+  const norm = s => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+  return norm(given).length > 0 && norm(given).includes(norm(expected));
+}
+
+/* ---------------- one gated question ---------------- */
+function askQuestion(q, onAnswered){
+  const prev = store.guesses[q.id];
+  const el = document.createElement("div");
+  el.className = "q";
+  el.innerHTML =
+    '<div class="txt">' + q.q + '</div>' +
+    '<input type="text" placeholder="commit a guess — wrong is fine, guessing is the point">' +
+    '<button>Lock in my guess</button>' +
+    '<div class="seal">The answer is sealed until you commit.</div>' +
+    '<div class="ans"><b></b><span class="why"></span><div class="you"></div></div>';
+
+  const inp = el.querySelector("input"), btn = el.querySelector("button");
+  const ans = el.querySelector(".ans"), seal = el.querySelector(".seal");
+
+  function reveal(text, correct){
+    ans.querySelector("b").textContent = (correct ? "Right — " : "The answer: ") + q.a;
+    ans.querySelector(".why").innerHTML = q.why;
+    ans.querySelector(".you").textContent = 'you said: "' + text + '"';
+    ans.classList.add("show");
+    seal.style.display = "none";
+    inp.disabled = btn.disabled = true;
+    inp.value = text;
+    if (onAnswered) onAnswered();
+  }
+
+  btn.addEventListener("click", () => {
+    const v = inp.value.trim();
+    if (!v) { inp.focus(); return; }
+    const ok = judge(v, q.a);
+    saveGuess(q.id, v, ok);
+    reveal(v, ok);
+  });
+  inp.addEventListener("keydown", e => { if (e.key === "Enter") btn.click(); });
+
+  if (prev) reveal(prev.text, prev.correct);   // already answered: stays revealed, stays locked
+  return el;
+}
+
+/* ---------------- spaced interleaved retrieval ---------------- */
+/* Module N opens with questions drawn from EARLIER modules — never its own.
+   Anything you missed is re-queued first; the rest fills up to 5. */
+function retrievalFor(i){
+  if (i === 0) return [];
+  const pool = [];
+  for (let k = 0; k < i; k++)
+    COURSE[k].selfcheck.concat(COURSE[k].pretest).forEach(q => pool.push(q));
+  const missed = pool.filter(q => store.missed.includes(q.id));
+  const rest   = pool.filter(q => !store.missed.includes(q.id));
+  return missed.concat(rest).slice(0, 5);
+}
+
+/* ---------------- progress: questions answered, never sections scrolled ---------------- */
+function allQuestions(){
+  return COURSE.flatMap(m => m.pretest.concat(m.selfcheck));
+}
+function paintProgress(){
+  const qs = allQuestions(), done = qs.filter(q => store.guesses[q.id]).length;
+  const bar = document.getElementById("bar");
+  bar.innerHTML = "";
+  COURSE.forEach(m => {
+    const mq = m.pretest.concat(m.selfcheck);
+    const d = mq.filter(q => store.guesses[q.id]).length;
+    const i = document.createElement("i");
+    if (mq.length && d === mq.length) i.className = "on";
+    bar.appendChild(i);
+  });
+  const missed = store.missed.length;
+  document.getElementById("barlbl").textContent =
+    done + " of " + qs.length + " questions answered" +
+    (missed ? "  ·  " + missed + " re-queued for review" : "");
+}
+
+/* ---------------- render ---------------- */
+function section(title, hint){
+  const s = document.createElement("section");
+  s.className = "sec";
+  s.innerHTML = "<h3>" + title + "</h3>" + (hint ? '<p class="hint">' + hint + "</p>" : "");
+  return s;
+}
+
+function renderCourse(){
+  const root = document.getElementById("course");
+  root.innerHTML = "";
+  if (!COURSE.length) {
+    root.innerHTML = '<p class="empty">No modules loaded yet.</p>';
+    return;
+  }
+
+  COURSE.forEach((m, i) => {
+    const mod = document.createElement("article");
+    mod.className = "mod";
+    mod.innerHTML = "<h2>" + m.title + "<small>WEEK " + m.week + " · " + m.blurb + "</small></h2>";
+
+    /* 1. cold pretest — gates everything below it */
+    const pre = section("1 · Cold pretest",
+      "Answer before you read anything below. Being wrong here is the mechanism, not a failure.");
+    const gated = [];
+    let answered = 0;
+    m.pretest.forEach(q => {
+      pre.appendChild(askQuestion(q, () => {
+        if (++answered >= m.pretest.length) {
+          gated.forEach(g => g.classList.add("open"));
+          const gm = mod.querySelector(".gatemsg");
+          if (gm) gm.classList.add("done");
+        }
+      }));
+    });
+    mod.appendChild(pre);
+
+    /* 2. spaced retrieval from EARLIER modules */
+    const rq = retrievalFor(i);
+    if (rq.length) {
+      const r = section("2 · Spaced retrieval",
+        "From earlier weeks. Studied once is not studied — this is the half that makes it stick.");
+      rq.forEach(q => r.appendChild(askQuestion(q)));
+      mod.appendChild(r);
+    }
+
+    /* everything from here is blurred until the pretest is committed */
+    const gate = document.createElement("div");
+    gate.className = "gatemsg";
+    gate.textContent = "↓ Sealed until you commit your pretest guesses above.";
+    mod.appendChild(gate);
+
+    const con = section("3 · Concept", null);
+    m.concept.forEach(p => { const x = document.createElement("p"); x.innerHTML = p; con.appendChild(x); });
+    mod.appendChild(con); gated.push(con);
+
+    const lab = section("4 · The lab",
+      "Open the file in your editor. Fill only the TODO(you) blanks. Then run it.");
+    const labp = document.createElement("p");
+    labp.innerHTML = "File: <code>" + m.toy.file + "</code> — <b>" + m.toy.blanks + "</b> blanks are yours.";
+    lab.appendChild(labp);
+    m.toy.runs.forEach(r => {
+      const c = document.createElement("code");
+      c.className = "cmd"; c.textContent = r; lab.appendChild(c);
+    });
+    mod.appendChild(lab); gated.push(lab);
+
+    const fal = section("5 · Falsify",
+      "Predict the result of THIS run before you press enter. The gap is the module.");
+    const c = document.createElement("code");
+    c.className = "cmd"; c.textContent = m.falsify.run; fal.appendChild(c);
+    const fp = document.createElement("p"); fp.innerHTML = m.falsify.expect; fal.appendChild(fp);
+    mod.appendChild(fal); gated.push(fal);
+
+    const tr = section("6 · The same idea, in the real system", null);
+    const ul = document.createElement("ul"); ul.className = "trace";
+    m.trace.forEach(t => {
+      const li = document.createElement("li");
+      li.innerHTML = '<span class="f">' + t.file + "</span>" + t.what;
+      ul.appendChild(li);
+    });
+    tr.appendChild(ul); mod.appendChild(tr); gated.push(tr);
+
+    const pay = section("7 · The bug this explains",
+      "Read it only now — you should already be able to predict it.");
+    const box = document.createElement("div"); box.className = "payoff";
+    box.innerHTML = "<h4>" + m.payoff.p + " — " + m.payoff.title + "</h4>" + m.payoff.body;
+    pay.appendChild(box); mod.appendChild(pay); gated.push(pay);
+
+    const sc = section("8 · Self-check",
+      "These come back to hunt you at the start of next week. Miss one and it repeats sooner.");
+    m.selfcheck.forEach(q => sc.appendChild(askQuestion(q)));
+    mod.appendChild(sc); gated.push(sc);
+
+    /* if the pretest was already committed in a past session, open the gate immediately */
+    if (m.pretest.every(q => store.guesses[q.id])) {
+      gated.forEach(g => g.classList.add("open"));
+      gate.classList.add("done");
+    } else {
+      gated.forEach(g => g.classList.add("locked"));
+    }
+
+    root.appendChild(mod);
+  });
+  paintProgress();
+}
+
+document.getElementById("reset").addEventListener("click", () => {
+  if (!confirm("Erase every guess and start over?")) return;
+  localStorage.removeItem(KEY);
+  location.reload();
+});
+
+/* ================= MODULE CONTENT =================
+   HARD RULE: no Python in this file, ever. Name the file and the blank; never the code. */
+const COURSE = [];
+
+renderCourse();
+</script>
+</body>
+</html>
