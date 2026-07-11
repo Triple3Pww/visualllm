@@ -16,4 +16,12 @@ Nothing here needs a GPU, a conda env, or an install. Plain Python 3.11 and a br
 **The page holds no code, on purpose.** It names the file and the blank; the code lives only
 in the `.py` file, so the two can never drift apart.
 
+## Using an outside tutor
+
+`COACH-BRIEF.md` is a self-contained teaching brief you can hand to another AI (Gemini) to be
+taught a module in depth. **Order matters:** commit that module's cold pretest guesses in
+`index.html` FIRST, then go to the coach, then come back for the lab and the self-check.
+Guessing before you are taught is the mechanism — teach yourself first and you spend it for
+nothing. The brief tells the coach the same thing, and tells it not to hand you the blanks.
+
 Design + evidence: `docs/superpowers/specs/2026-07-11-visualllm-study-plan-design.md`
