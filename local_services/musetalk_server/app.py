@@ -594,6 +594,17 @@ class MuseTalkEngine:
         blended = face_large * alpha + region * (1.0 - alpha)
         out = base.clone()
         out[y_s:y_e, x_s:x_e, :] = blended
+        if self._split and self._split_bbox is not None:
+            # Split mode: return the fixed-size MOUTH CROP (like _crop_split), NOT the full frame.
+            # Without this the GPU-composite path (MUSETALK_GPU_COMPOSITE=1) streams full 512 frames
+            # while neutral frames are 256 crops -> the client draws a whole shrunk portrait into the
+            # mouth box. (_composite, the CPU twin, already crops; only this GPU twin was missed.)
+            sx1, sy1, sx2, sy2 = self._split_bbox
+            crop = out[sy1:sy2, sx1:sx2, :]
+            c = F.interpolate(crop.permute(2, 0, 1)[None],
+                              size=(self._split_size, self._split_size), mode="area")[0]
+            u8 = (c.permute(1, 2, 0) * 255.0).round().clamp(0, 255).to(torch.uint8)
+            return u8.contiguous().cpu().numpy().tobytes()
         o = F.interpolate(out.permute(2, 0, 1)[None], size=(self.size, self.size), mode="area")[0]
         u8 = (o.permute(1, 2, 0) * 255.0).round().clamp(0, 255).to(torch.uint8)
         return u8.contiguous().cpu().numpy().tobytes()
