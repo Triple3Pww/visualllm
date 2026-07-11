@@ -382,10 +382,121 @@ const COURSE = [
     { id:"m2sc3", q:"Why can a metric that ends at <code>BotStartedSpeakingFrame</code> be honest and still be wrong?", a:"ear",
       why:"Because the frame is emitted in the server, and the <b>ear</b> is past the transport, the encode, the network and the jitter buffer. Every number it reports is true; the thing it measures is just not the thing that matters. (P35.)" }
   ]
+},
+{
+  id: "m3", week: 3, title: "Models that generate one step at a time",
+  blurb: "the machine finds its words, and its voice",
+  toy: { file: "learn/m3_sampler.py", blanks: 4,
+    runs: ["python learn/m3_sampler.py prefill",
+           "python learn/m3_sampler.py greedy",
+           "python learn/m3_sampler.py topp",
+           "python learn/m3_sampler.py ras"] },
+  pretest: [
+    { id:"m3q1",
+      q:"Two prompts, one short and one long. Both produce a 5-word answer. Why does the long one take longer to produce its <b>first</b> word?",
+      a:"prefill",
+      why:"<b>Prefill.</b> Before a model can emit token #1 it must process every token of the input. So time-to-first-token scales with the <i>input</i> length, even when the output is identical. This single fact is why <code>COSYVOICE_FIRST_PIECE</code> exists." },
+    { id:"m3q2",
+      q:"A TTS model gets stuck emitting the same token over and over — a 4-second sentence becomes 12 seconds of silence. What kind of failure is that?",
+      a:"repetition",
+      why:"A <b>repetition</b> loop. An autoregressive model feeds its own output back as input, so a self-reinforcing state can trap it. The defence is a sampler that penalises recent tokens — and P18 is what happened when we lost ours." }
+  ],
+  concept: [
+    "An autoregressive model emits <b>one token, feeds it back, and emits the next</b>. Everything strange about its latency and its failures falls out of that loop. Your toy is a character-level Markov chain, not a transformer — but it is autoregressive, and that is the only property that matters here.",
+    "Latency splits in two. <b>Prefill</b> processes the input before a single token comes out; <b>decode</b> emits tokens one at a time after. Prefill is why a long sentence handed to CosyVoice costs ~3.0s to first audio while a short clause costs ~1.7s — and why we split the first clause off and speak it early.",
+    "Failure also falls out of the loop. Take the likeliest token every time (<b>greedy</b>) and the model can enter a cycle it can never leave. <b>Top-p</b> samples from the smallest set of tokens covering p of the probability mass, which usually escapes. A <b>repetition-aware</b> sampler down-weights tokens it just emitted, which escapes <i>by construction</i>. Guess which one CosyVoice needs."
+  ],
+  falsify: {
+    run: "python learn/m3_sampler.py greedy     (then: ras)",
+    expect: "Predict what greedy's output looks like after ~50 characters. Then look: it locks into <code>(`tailscale (`tailscale (`tailscale…</code> forever. The model is not broken and the corpus is not broken — the <b>decoding rule</b> is. Now run <code>ras</code> and watch one line of sampling policy dissolve the whole failure. (While you are there: the window is tuned to 24 for a reason. Try 12, and a <i>longer</i> cycle simply forms outside the window.)"
+  },
+  trace: [
+    { file:"CosyVoice/cosyvoice/vllm/ras_logits_processor.py  (cosyvoice repo)",
+      what:" — the real repetition-aware sampler, restored as a vLLM logits processor. This IS the P18 fix." },
+    { file:"local_services/cosyvoice_tts.py",
+      what:" — the streaming client: first audio chunk forwarded the moment it exists." },
+    { file:"pipeline/stages/llm.py",
+      what:" — the OpenRouter/Groq pin. The LLM hop was once the single dominant cost in the whole turn." }
+  ],
+  payoff: { p:"P18", title:"Chinese looped on silence, and the avatar lip-synced through it",
+    body:"Moving CosyVoice's LLM onto vLLM bought a huge speedup — and <b>silently dropped its repetition-aware sampling (RAS)</b>. Chinese then intermittently looped on the silence token: a 4-second sentence became ~12 seconds of dead air. It was heard as 'halting' speech, and the avatar kept lip-moving through the silence, because the mouth follows the waveform.<br><br>The fix restores RAS as a vLLM logits processor. Note the shape of this bug — <b>an optimisation quietly removed a correctness guarantee nobody had written down.</b> That shape recurs: see P33, where CUDA graphs made the stopwatch faster and the <i>lipsync worse</i>, and the eye overruled the benchmark." },
+  selfcheck: [
+    { id:"m3sc1", q:"Which scales time-to-first-token: the length of the input, or of the output?", a:"input",
+      why:"The <b>input</b> — that is prefill. You measured it: 20 / 200 / 1500 chars of prompt cost 0.016 / 0.109 / 0.813s before a single token came out. The output length costs nothing until decoding starts, which is why splitting off a short first clause wins TTFO for free." },
+    { id:"m3sc2", q:"One word: what defence stops an autoregressive model from looping forever?", a:"repetition",
+      why:"A <b>repetition</b>-aware sampler (RAS): down-weight what you just emitted. Top-p escapes a loop probabilistically; RAS escapes it by construction." },
+    { id:"m3sc3", q:"An optimisation makes a benchmark faster but a human says it got worse. Who wins?", a:"human",
+      why:"The <b>human</b>. P33 is exactly this: CUDA graphs won the TTS stopwatch and lost the Chinese lipsync, because the graph decode perturbed the RAS sampling and the mouth follows the waveform. The benchmark was measuring the wrong side. The avatar is the product." }
+  ]
+},
+{
+  id: "m4", week: 4, title: "Pixels, GPUs, and the sync contract",
+  blurb: "a face has to say it in time",
+  toy: { file: "learn/m4_sync.py", blanks: 4,
+    runs: ["python learn/m4_sync.py live",
+           "python learn/m4_sync.py steady",
+           "python learn/m4_sync.py steady --contention",
+           "python learn/m4_sync.py steady --trt"] },
+  pretest: [
+    { id:"m4q1",
+      q:"The avatar should render 14 frames a second. The GPU is busy running the TTS, so it manages 10. The voice plays at exactly one second per second. After a 20-second reply, how far behind are the lips?",
+      a:"seconds",
+      why:"<b>Seconds</b> behind — you will measure 8.07s. And crucially the gap <i>grows with the length of the turn</i> (0.87s at 2s, 3.27s at 8s, 8.07s at 20s). Every second you lose 4 frames and nothing ever gives them back. A short reply looks fine; a long one falls apart. That is why P16 only showed up on long answers." },
+    { id:"m4q2",
+      q:"You cannot make the renderer faster. Do you let the video fall behind the voice, or make the voice wait for the video?",
+      a:"wait",
+      why:"This system makes the voice <b>wait</b> (<code>MUSETALK_SYNC_MODE=steady</code>): audio is released paced to the frames actually rendered, so drift is zero by construction and the cost becomes a pause instead. The alternative (<code>live</code>) never pauses but the lips trail. There is no third option — and that is the whole point of the module." }
+  ],
+  concept: [
+    "One 16 GB card runs both the TTS and the avatar. They contend, so the renderer's real frame rate is a <i>variable</i>, not a constant — while audio's rate is fixed by physics. That mismatch has to be paid somewhere, and choosing <b>where</b> is the design decision.",
+    "<b>Audio-master</b> (<code>live</code>): ship the voice immediately, let video arrive when it can. Nothing ever pauses; the lips slide behind, and the drift accumulates with turn length. <b>Video-master</b> (<code>steady</code>): pin audio frame N to video frame N and release both together. Drift becomes structurally impossible; a render stall becomes a silence instead.",
+    "The user chose <code>steady</code>: a pause is survivable, lips that slide off the words are not. But watch the toy carefully — <b>steady alone is not enough.</b> If the renderer is <i>permanently</i> below target it does not pause occasionally, it stretches the entire voice. Which is why everything else in this layer (TensorRT, the GPU composite, <code>MUSETALK_LEAD_FRAMES</code>) exists: to buy back the headroom that makes steady free."
+  ],
+  falsify: {
+    run: "python learn/m4_sync.py steady     (then: steady --trt)",
+    expect: "Predict how many audio gaps exceed the frame budget in each. Plain <code>steady</code> gives you <b>111 of 111</b> — every single one. That looks like a broken mode, and it is not: it is what a permanently-too-slow renderer <i>does</i> to a video-mastered stream. Then <code>--trt</code> puts the render above target and it becomes <b>0 of 111</b>. TensorRT did not fix the sync logic. The sync logic was right all along. It bought the headroom the logic needed."
+  },
+  trace: [
+    { file:"local_services/musetalk_server/app.py", what:" — the render loop, and video_clock: it counts only REAL rendered frames, never held duplicates." },
+    { file:"local_services/musetalk_video.py", what:" — the client: steady vs live, and the paced release queue. Your toy, for real." },
+    { file:"pipeline/main.py :: video_out_is_live = not config.avatar_sync_with_audio",
+      what:" — the CRITICAL COUPLING. Pipecat only honours per-frame A/V pinning when the transport is NOT live; set is_live independently and the tagged frames are silently dropped and video free-runs." }
+  ],
+  payoff: { p:"P16", title:"the lips drifted further behind the longer the reply got",
+    body:"Under shared-GPU contention the PyTorch render path fell below the target frame rate. Drift is <code>turn_length &times; (1 - real_fps/target_fps)</code> — so it <b>scaled with the reply</b>, invisible on a short answer and ruinous on a long one. The fix was TensorRT (<code>MUSETALK_TRT=1</code>, render ~389ms &rarr; ~255ms per segment), which keeps the real rate above the target so <code>steady</code> rarely has to pause at all.<br><br>Note what the fix actually did: it did not repair the sync logic, which was correct all along. It bought back the <i>headroom</i> the sync logic needed. Also read <b>P1</b> — <code>cudnn.benchmark = True</code> re-autotuned on each turn's first segment and cost a <b>16-second</b> GPU spike, every single turn." },
+  selfcheck: [
+    { id:"m4sc1", q:"Why does A/V drift grow with reply length instead of staying constant?", a:"accumulate",
+      why:"Because the frame deficit <b>accumulates</b>: every second at 10fps against a 14fps target loses 4 frames, permanently. Drift = turn_length &times; (1 - real/target). Short replies hide it completely — which is exactly how it survived so long." },
+    { id:"m4sc2", q:"In <code>steady</code> mode the renderer stalls. What does the user experience?", a:"pause",
+      why:"A <b>pause</b> in the voice — then it resumes in sync. The lost time has to go somewhere; steady spends it on the ears rather than on the eyes. And if the renderer is <i>always</i> slow, that pause stops being occasional and becomes the whole voice." },
+    { id:"m4sc3", q:"Per-frame A/V pinning silently stops working. What is the first thing you check?", a:"is_live",
+      why:"<code>video_out_is_live</code>. Pipecat 1.3.0 only reads the tagged frames when the transport is <b>not</b> live; with <code>is_live=True</code> they are dropped without a word and video free-runs. Hence the hard coupling in <code>main.py</code>." }
+  ]
 }
 ];
 
 renderCourse();
+
+/* ---------------- capstone ---------------- */
+const cap = document.createElement("article");
+cap.className = "mod";
+cap.innerHTML =
+  '<h2>Capstone — one real turn, all the way down<small>AFTER WEEK 4 · ~2 hours</small></h2>' +
+  '<section class="sec"><h3>Drive the real system</h3>' +
+  '<code class="cmd">python -m scripts.measure --offline-capture</code>' +
+  '<p>Then write the waterfall yourself. For <b>every hop</b> of one turn, name four things: ' +
+  'the <b>layer</b>, the <b>file</b>, the <b>milliseconds</b>, and the <b>one knob</b> that moves it. ' +
+  'If you can fill that table without looking anything up, the four modules did their job.</p></section>' +
+  '<section class="sec"><h3>The defence</h3>' +
+  '<p>Open <code>docs/PROBLEMS-AND-FIXES.md</code>, pick a P-number you have never read, and explain ' +
+  'it <b>before</b> you read the write-up. Not the fix — the <i>mechanism</i>. You should now be able to ' +
+  'get most of the way there from first principles, because every one of them is one of these four ' +
+  'layers, misbehaving.</p></section>' +
+  '<section class="sec"><h3>Then: weeks 6 and 10</h3>' +
+  '<p>Come back and re-answer your missed questions. This is not optional decoration — <b>spacing is ' +
+  'half of why any of this will still be in your head next term.</b> Studied once is not studied. ' +
+  'Anything that decays before week 10 was activity, not learning.</p></section>';
+document.getElementById("course").appendChild(cap);
 </script>
 </body>
 </html>
