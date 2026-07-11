@@ -1,363 +1,129 @@
-# MODULE 4 — Pixels, GPUs, and the sync contract
+# Module 4 — Pixels, GPUs, and the sync contract
 
-> **Paste this whole file into the coach.** It is self-contained.
+## Who I am and what I'm doing
 
----
+I'm Chanachon, a 3rd-year ICT student at Mahidol, on a research internship. I built a real-time system
+where you speak into a browser and a photoreal talking-head avatar answers you out loud: microphone →
+detect speech → speech-to-text → LLM → text-to-speech → face-animation model → back to the browser. It
+runs on **one 16 GB GPU**, and the text-to-speech and the avatar share that single card. I built it with
+heavy AI help and I'm learning the fundamentals underneath, one layer per week. So far: audio is int16 and
+corruption is loud (M1); queues, backpressure, streaming, paced release (M2); autoregressive models,
+prefill cost, sampling and repetition loops (M3).
 
-## COACH: read this before you teach
+**This is the last module — the avatar, the GPU they fight over, and how I keep the lips matching the
+voice.** It ties the previous three together. Teach me the content, then quiz me. I have a small Python
+exercise after, so explain ideas, don't write code for me.
 
-**Who you are teaching.** Chanachon — 3rd-year ICT undergrad, on a research internship. A capable
-builder: he **shipped** a real-time speech → LLM → talking-head-avatar system running locally on one
-GPU. He built it with heavy AI help, and it works. But he self-assessed at **zero** in the four
-foundations underneath it — including this one.
-
-**This is the final module, and it closes the loop.** Everything from Modules 1–3 gets cashed in here.
-Watch for the moment he realises *why* Module 1's byte bug destroyed the lip-sync — do not hand him
-that connection, let him make it.
-
-**Three rules. Please do not break them.**
-
-1. **He has already taken a cold pretest on this module.** Start by asking what he guessed and what he
-   got wrong. Teach to those gaps first.
-2. **Never write the toy's `TODO(you)` blanks for him.** Blank #4 in particular asks him to *write a
-   sentence in his own words* — that one is the real exam. Do not accept vagueness, and do not supply
-   the sentence.
-3. **Worked examples first, not "how would you approach this?"** Novices are overloaded by minimal
-   guidance (expertise-reversal effect).
-
-**Do not teach:** writing CUDA kernels, PTX, GPU microarchitecture (warps, SMs beyond one sentence),
-video codec internals (VP8/H.264 bitstreams), or WebRTC negotiation. He needs *contention*, *compile*,
-and *the sync contract*.
-
-**Time: 2–3 hours.**
-
-**He has done Modules 1–3.** He knows: audio is int16 and corruption is loud; queues, backpressure,
-and paced release; autoregression, prefill/decode, and that an optimisation can silently remove a
-correctness guarantee. **All four threads tie off here.**
+**Out of scope — don't teach me:** writing GPU kernels, GPU microarchitecture, video codec internals, or
+WebRTC negotiation. I need contention, compilation, and the sync contract.
 
 ---
 
-## The system he built (context for you)
+## What I need to learn
 
-Speech → STT → LLM → TTS → **talking-head avatar** → browser. The avatar model generates a photoreal
-face whose mouth matches the words.
+### What a GPU is (minimally)
+Thousands of small cores doing the same operation on lots of data at once. A **kernel** is a function you
+launch onto it. Data must be copied into **VRAM** — the GPU's own memory — before it can be used. VRAM is
+small and fixed; my card has 16 GB, and that's the whole budget.
 
-**The TTS and the avatar share one 16 GB GPU.** That single fact generates most of the project's
-hardest bugs, and this module is about all of them.
+### Contention — the fact behind most of my bugs
+My text-to-speech and my avatar are **two separate processes on one card**. They fight over:
+- **VRAM** — if either takes too much, the other fails to start. (In my system I *must* launch the TTS
+  before the avatar, or it crashes with "no memory.")
+- **Compute** — the GPU time-slices between them, so **both get slower**.
 
----
+Consequence: **the avatar's real frame rate is a variable, not a constant** — it depends on what the TTS
+is doing at that instant. Benchmarking the avatar alone tells me almost nothing about production, because
+in production it shares the card with a TTS that's busiest at exactly the same moments (same turn).
 
-## Session plan
+### Frames and the frame budget
+Video is still images at a fixed rate. At **14 fps** I have 1/14 = **71 ms** to produce each frame. Miss
+the budget and I'm behind — and I don't get the time back.
 
-| Time | What |
-|---|---|
-| 10 min | His pretest guesses. What did he get wrong? |
-| 25 min | Concepts 1–3: what a GPU is; **contention**; frames and the frame budget |
-| 25 min | Concept 4: what the talking-head model does — **and the moment the course closes** |
-| 20 min | Concepts 5–6: TensorRT; CUDA graphs |
-| 45 min | Concept 7: **THE A/V SYNC CONTRACT.** The heart of the module. |
-| 20 min | Concept 8: the twist — video-master alone is not enough |
-| 20 min | The bugs (P16, P1) |
-| 15 min | Exit quiz + the capstone handoff |
-
----
-
-## The concepts, in teaching order
-
-### 1. What a GPU is, minimally
-
-Thousands of small cores doing the **same operation on lots of data at once**. A **kernel** is a
-function you launch onto it. Data must be copied into **VRAM** — the GPU's own memory — before it can
-be touched.
-
-**VRAM is small, fixed, and the scarce resource.** His card has 16 GB. That's the whole budget.
-
-> **Analogy:** a CPU is a few brilliant generalists. A GPU is ten thousand interns who can only all do
-> the exact same thing at the exact same time — and they can only work on paper that's already been
-> carried into their room.
-
-### 2. CONTENTION — the fact that generates his bug list
-
-His **TTS** and his **avatar** are **two separate processes on one card**. They contend for:
-
-- **VRAM** — if either grabs too much, the other **fails to start**. (In his project, the TTS has to be
-  launched *before* the avatar, or it crashes with "no memory for cache blocks." Load order is a real
-  constraint in his system.)
-- **Compute** — the GPU time-slices between them, so **both get slower**, and neither one's benchmark
-  predicts its production speed.
-
-**State the consequence plainly, because everything downstream depends on it:**
-
-> **The avatar's real frame rate is a VARIABLE, not a constant.** It depends on what the TTS happens to
-> be doing at that instant.
-
-Ask him: "You benchmark the avatar alone and it hits 20 fps. What does that tell you about production?"
-(**Almost nothing.** In production it's sharing the card with a TTS that is busiest exactly when the
-avatar is busiest — because they're both working on the same turn.)
-
-### 3. Frames, fps, and the frame budget
-
-Video is still images at a fixed rate. At **14 fps** you have `1/14` = **71 ms** to produce each frame.
-
-Miss the budget, and you're behind — **and you don't get the time back.** Hold that.
-
-### 4. What the talking-head model actually does — and the moment the course closes
-
-Behavioural, not architectural. Per frame:
-
+### What the avatar model does per frame
 1. Take a window of the **audio**.
-2. Run a **speech model** over it to get features encoding *what sound is being made right now*.
-3. Feed those features + the masked mouth region into a network that **generates the mouth**.
-4. Decode to pixels, composite back onto the face.
+2. Run a speech model over it to get features for *what sound is being made now*.
+3. Feed those + the masked mouth region into a network that generates the mouth.
+4. Decode to pixels, composite onto the face.
 
-*(Once, at startup: find the face, locate the mouth region. Not per frame.)*
+The key point: **the mouth is generated from the audio waveform.** So if the waveform is garbage, the
+mouth is garbage — which is exactly why Module 1's one dropped byte destroyed the lip-sync (noise in →
+generic flapping out) while the voice, a different copy, sounded perfect. This module closes that loop.
 
-**Now stop, and ask him this question. Do not answer it for him:**
+### TensorRT
+An ahead-of-time **compiler** for neural networks: it fuses operations, picks the best kernels for my
+specific GPU, uses lower precision (fp16). Compile once into an "engine" file; it runs much faster.
+Costs: the engine is tied to that exact GPU and to fixed input shapes. In my project it cut render time
+from ~389 ms to ~255 ms per segment.
 
-> **"The mouth is generated from the audio waveform. So — what happens if the waveform is garbage?"**
+### CUDA graphs
+Normally the CPU launches every kernel one at a time, and that overhead adds up. A **CUDA graph** captures
+a whole sequence of launches once and replays it as one unit — faster. But capture fixes the execution and
+can subtly change numerical behaviour. (This is what perturbed my TTS sampling in Module 3's second bug.)
 
-Wait. Let him get there.
+### The heart of it — the A/V sync contract
+Audio plays at exactly one second per second; physics won't negotiate. Video comes from a renderer whose
+speed is a variable — target 14 fps, but under GPU contention I actually get 10. So I produce 10 frames
+for every 14 I need: **4 frames per second in debt, never repaid.**
 
-This is the moment **Module 1 closes**. The one dropped byte fed the lip-sync model 14×-louder noise;
-the model dutifully ran speech recognition on noise; and it produced a generic, wordless flapping that
-never closed for pauses — while the voice the human heard was perfect, because that was a *different
-copy* of the audio.
-
-**He should be able to reconstruct that entire bug himself, right now, from first principles.** If he
-can, the course has worked. Let him have the moment.
-
-### 5. TensorRT
-
-An **ahead-of-time compiler** for neural networks. It fuses operations, picks the optimal kernels for
-*that specific GPU*, and uses lower precision (fp16). You compile once into an "engine" file, and it
-runs much faster.
-
-**The costs, which matter:** the engine is tied to that GPU and driver, and to **fixed input shapes**.
-Change the shape and you recompile.
-
-In his project it cut render time per segment from **~389 ms to ~255 ms.** Remember that number; it's
-about to be load-bearing.
-
-### 6. CUDA graphs
-
-Normally the CPU launches every kernel individually, and that launch overhead adds up — especially for
-a model made of many small operations.
-
-A **CUDA graph** *captures* an entire sequence of launches once, then **replays it as a single unit**.
-Much less CPU overhead.
-
-**But capture fixes the execution — and it can subtly change numerical behaviour.**
-
-**Hold that sentence.** Then ask: *"Module 3 — what happens when an optimisation subtly changes a
-model's numerical behaviour?"* (The sampler gets perturbed. The output degrades. Nobody notices,
-because the benchmark got faster.) He should feel the déjà vu.
-
-### 7. THE A/V SYNC CONTRACT — the heart of the module
-
-**Set the conflict up crisply, and make him derive the rest.**
-
-> **Audio plays at exactly one second per second.** Physics will not negotiate.
-> **Video is produced by a renderer whose speed is a variable.**
->
-> Target: 14 fps. Under GPU contention, you actually get 10.
-
-So you're producing **10 frames for every 14 you need**. You are **4 frames per second in debt, and the
-debt is never repaid.**
-
-**Ask him: after a 20-second reply, how far behind are the lips?**
-
-Have him derive the formula rather than giving it:
-
+How far behind are the lips after a long reply?
 ```
 drift = turn_length × (1 − real_fps / target_fps)
 ```
+In my exercise: **0.87 s at a 2 s turn, 3.27 s at 8 s, 8.07 s at 20 s** — dead linear. **This is why the
+bug hid: short replies looked completely fine.**
 
-His toy measures it:
+There are exactly two ways to handle it:
+- **Audio-master (`live`)**: play the voice immediately; show video whenever it arrives. Never pauses, but
+  the lips slide progressively behind.
+- **Video-master (`steady`)**: pin audio frame N to video frame N and release them together. Drift becomes
+  *structurally impossible*, but the voice must wait for the renderer, so a stall becomes a silence.
 
-| turn length | final drift |
-|---|---|
-| 2 s | **0.87 s** |
-| 8 s | **3.27 s** |
-| 20 s | **8.07 s** |
+Conventional media players (VLC, browsers) use **audio-master** — they drop video frames to keep audio
+smooth, because people notice an audio glitch more than a dropped frame. **My system does the opposite**,
+because a talking face whose mouth doesn't match is uncanny-valley wrong in a way a dropped frame isn't. A
+pause is survivable; sliding lips aren't. The real lesson: **sync isn't a bug to fix, it's a contract you
+choose** — both options are correct, they differ in who pays (the eyes or the ears).
 
-**Dead linear.** And now the thing he must notice on his own:
-
-> **This is why the bug hid for months: SHORT replies looked completely fine.**
-
-Ask him what other bugs have that property. (Anything that accumulates. It is a whole *family*.)
-
-#### Now: the choice. There are exactly two options.
-
-**Option A — AUDIO-MASTER (`live`).** Play the voice immediately, at real time. Show video whenever it
-arrives.
-- Nothing ever pauses.
-- The lips slide progressively behind the words.
-
-**Option B — VIDEO-MASTER (`steady`).** Pin audio frame N to video frame N; release them together.
-- Drift becomes **structurally impossible** — not "small", *impossible*.
-- But the voice must now **wait** for the renderer. A render stall becomes a **silence**.
-
-**Context worth giving him, because it makes the choice real:** conventional media players (VLC,
-browsers, every video app you've used) use **audio-master**. They drop video frames to keep the audio
-smooth, because humans notice an audio glitch far more than a dropped frame.
-
-**His system rejects the industry default. Make him argue for why.**
-
-The answer: a talking face whose mouth doesn't match the words is a *special* kind of wrong. It's the
-uncanny valley — it reads as broken in a way a dropped frame never does. **A pause is survivable. Lips
-that slide off the words are not.**
-
-**Frame it as the real lesson:** sync is not a bug to be fixed. **Sync is a contract you choose.** Both
-options are "correct." They differ in **who pays** — the eyes or the ears. Engineering is picking.
-
-### 8. THE TWIST — video-master alone is not enough
-
-**This is the part everyone misses, and his toy makes it undeniable.**
-
-If the renderer is *permanently* below target, video-master doesn't pause **occasionally**. It stretches
-**the entire voice**.
-
-His toy: **every single one of 111 audio gaps exceeds the frame budget.** All of them. It looks like
-the mode is broken.
-
-**It isn't.** That is simply what a permanently-too-slow renderer *does* to a video-mastered stream.
-Steady mode faithfully did its job; there was just no headroom to do it in.
-
-Now run it with TensorRT (render now *above* target): **0 of 111 gaps.**
-
-**Make him say the conclusion out loud:**
-
-> **TensorRT did not fix the sync logic. The sync logic was correct all along. It bought back the
-> HEADROOM that made the correct logic free.**
-
-This is a genuinely different way to think about performance work, and it's the most transferable idea
-in the module. Performance isn't only about being fast. **It's about buying enough slack that your
-correct design costs nothing.**
+### The twist — video-master alone isn't enough
+If the renderer is *permanently* below target, video-master doesn't pause occasionally — it stretches the
+*entire* voice. In my exercise, **every one of 111 audio gaps exceeds the budget** — it looks broken but
+isn't; that's just what a permanently-too-slow renderer does. Run it with TensorRT (render now above
+target): **0 of 111 gaps.** The conclusion I want to internalise: **TensorRT didn't fix the sync logic —
+the logic was correct all along. It bought back the headroom that made the correct logic free.** Performance
+work is often about buying enough slack that your correct design costs nothing.
 
 ---
 
-## The blanks he must fill — DO NOT WRITE THESE FOR HIM
+## The bugs this explains ("P16" and "P1" in my project)
 
-**Blank #1 — `live` drift.** `drift = rendered_at − (i / target_fps)` — when the frame arrived, minus
-when its audio *should* have played.
-*Stuck?* "When *should* frame i's audio be heard? When did the frame actually show up? Subtract."
+**P16** — the lips drifted further behind the longer the reply got, because the render rate was below target
+and the deficit accumulated. Fixed with TensorRT — not by changing the sync, but by buying the headroom it
+needed.
 
-**Blank #2 — `steady` release.** Audio for frame i can only be released once frame i **exists** — so
-its release time *is* the render time. (It's one line. If he overthinks it, that's a sign he hasn't
-internalised the contract — go back to Concept 7.)
-
-**Blank #3 — `steady` gaps.** Drift is zero by construction, so the cost reappears as **gaps between
-consecutive releases**. Return them.
-*Ask:* "If drift is zero, where did the lost time GO? It can't vanish." (Into the gaps. Into the ears.)
-
-**Blank #4 — WRITE A SENTENCE.** In his own words: **why does drift GROW with turn length instead of
-staying constant?**
-
-> **This one is the real exam. Do not accept "because the renderer is slow."** Push until he says
-> something equivalent to: *the deficit accumulates — every second you fall 4 frames further behind and
-> nothing ever gives them back, so the gap is a running total, not a fixed offset.*
+**P1** — a single flag, `cudnn.benchmark = True`, told the library to re-tune its algorithm on every new
+input shape. The first segment of every turn has a different shape than mid-turn ones, so it re-tuned at the
+*start of every turn* — a ~16-second GPU spike, every turn. Setting it to `False` removed it with no cost.
+This is the same family as Module 3's bug: an optimisation that assumed a stable workload, in a system whose
+workload is stable in the middle and never at the start. I've now seen this shape three times in three
+layers (sampling, CUDA graphs, cudnn) — it's the most common way fast systems break.
 
 ---
 
-## Misconceptions — expect these exact wrong answers
+## Questions for Gemini to ask me
 
-| He will say | Why it's wrong | What to make him do |
-|---|---|---|
-| "The GPU is fast, rendering is basically free." | Not when two models share one card, contending for VRAM *and* compute. | The benchmark-alone-vs-production question. |
-| "Higher resolution = a better avatar." | His team **measured the opposite**: pushing resolution starved the renderer, which caused *voice lag*. Quality and latency are coupled **through the shared GPU**. | Ask what happens to fps when each frame costs more. |
-| "Drift is a constant offset — just delay the audio to match." | It **grows**. A fixed offset cannot correct an accumulating deficit. | The 0.87 / 3.27 / 8.07 table. |
-| "The benchmark got faster, so it got better." | The CUDA-graphs case: faster stopwatch, **worse lip-sync**. The eye overruled the benchmark, and the eye was right. | Module 3's P18. Same bug, new costume. |
-| "Sync is broken, we need to fix it." | Sync is a **contract you choose**. Both modes are correct; they differ in who pays. | Make him argue *for* video-master against VLC's default. |
-| "Steady mode is broken — look, every gap is over budget." | No: that's what a permanently-slow renderer does. Steady worked; it had no headroom. | Run `--trt`. 111 gaps → 0. |
+1. My avatar benchmarks at 20 fps when run alone. What does that predict about production, and why?
+2. What two resources do my TTS and avatar fight over, and what different failure does each cause?
+3. Why does A/V drift grow with reply length instead of staying a constant offset?
+4. Give the drift formula.
+5. Audio-master vs video-master — what does each one sacrifice?
+6. VLC uses audio-master. Why is my system right to do the opposite?
+7. In video-master mode drift is zero — so where did the lost time go?
+8. What did TensorRT actually fix? (Careful — it's not the sync logic.)
+9. A benchmark says faster, a human says worse. Who wins, and what's the name of that failure?
+10. **The closer:** the lip-sync model generates the mouth from the audio waveform. So what happens if one
+    byte was dropped upstream? (I should be able to reconstruct Module 1's whole bug from scratch.)
 
----
-
-## Socratic question bank
-
-- The avatar benchmarks at 20 fps alone. What does that predict about production? (Nearly nothing.)
-- Why does a bug that scales with turn length survive so long in testing? (Everyone tests with short
-  inputs.)
-- Drift is 3 seconds at the end of an 8-second turn. Can you fix it by delaying the audio 3 seconds?
-  (No — it *accumulates*. Your fixed offset is right for exactly one instant.)
-- VLC drops video frames to keep audio smooth. Why is your system right to do the opposite?
-- Where does the lost time GO in video-master mode, if drift is zero?
-- Name the two resources the TTS and the avatar fight over, and the different failure each produces.
-  (VRAM → won't start. Compute → won't keep up.)
-- Your renderer is 30% too slow. Name three fixes and rank them. (Make render faster [TensorRT]; make
-  each frame cheaper [lower res]; get a second GPU. Note that "fix the sync code" is *not* on the list.)
-
----
-
-## The bugs this explains
-
-### "P16" — the lips drift further behind the longer the reply gets
-
-The PyTorch render path fell below the target frame rate under shared-GPU contention. The deficit
-**accumulated**, so drift scaled with reply length — invisible on a short answer, ruinous on a long
-one.
-
-Fixed with **TensorRT** (render ~389 ms → ~255 ms per segment).
-
-**And the lesson, again, because it's the good one:** it did not repair the sync logic — the sync logic
-was right. **It bought the headroom the logic needed.**
-
-### "P1" — a single boolean cost 16 seconds per turn
-
-A flag called `cudnn.benchmark` was set to `True`. That flag tells the library: *"re-tune and pick the
-fastest algorithm whenever you see a new input shape."* Normally a pure win.
-
-But **the first segment of every turn has a different shape than the mid-turn segments.** So the
-library re-tuned **at the start of every single turn** — a **~16-second GPU spike**, every turn.
-
-Setting it to `False` removed it entirely, with no cost to steady-state speed.
-
-**Ask him what class of bug that is.** What you're fishing for:
-
-> *An optimisation that assumed a **stable** workload, running in a system whose workload is stable in
-> the middle and never at the start.*
-
-Then the kicker — ask him to connect it to Module 3's P18. **Same family:** an optimisation that was
-correct under an assumption nobody wrote down, deployed into a system that violated it. He has now seen
-this bug **three times in three different layers** (P18 sampling, P33 CUDA graphs, P1 cudnn). That is
-not a coincidence — **it is the most common way fast systems break.**
-
----
-
-## Exit quiz — the last gate
-
-Answers in brackets.
-
-1. Why does A/V drift grow with reply length instead of staying constant? [The frame deficit
-   **accumulates** — 4 frames/sec lost, never repaid. It's a running total, not an offset.]
-2. Give the drift formula. [`turn_length × (1 − real_fps/target_fps)`]
-3. Audio-master vs video-master: name what each one sacrifices. [Audio-master sacrifices lip accuracy
-   (drift). Video-master sacrifices voice continuity (pauses).]
-4. VLC uses audio-master. Why is his system right to do the opposite? [A mismatched talking face is
-   uncanny-valley wrong in a way a dropped frame isn't. A pause is survivable; sliding lips aren't.]
-5. In video-master mode, drift is zero. Where did the lost time go? [Into gaps in the audio — into the
-   ears instead of the eyes.]
-6. What did TensorRT actually fix? [**Not the sync logic** — that was correct. It bought the render
-   headroom that made the correct logic free.]
-7. A benchmark says faster; a human says worse. Who wins, and what's the name of that failure? [The
-   human. An optimisation silently violated an unwritten guarantee.]
-8. **The closer:** the lip-sync model generates the mouth from the audio waveform. What happens if one
-   byte was dropped upstream? [It gets 14×-louder noise, transcribes noise, and produces generic
-   wordless flapping — while the *voice* sounds perfect, because that's a different copy. **That's
-   P40, and he should now be able to derive it from scratch.**]
-
-**Question 8 is the whole course.** If he gets it cold, he's done.
-
----
-
-## Hand him back
-
-Tell him to return to `learn/index.html` for the **capstone**:
-
-1. Drive the real system and produce a per-hop latency waterfall — for every hop: the **layer**, the
-   **file**, the **milliseconds**, and the **one knob** that moves it.
-2. Then open his project's bug ledger, pick a bug he has **never read**, and explain the **mechanism**
-   before reading the write-up. Every one of them is one of these four layers, misbehaving.
-
-And tell him the thing he will want to skip: **he must come back at week 6 and week 10 and re-answer
-everything he got wrong.** Spaced practice is one of only two techniques that reliably work. Studied
-once is not studied. **Anything that decays before week 10 was activity, not learning.**
+Question 10 is the whole course. If I can answer it cold, I'm done. After this, I go back to my interactive
+course for the capstone: trace one real turn end-to-end, then explain a bug I've never read before I read
+the write-up.
