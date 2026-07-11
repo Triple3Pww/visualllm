@@ -297,7 +297,93 @@ document.getElementById("reset").addEventListener("click", () => {
 
 /* ================= MODULE CONTENT =================
    HARD RULE: no Python in this file, ever. Name the file and the blank; never the code. */
-const COURSE = [];
+const COURSE = [
+{
+  id: "m1", week: 1, title: "Sound is just numbers",
+  blurb: "the mic reaches the machine",
+  toy: { file: "learn/m1_vad.py", blanks: 2,
+    runs: ["python learn/m1_vad.py output/q_ai.wav"] },
+  pretest: [
+    { id:"m1q1",
+      q:"A 3-second, 16 kHz, mono, <code>int16</code> WAV. How many <b>bytes</b> of audio data?",
+      a:"96000",
+      why:"16000 samples per second &times; 3 seconds &times; <b>2 bytes per sample</b> = 96,000. Everything in Module 1 is that one multiplication, read in different directions." },
+    { id:"m1q2",
+      q:"The repo's <code>output/q_ai.wav</code> — what sample rate would you bet on?",
+      a:"24000",
+      why:"It is <b>24 kHz</b>, not the 16 kHz the pipeline uses. If you guessed 16000, you just made the exact assumption the toy is built to punish: every timestamp you computed would be 1.5&times; wrong. Read the header. Never assume the rate." }
+  ],
+  concept: [
+    "Sound arrives as a list of numbers. Each number is one <b>sample</b> — the air pressure at one instant — and in this system each sample is an <code>int16</code>: a signed 16-bit integer, which is <b>exactly two bytes</b>.",
+    "That gives you the only equation you need: <b>bytes = seconds &times; rate &times; 2</b>. Read it forward to size a buffer, backward to turn a byte offset into a timestamp. The avatar server, the TTS client and the VAD all live or die on this one line.",
+    "And it gives you the trap. If a stream is two bytes per sample, then a <b>one-byte</b> shift re-pairs every byte with the wrong neighbour. Sample <i>n</i> is now built from the second half of one sample and the first half of the next. The result is still a valid WAV. It still has plausible loudness. It is noise."
+  ],
+  falsify: {
+    run: "python learn/m1_vad.py output/q_ai.wav --drop-byte",
+    expect: "Predict first, in one line: what happens to the mean RMS, and what happens to the number of speech segments? Then run it. Most people expect a small glitch — a bit of crackle. What actually happens is that the loudness goes <b>up by 14&times;</b> (1,156 &rarr; 16,547) and the speech structure dissolves, because the audio is no longer audio. Noise is <i>loud</i>. Hold on to that: it is why the bug hid."
+  },
+  trace: [
+    { file:"local_services/musetalk_video.py :: _align_even",
+      what:" — carries the odd byte forward instead of dropping it, on the copy you HEAR." },
+    { file:"local_services/musetalk_video.py :: self._srv_carry",
+      what:" — does the same for the copy sent to the lip-sync model. This line is the fix for P40." },
+    { file:"pipeline/stages/vad.py",
+      what:" — Silero VAD: the real version of the toy you just built." }
+  ],
+  payoff: { p:"P40", title:"the lip-sync model was fed noise for three sessions",
+    body:"The TTS hands back <b>odd-byte</b> buffers. The audio going to the browser was protected — so <b>the voice always sounded perfect</b>. But the copy sent to the avatar dropped that byte, so MuseTalk lip-synced against pure noise, and since it reads a Whisper transcription <i>of the waveform</i>, the mouth flapped in a generic wordless pattern that never closed for pauses.<br><br>It survived three sessions of debugging because the tests <b>could not fail</b>: an offline render fed audio captured from WebRTC was fed the <i>repaired</i> copy, so it always looked fine. Read the METROLOGY note under P40 in <code>docs/PROBLEMS-AND-FIXES.md</code> — it is the most valuable page in this repo, and it is really about how to build a test that <i>can</i> fail." },
+  selfcheck: [
+    { id:"m1sc1", q:"Byte 48,000 of a 16 kHz mono int16 stream. What timestamp is that?", a:"1.5",
+      why:"48000 bytes / (16000 &times; 2 bytes per second) = <b>1.5 seconds</b>." },
+    { id:"m1sc2", q:"The voice sounds perfect but the mouth flaps wrong. Which copy of the audio is broken?", a:"avatar",
+      why:"The one going to the <b>avatar</b>. Two copies leave the TTS; only the downstream (heard) one was protected. A bug in the branch you cannot hear is invisible to your ears — which is exactly why it hid." },
+    { id:"m1sc3", q:"Why is correlating mouth motion against audio RMS a useless test?", a:"noise",
+      why:"Because <b>noise has RMS too</b> — you measured that yourself: the corrupt audio was 14&times; <i>louder</i>. A mouth flapping at loud garbage correlates beautifully with the loudness of that garbage. P40's note records that this test misled us four separate times." }
+  ]
+},
+{
+  id: "m2", week: 2, title: "Streams, queues, and time",
+  blurb: "the words become a stream",
+  toy: { file: "learn/m2_pipeline.py", blanks: 3,
+    runs: ["python learn/m2_pipeline.py unbounded",
+           "python learn/m2_pipeline.py bounded",
+           "python learn/m2_pipeline.py paced"] },
+  pretest: [
+    { id:"m2q1",
+      q:"A fast producer feeds a slow consumer through a queue with <b>no size limit</b>. Nothing crashes, nothing is dropped. What goes wrong anyway?",
+      a:"latency",
+      why:"<b>Latency.</b> The queue absorbs the mismatch by getting longer, so by the end you are delivering something made many seconds ago. An unbounded queue does not fix a slow consumer — it <i>hides</i> it, and bills you in staleness." },
+    { id:"m2q2",
+      q:"The LLM has produced 4 words of a 40-word answer. Why does the TTS start speaking already?",
+      a:"stream",
+      why:"Because the pipeline <b>streams</b>. The first sentence reaches TTS before the full answer exists, and TTS's first audio chunk reaches the avatar immediately. Time-to-first-output is a property of the first <i>piece</i>, never the whole reply — that is the entire reason this system can answer in under 3 seconds." }
+  ],
+  concept: [
+    "Every stage in <code>pipeline/main.py</code> is a coroutine, and between them sit queues. A stage awaits its input, does its work, and awaits a put on its output. When one stage blocks, the event loop simply runs another — that is all <code>asyncio</code> is doing.",
+    "The queue's <b>size limit</b> is the whole design. Unbounded, a fast producer runs free and the backlog turns into latency. Bounded, the put <i>blocks the producer</i> the moment the consumer falls behind, forcing the whole pipeline to the speed of its slowest stage. That blocking is called <b>backpressure</b>, and it is a feature.",
+    "Then there is <i>when</i> you let something out. Free-run means: ship it the instant it is ready. Paced means: item N leaves at <code>t0 + N/fps</code>, on a clock, no matter when it arrived. Hold that second idea — in Module 4 it turns out to be the system's central design decision."
+  ],
+  falsify: {
+    run: "python learn/m2_pipeline.py unbounded     (then: bounded)",
+    expect: "Predict the <b>worst item age</b> in each mode before running — is bounded higher or lower than unbounded, and by how much? Most people expect bounding to make things <i>slower</i>: you are deliberately throttling the producer, after all. In fact the worst age drops from <b>1.30s to 0.45s</b> — nearly 3&times; fresher — and the total wall time is <b>identical</b>. Throttling the producer cost nothing and bought everything."
+  },
+  trace: [
+    { file:"pipeline/main.py", what:" — the Pipeline assembly: the stages, in order, and the frames that flow between them." },
+    { file:"local_services/first_piece_aggregator.py", what:" — splits off a short opening clause so speech can start before the sentence is finished. Pure streaming latency trick." },
+    { file:"pipeline/metrics.py :: TtfoMeter", what:" — measures UserStoppedSpeaking to BotStartedSpeaking. Note carefully WHERE it stops measuring." }
+  ],
+  payoff: { p:"P35", title:"our own latency metric was lying by 1.26 seconds",
+    body:"<code>[TTFO]</code> measured up to <code>BotStartedSpeakingFrame</code> — a frame emitted <b>inside the server</b>. But the user's ear is at the far end of a transport, a WebRTC encode, a network, and a browser jitter buffer. All of that was <b>after</b> the stopwatch stopped, and it was worth ~1.26 seconds.<br><br>We were tuning hard against a number that did not describe the experience we were selling. The fix (<code>scripts/measure.py</code>) stitches the client's arrival clock onto the server's <code>t0</code> and reports a full waterfall <i>to the ear</i>. The lesson is bigger than the bug: <b>a metric that stops before the user does is not a metric, it is a comfort.</b>" },
+  selfcheck: [
+    { id:"m2sc1", q:"One word: what does a bounded queue do to a producer that is outrunning its consumer?", a:"block",
+      why:"It <b>blocks</b> it — the put does not return. That is backpressure: the pipeline self-regulates to its slowest stage instead of building a hidden backlog." },
+    { id:"m2sc2", q:"Time-to-first-output depends on the length of the whole reply. True or false?", a:"false",
+      why:"<b>False</b> — and this is the point of streaming. TTFO depends on the first <i>piece</i>. Hence <code>COSYVOICE_FIRST_PIECE</code>: emit a short opening clause, and first audio lands ~1.3s sooner even though the full answer takes exactly as long." },
+    { id:"m2sc3", q:"Why can a metric that ends at <code>BotStartedSpeakingFrame</code> be honest and still be wrong?", a:"ear",
+      why:"Because the frame is emitted in the server, and the <b>ear</b> is past the transport, the encode, the network and the jitter buffer. Every number it reports is true; the thing it measures is just not the thing that matters. (P35.)" }
+  ]
+}
+];
 
 renderCourse();
 </script>
