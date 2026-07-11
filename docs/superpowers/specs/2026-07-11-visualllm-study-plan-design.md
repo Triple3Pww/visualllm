@@ -170,14 +170,32 @@ Run `python -m scripts.measure --offline-capture` on a real turn and write the l
 himself: for every hop, name the layer, the file, the milliseconds, and the one knob that moves it.
 Then Claude picks a P-number at random and he explains it cold.
 
-## Deliverables
+## Deliverables — one self-contained `learn/` folder
 
-1. `docs/STUDY-PLAN.md` — the curriculum. Per module: concept → predict → build/run → compare →
-   real-code trace → the P-number it explains → five self-check questions he can grade alone.
-2. `study/` — `m1_vad.py` (his), `m2_pipeline.py` (Claude's), `m3_sampler.py` (Claude's),
-   `m4_sync.py` (his), plus `PREDICTIONS.md` (written before each run) and a `README.md`.
+Everything for learning lives in **one folder at the repo root**, not scattered between `docs/`
+and a separate toy directory. He opens `learn/` and works out of it; each module's guide sits
+directly beside the toy it drives.
 
-Both are git-tracked in this repo, next to the code they teach.
+```
+learn/
+  README.md          <- START HERE: the 4-week schedule, how a module runs, the spacing checkpoints
+  PREDICTIONS.md     <- his log. Cold pretest answers go here BEFORE any reading. Never edited after.
+  m1-sound.md        <- Module 1 guide      m1_vad.py       <- faded toy (~20% blank)
+  m2-streams.md      <- Module 2 guide      m2_pipeline.py  <- faded toy (~40% blank)
+  m3-models.md       <- Module 3 guide      m3_sampler.py   <- faded toy (~55% blank)
+  m4-pixels.md       <- Module 4 guide      m4_sync.py      <- faded toy (~70% blank)
+  capstone.md        <- the end-to-end turn trace + the random P-number defense
+  ANSWERS.md         <- self-check answer keys, so he can grade himself without Claude
+```
+
+Each module guide follows the eight-step structure above (pretest → spaced retrieval → concept →
+faded example → falsify → real-code trace → bug payoff → five self-check questions). `README.md`
+is a lean router in the house style: the schedule and the method, pointing at the module files —
+not an encyclopedia.
+
+Git-tracked in this repo, so the curriculum sits next to the code it teaches and travels with it.
+`learn/` is deliberately a sibling of `pipeline/` and `local_services/`, not buried in `docs/` —
+it is a place to *work*, not a document to read.
 
 ## Success criteria
 
