@@ -37,6 +37,12 @@ _MUSETALK_PY = Path(r"E:\miniconda3\envs\musetalk\python.exe")
 _COSY_SCRIPT = Path(r"E:\Claude\cosyvoice-local-tts\run_vllm_server.sh")
 _COSY_SCRIPT_WSL = "/mnt/e/Claude/cosyvoice-local-tts/run_vllm_server.sh"
 _WSL_DISTRO = "Ubuntu"
+
+# Avatar-preset voice file: restart_cosyvoice `source`s this so a preset's cloned voice
+# (COSYVOICE_PROMPT_WAV/TEXT) reaches the WSL engine WITHOUT the CJK transcript ever touching
+# the command line (WSL/git-bash mangle CJK argv -- the P40/metrology trap). Written UTF-8, LF.
+_VOICE_ENV = Path(r"E:\Claude\cosyvoice-local-tts\.preset_voice.env")
+_VOICE_ENV_WSL = "/mnt/e/Claude/cosyvoice-local-tts/.preset_voice.env"
 _EAGER_RE = re.compile(r"(COSYVOICE_VLLM_EAGER=\$\{COSYVOICE_VLLM_EAGER:-)([01])(\})")
 
 # Fields the panel exposes. group: curated | advanced. type: select -> options; text -> free.
@@ -313,7 +319,10 @@ def restart_cosyvoice() -> dict:
     WSL child dies when its launching shell returns). Forwards COSYVOICE_MODEL from .env, so a v3
     user's model survives a graphs restart (and vice-versa). Always returns a JSON-able dict."""
     model = read_env().get("COSYVOICE_MODEL", "").strip() or "v2"
-    inner = "COSYVOICE_MODEL=%s bash %s" % (model, _COSY_SCRIPT_WSL)
+    # `source` the preset voice file first (if present) so its exported COSYVOICE_PROMPT_WAV/TEXT
+    # reach the engine; set -a auto-exports the sourced assignments to the `bash script` child.
+    inner = ("set -a; [ -f %s ] && . %s; set +a; COSYVOICE_MODEL=%s bash %s"
+             % (_VOICE_ENV_WSL, _VOICE_ENV_WSL, model, _COSY_SCRIPT_WSL))
     try:
         subprocess.run(["wsl.exe", "-d", _WSL_DISTRO, "-e", "bash", "-c", "pkill -f 'uvicorn app:app'"],
                        timeout=20)
@@ -342,6 +351,83 @@ def restart_cosyvoice() -> dict:
 def read_cosy_model() -> str:
     """Current COSYVOICE_MODEL in .env (v2 | v3), default v2."""
     return read_env().get("COSYVOICE_MODEL", "").strip() or "v2"
+
+
+# --------------------------------------------------------------------------- avatar presets
+# One GPU = one live avatar, so an "avatar preset" is a full backend swap: portrait (AVATAR_REF),
+# cloned voice (COSYVOICE_PROMPT_WAV/TEXT, delivered via the sourced _VOICE_ENV file), and language.
+# Both the prebuilt page family shares one active preset -- /nimbus and /studio show whichever is
+# live. voice_text is the EXACT transcript of voice_wav (zero-shot needs it) in SIMPLIFIED zh (the
+# clean CosyVoice path; Traditional garbles -- P43). No <|endofprompt|> marker: that is v3-only.
+PRESETS = {
+    "nimbus": {
+        "label": "Nimbus -- weather presenter (female)",
+        "page": "/nimbus/",
+        "env": {"AVATAR_REF": "assets/avatar_studio_match.png", "LANGUAGE": "en",
+                "LLM_PROVIDER": "openrouter"},
+        "voice_wav": "/mnt/e/Claude/cosyvoice-local-tts/CosyVoice/asset/pro_ref.wav",
+        "voice_text": "你好，我是你的AI虚拟助手，很高兴见到你。今天天气不错，有什么我可以帮你的",
+    },
+    "leo": {
+        "label": "Leo -- AI assistant (his face + voice, zh)",
+        "page": "/studio/",
+        "env": {"AVATAR_REF": "assets/avatar_leo.png", "LANGUAGE": "zh",
+                "LLM_PROVIDER": "openrouter"},
+        "voice_wav": "/mnt/e/Claude/cosyvoice-local-tts/CosyVoice/asset/leo_ref.wav",
+        "voice_text": "我是国家灾害防救科技中心副主任张国浩，目前也是国立清华大学工业工程与工程管理学系的特聘教授。",
+    },
+}
+
+
+def read_preset() -> str:
+    """Active preset name from .env (AVATAR_PRESET), default 'nimbus'."""
+    p = read_env().get("AVATAR_PRESET", "").strip().lower()
+    return p if p in PRESETS else "nimbus"
+
+
+def _write_voice_env(preset: dict) -> None:
+    """Write the WSL-sourced voice file (UTF-8, no BOM, LF) -- keeps the CJK transcript OFF the
+    WSL command line. restart_cosyvoice `source`s it so the prompt wav/text reach the engine."""
+    body = ('COSYVOICE_PROMPT_WAV="%s"\nCOSYVOICE_PROMPT_TEXT="%s"\n'
+            % (preset["voice_wav"], preset["voice_text"]))
+    _VOICE_ENV.write_bytes(body.encode("utf-8"))
+
+
+def _kill_port(port: int) -> None:
+    """Native TerminateProcess for whatever LISTENs on a port (taskkill/PowerShell hang under
+    load here -- the documented gotcha). Used to FREE the GPU before the ordered preset relaunch."""
+    for pid in _pids_on(port):
+        try:
+            if os.name == "nt":
+                h = ctypes.windll.kernel32.OpenProcess(0x0001, False, int(pid))  # PROCESS_TERMINATE
+                if h:
+                    ctypes.windll.kernel32.TerminateProcess(h, 1)
+                    ctypes.windll.kernel32.CloseHandle(h)
+            else:
+                os.kill(int(pid), 9)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def apply_preset(name: str) -> dict:
+    """Swap the whole avatar backend to a preset: portrait, cloned voice, language -> then relaunch
+    the three GPU services in the SAFE ORDER. LOAD ORDER MATTERS (P15): vLLM CosyVoice needs the card
+    mostly free, so free MuseTalk's VRAM FIRST, then start CosyVoice, THEN MuseTalk, THEN the
+    pipeline. Long (model reload + TRT + warmup ~2-4 min); the panel warns before calling."""
+    name = (name or "").strip().lower()
+    if name not in PRESETS:
+        return {"ok": False, "message": "unknown preset %r" % name}
+    preset = PRESETS[name]
+    write_env({**preset["env"], "AVATAR_PRESET": name})
+    _write_voice_env(preset)
+    _kill_port(8002)          # free MuseTalk's ~5GB so vLLM can claim the KV cache (P15)
+    steps, oks = [], []
+    for label, fn in (("cosyvoice", restart_cosyvoice), ("avatar", restart_avatar),
+                      ("pipeline", restart_pipeline)):
+        r = fn()
+        oks.append(bool(r.get("ok")))
+        steps.append("%s: %s" % (label, r.get("message", "")))
+    return {"ok": all(oks), "preset": name, "page": preset["page"], "message": " | ".join(steps)}
 
 
 # --------------------------------------------------------------------------- HTTP
@@ -376,7 +462,9 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/config":
             return self._send(200, {"fields": FIELDS, "values": read_env(),
                                     "graphs": read_graphs(), "cosyModel": read_cosy_model(),
-                                    "split": read_split()})
+                                    "split": read_split(), "preset": read_preset(),
+                                    "presets": [{"name": k, "label": v["label"], "page": v["page"]}
+                                                for k, v in PRESETS.items()]})
         if self.path == "/status":
             return self._send(200, status())
         return self._send(404, {"error": "not found"})
@@ -413,6 +501,11 @@ class Handler(BaseHTTPRequestHandler):
                 res["ok"] = bool(pres.get("ok"))
                 res["message"] = "%s; %s" % (res.get("message", ""), pres.get("message", ""))
             res["split"] = read_split()
+            return self._send(200, res)
+        if self.path == "/preset":
+            name = str((self._body() or {}).get("preset", "")).strip()
+            res = apply_preset(name)
+            res["preset"] = read_preset()
             return self._send(200, res)
         return self._send(404, {"error": "not found"})
 

@@ -1,5 +1,44 @@
 # VisualLLm — Project Status & Next Steps
 
+_Last updated: 2026-07-11 (**PUBLIC LINK anyone can use — no Tailscale, no signup. VERIFIED LIVE.**
+The front door moved from Tailscale Funnel (stopped working) to a **Cloudflare quick tunnel**
+(`scripts/tunnel.ps1`, auto-started by `launch.ps1` step [4/5]; random `trycloudflare.com` URL). `.env`
+**`WEBRTC_PUBLIC=1`** now baseline. The media leg that STUN-only couldn't reach for symmetric-NAT /
+UDP-restricted visitors (symptom: page loads but avatar stuck "connecting") is fixed by a **zero-signup
+Cloudflare TURN relay** — `main.py::_cloudflare_turn()` fetches fresh creds per connection from
+`speed.cloudflare.com/turn-creds`, gated by **`TURN_CLOUDFLARE`** (default ON with `WEBRTC_PUBLIC=1`,
+no static `TURN_URLS`). Verified: server offers a `relay` candidate, a relay-only client connects over
+`turns:5349`, and the user opened the link on an external non-Tailscale computer → "it work now". Caveat:
+the turn-creds endpoint is Cloudflare's speed-test backend (best-effort); the drop-in durable upgrade is
+an official free Cloudflare Realtime TURN key via `TURN_URLS/TURN_USERNAME/TURN_CREDENTIAL`. Still
+single-client + unauth. Spec: `docs/superpowers/specs/2026-07-11-cloudflare-public-tunnel-design.md`.)_
+<!-- prior handoff -->
+_Last updated: 2026-07-11 (**20th session — a SECOND avatar identity ("Leo") + a switchable-preset system + a `/studio`
+page + longer zh + a fullscreen button. UNCOMMITTED.**
+(1) **New avatar "Leo" from a source clip** — a man's front-facing zh webcam clip (`C:\Users\MARU\Downloads\avatar.mp4`,
+張國浩). Portrait = the clip's **full last frame** (`assets/avatar_leo.png`, 1280×720, eyes-open/mouth-closed rest pose; the
+user asked for the WHOLE rectangular frame, not a square crop — the server derives the split bbox+bg from it). Voice = a clean
+~9s self-intro segment cloned zero-shot (`cosyvoice-local-tts/CosyVoice/asset/leo_ref.wav` + a **Simplified**-zh transcript —
+the clean CosyVoice path, P43; Deepgram gave the transcript, I fixed 工整→工程 / 特别→特聘). Both new-risk pieces VERIFIED: the
+overlay bg is his face w/ bbox auto-derived; a live-TTS transcribe-back was an exact match (3.48s clean zh). Watchable proof:
+`output/leo_studio_demo.mp4` (offline synced render, mouth seamless on his face).
+(2) **Avatar PRESETS** (`config_panel/server.py::PRESETS` + `apply_preset` + `POST /preset`, a new panel card) — one GPU = one
+live avatar, so a preset is a full backend swap (portrait `AVATAR_REF` + cloned voice `COSYVOICE_PROMPT_WAV/TEXT` +
+`LANGUAGE`), persisted as `AVATAR_PRESET` (nimbus|leo). Applying frees `:8002` VRAM then relaunches **CosyVoice → avatar →
+pipeline in the P15 order** (~2–4 min). The CJK transcript reaches WSL via a **sourced file** (`.preset_voice.env`, `set -a; .`
+in `restart_cosyvoice`) so CJK never rides the mangling-prone WSL argv. **Leo preset is ACTIVE now.**
+(3) **New `/studio/` page** (`local_services/studio_client/`, `_install_studio_client` in main.py) — a WHITE-theme sibling of
+`/nimbus`, Leo branding + zh copy, reusing the SAME signaling + split-compositor + transcript JS verbatim. `/nimbus` + `/client`
+untouched. (4) **Longer zh** — `pipeline/config.py` zh system prompt relaxed from "2–3 短句" to "健談… 大約 5 到 8 句 + 細節/例子"
+(KEPT the first-sentence-short TTFO lever — it caps only the opener); `OPENROUTER_MAX_TOKENS` 200→500 so it isn't clipped.
+Isolated-probe verified ~7 sentences w/ a 7-char opener. GLOBAL to zh (not Leo-only) — ask if it should be preset-scoped.
+(5) **Fullscreen button** on BOTH pages — fullscreens `.presenter` (bg+mouth+name tag), recomputes `layoutSplitVideo()` on
+`fullscreenchange` so the split crop lands right at the new size. Files: `local_services/{studio_client,nimbus_client}/index.html`,
+`local_services/config_panel/{server.py,index.html}`, `pipeline/{main.py,config.py}`, `.env`, `assets/avatar_leo.png`, the
+cosyvoice asset. **NOT committed** (per the user's usual "commit on ask"). vLLM (CosyVoice) per-request ceiling is
+`COSYVOICE_VLLM_MAX_LEN=2048` ≈ ~80s of speech at 25Hz, but the pipeline splits a turn into sentences so it never binds a turn;
+the real per-turn cap is `OPENROUTER_MAX_TOKENS`.)_
+<!-- prior handoff -->
 _Last updated: 2026-07-11 (**later same day — mouth-crop OVERLAY prototype (`MUSETALK_SPLIT`), on branch
 `feat/mouth-crop-overlay`, NOT merged.** Goal: a sharper avatar PICTURE. In split mode the MuseTalk server streams only a
 fixed 256px mouth crop over the existing WebRTC track (verified: every delivered frame is exactly 256×256×3) and exposes

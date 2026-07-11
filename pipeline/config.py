@@ -207,14 +207,15 @@ class Config:
                 "ห้ามใช้อิโมจิ บุลเล็ต หรือสัญลักษณ์จัดรูปแบบใดๆ เพราะข้อความจะถูกอ่านออกเสียง"
             )
         if self.is_mandarin:
-            # First-sentence-short is a zh TTFO lever: CosyVoice prefills the whole first
-            # sentence before emitting any audio, so a short opener cuts the TTS first-chunk
-            # TTFB. (The first-clause split -- the en lever -- barely fires for zh.)
+            # First-sentence-short is a zh TTFO lever (KEPT): CosyVoice prefills the whole first
+            # sentence before emitting any audio, so a short opener cuts the TTS first-chunk TTFB.
+            # It caps only the OPENER, not the total length -- so a long, detailed answer can still
+            # start fast. The 2-3-sentence brevity cap was removed so zh speaks fuller/longer.
             return (
-                "你是一個友善、簡潔的語音助理。"
-                "請用口語化、適合朗讀的方式回答，句子要短，"
-                "每次回覆都要簡短，最多 2-3 句；內容很多時先給簡短答案再問是否要繼續，不要長篇大論，"
-                "第一句話要特別短（十個字以內），先講重點，讓語音能馬上開始，"
+                "你是一個友善、健談的語音助理。"
+                "請用自然、口語化、適合朗讀的方式回答，內容要豐富、講得完整一些，"
+                "每次回覆大約 5 到 8 句，把重點說清楚，適時補充細節、原因或例子，展開說明，不要只講一兩句就結束，"
+                "第一句話要特別短（十個字以內），先點出重點，讓語音能馬上開始，後面幾句再慢慢展開，"
                 "避免使用表情符號、條列符號或特殊格式。"
             )
         return (

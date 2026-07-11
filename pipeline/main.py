@@ -354,6 +354,9 @@ _client_patch_middleware_installed = False
 # GET /client/ice-config. Empty = no TURN configured -> public WebRTC off, tailnet behavior
 # unchanged. Populated by _install_turn_ice_servers() from TURN_URLS/TURN_USERNAME/TURN_CREDENTIAL.
 _ice_config_js: list[dict] = []
+# When True, a fresh Cloudflare zero-signup TURN relay is appended per connection/request
+# (see _cloudflare_turn). Set by _install_turn_ice_servers when TURN_CLOUDFLARE is enabled.
+_cf_turn_enabled = False
 # Set by run_bot so the /client/measure-turn endpoint (the Measure button) can inject a turn
 # into the live pipeline. None between sessions.
 _active_task = None
@@ -670,8 +673,13 @@ def _ensure_client_patch_middleware() -> bool:
         # configured -> the client falls back to a default RTCPeerConnection (tailnet path).
         if request.method == "GET" and request.url.path == "/client/ice-config":
             import json as _json
+            servers = list(_ice_config_js)
+            if _cf_turn_enabled:  # append a FRESH Cloudflare relay (short-lived creds)
+                cf_js, _ = _cloudflare_turn()
+                if cf_js:
+                    servers.append(cf_js)
             return HTMLResponse(
-                _json.dumps({"iceServers": _ice_config_js}),
+                _json.dumps({"iceServers": servers}),
                 media_type="application/json",
                 headers={"Cache-Control": "no-store"},
             )
@@ -1096,6 +1104,50 @@ def _restrict_ice_to_subnet() -> None:
     )
 
 
+_cf_turn_cache: dict = {"exp": 0.0, "js": None, "rtc": None}
+
+
+def _cloudflare_turn():
+    """Fetch FRESH Cloudflare TURN credentials with NO signup/account.
+
+    Cloudflare's speed test exposes a relay-credential endpoint (turn.cloudflare.com) that
+    hands out short-lived username/credential pairs to any browser-style caller (a Referer
+    header is all it wants). We reuse it as a zero-signup TURN relay so an off-tailnet visitor
+    on a symmetric-NAT / UDP-restricted network can still reach the avatar (verified: yields a
+    relay candidate on turn:3478 udp/tcp AND turns:5349 TLS, the firewall-proof one).
+
+    Returns (js_entry: dict, rtc_entry: RTCIceServer) or (None, None) on any failure -> the
+    caller silently degrades to STUN-only. Cached ~5 min (well under the credential TTL) so we
+    don't hammer the endpoint. Best-effort by nature (undocumented endpoint); the drop-in
+    upgrade is an official Cloudflare Realtime TURN key -> same turn.cloudflare.com servers,
+    set TURN_URLS/TURN_USERNAME/TURN_CREDENTIAL instead and this path is bypassed."""
+    import time
+    now = time.time()
+    if _cf_turn_cache["js"] and now < _cf_turn_cache["exp"]:
+        return _cf_turn_cache["js"], _cf_turn_cache["rtc"]
+    try:
+        import json as _json
+        import urllib.request
+        req = urllib.request.Request(
+            "https://speed.cloudflare.com/turn-creds",
+            headers={"Referer": "https://speed.cloudflare.com/", "User-Agent": "Mozilla/5.0"},
+        )
+        data = _json.loads(urllib.request.urlopen(req, timeout=8).read())
+        urls = [u for u in data.get("urls", []) if u.startswith(("turn:", "turns:"))]
+        user, cred = data.get("username"), data.get("credential")
+        if not urls or not user or not cred:
+            logger.warning("Cloudflare TURN: endpoint returned no usable creds; relay unavailable.")
+            return None, None
+        from aiortc import RTCIceServer
+        js = {"urls": urls, "username": user, "credential": cred}
+        rtc = RTCIceServer(urls=urls, username=user, credential=cred)
+        _cf_turn_cache.update(exp=now + 300, js=js, rtc=rtc)
+        return js, rtc
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Cloudflare TURN fetch failed ({e!r}); relay unavailable this attempt.")
+        return None, None
+
+
 def _install_turn_ice_servers() -> None:
     """Enable PUBLIC WebRTC (a link a stranger can use) by advertising STUN + TURN.
 
@@ -1121,11 +1173,18 @@ def _install_turn_ice_servers() -> None:
     by design (the browser must use them), so embedding them in the served page / ice-config is
     expected. Env: WEBRTC_PUBLIC, TURN_URLS (comma-sep turn:/turns:), TURN_USERNAME,
     TURN_CREDENTIAL, STUN_URLS (default stun:stun.l.google.com:19302)."""
-    global _ice_config_js
+    global _ice_config_js, _cf_turn_enabled
     turn_urls = [u.strip() for u in (os.getenv("TURN_URLS", "") or "").split(",") if u.strip()]
     public = (os.getenv("WEBRTC_PUBLIC", "") or "").strip().lower() in ("1", "true", "yes", "on")
     if not turn_urls and not public:
         return  # public WebRTC disabled; tailnet behavior unchanged.
+    # Cloudflare zero-signup TURN relay (see _cloudflare_turn): default ON when public and no
+    # explicit TURN_URLS is set, so a symmetric-NAT / UDP-restricted visitor connects with no
+    # account. TURN_CLOUDFLARE=0 opts out; =1 forces on even alongside a static TURN_URLS.
+    cf_env = (os.getenv("TURN_CLOUDFLARE", "") or "").strip().lower()
+    cf_turn = (cf_env in ("1", "true", "yes", "on")) or (
+        public and not turn_urls and cf_env not in ("0", "false", "no", "off"))
+    _cf_turn_enabled = cf_turn
     turn_user = (os.getenv("TURN_USERNAME", "") or "").strip()
     turn_cred = (os.getenv("TURN_CREDENTIAL", "") or "").strip()
     stun_urls = [u.strip() for u in
@@ -1165,7 +1224,12 @@ def _install_turn_ice_servers() -> None:
 
         def _patched_init(self, ice_servers=None, *a, **k):
             if not ice_servers:
-                ice_servers = list(rtc)
+                servers = list(rtc)
+                if cf_turn:  # append a FRESH Cloudflare relay per connection (creds are short-lived)
+                    _cf_js, _cf_rtc = _cloudflare_turn()
+                    if _cf_rtc is not None:
+                        servers.append(_cf_rtc)
+                ice_servers = servers
             return _orig_init(self, ice_servers, *a, **k)
 
         SmallWebRTCConnection.__init__ = _patched_init
@@ -1173,9 +1237,17 @@ def _install_turn_ice_servers() -> None:
 
     # Client side (prebuilt /client): wrap RTCPeerConnection to inject the same servers. Same
     # synchronous <head> pattern as the jitter buffer, so it runs before the ES-module bundle.
-    _ice_config_js = js  # also served to /nimbus via GET /client/ice-config
+    _ice_config_js = js  # base; the /client/ice-config endpoint appends a FRESH Cloudflare relay
+    # The prebuilt /client page embeds ICE statically (can't fetch async before the bundle builds
+    # its peer connection), so bake a startup Cloudflare snapshot into it (best-effort; /studio +
+    # /nimbus re-fetch fresh via /client/ice-config, so they never go stale).
+    js_head = list(js)
+    if cf_turn:
+        _cf_js, _ = _cloudflare_turn()
+        if _cf_js:
+            js_head.append(_cf_js)
     import json as _json
-    ice_json = _json.dumps(js)
+    ice_json = _json.dumps(js_head)
     patch = (
         "<script>(()=>{const ICE=" + ice_json + ";const N=window.RTCPeerConnection;"
         "if(!N||N.__ice)return;const P=function(...a){const c=a[0]||{};"
@@ -1185,10 +1257,15 @@ def _install_turn_ice_servers() -> None:
     )
     if _ensure_client_patch_middleware():
         _client_head_patches.append(patch)
+    if turn_urls:
+        _relay = "STUN+TURN (static relay for symmetric NAT)"
+    elif cf_turn:
+        _relay = "STUN + Cloudflare zero-signup TURN relay (symmetric-NAT / UDP-restricted OK)"
+    else:
+        _relay = "STUN only (no TURN)"
     logger.info(
-        f"Public WebRTC ICE servers ENABLED: {len(js)} server(s), "
-        f"{'STUN+TURN (relay fallback for symmetric NAT)' if turn_urls else 'STUN only (no TURN)'}"
-        f" -> a public browser can reach the media. Unset TURN_URLS/WEBRTC_PUBLIC to disable."
+        f"Public WebRTC ICE servers ENABLED: {_relay} -> a public browser can reach the media. "
+        f"Unset TURN_URLS/WEBRTC_PUBLIC to disable; TURN_CLOUDFLARE=0 to drop the Cloudflare relay."
     )
 
 
@@ -1226,6 +1303,14 @@ def _install_nimbus_client() -> None:
 
     app.mount("/nimbus", _NoStoreStatic(directory=str(client_dir), html=True), name="nimbus")
     logger.info("Nimbus UI mounted at /nimbus/ (custom client; /client prebuilt untouched).")
+
+    # Sibling custom client for the "Leo" avatar preset (his face + cloned voice). Same
+    # SmallWebRTC signaling + split-compositor; only the theme/branding differ. Additive --
+    # whichever avatar preset is live streams to whichever page is open (one GPU, one avatar).
+    studio_dir = _Path(__file__).resolve().parent.parent / "local_services" / "studio_client"
+    if (studio_dir / "index.html").is_file():
+        app.mount("/studio", _NoStoreStatic(directory=str(studio_dir), html=True), name="studio")
+        logger.info("Studio UI mounted at /studio/ (Leo preset; /client + /nimbus untouched).")
 
 
 if __name__ == "__main__":

@@ -23,7 +23,7 @@ A/V-sync architecture decision (read it before touching sync).**
 | STT | Deepgram nova-2 (`en-US`/`zh-TW`/`th` by `LANGUAGE`) default; **local OFFLINE alt `STT_PROVIDER=sherpa`** (sherpa-onnx streaming zipformer, bilingual zh-en, in-process CPU/~0 VRAM, zh→Traditional via OpenCC) or `funasr` (SenseVoice segmented, `:8004`, untested alt) | cloud / **local CPU** |
 | LLM | `LLM_PROVIDER=openrouter` — OpenAI-compatible, so **cloud OR local Ollama** by `OPENROUTER_BASE_URL` (any model via `OPENROUTER_MODEL`); or `weather_chain` (Chinese weather bot) | cloud / local / remote |
 | TTS | **CosyVoice** local streaming on vLLM in WSL — `COSYVOICE_MODEL=v2` (CosyVoice2-0.5B) or **`v3`** (Fun-CosyVoice3-0.5B, **current baseline**, +flow-decoder TRT + CUDA graphs, isolated first-chunk zh~1.08/en~0.80s; graphs carry the P33 zh-lipsync caveat, safe on `en`). Or **MOSS-TTS-Realtime** (`TTS_PROVIDER=moss`, `:8003`) | **`:8001` cosy / `:8003` moss, both WSL** |
-| Avatar | **MuseTalk** local mouth-region talking-head (female portrait), **TensorRT render by default** (`MUSETALK_TRT=1`) | **`:8002`, `musetalk` conda env** |
+| Avatar | **MuseTalk** local mouth-region talking-head (**switchable preset**: `nimbus` female / `leo` his face+voice — `AVATAR_PRESET`), **TensorRT render by default** (`MUSETALK_TRT=1`) | **`:8002`, `musetalk` conda env** |
 | Config | **Web config panel** — edit `.env` + restart the pipeline from a browser | **`:7870` (`:8444` over Tailscale)** |
 
 **TTS note:** CosyVoice runs its autoregressive LLM on **vLLM inside WSL Ubuntu**
@@ -142,7 +142,9 @@ are **deliberate fallback switches, not multi-provider branching**:
 **The web config panel (`local_services/config_panel/`, `:7870`) is the easy way to change all of this**
 — it edits `.env` in place (preserving comments) and restarts the pipeline. Run it with the system
 Python: `python -m local_services.config_panel.server`. Its Restart kills `:7860` via a native Win32
-`TerminateProcess` (NOT `taskkill`/PowerShell — those hang for tens of seconds under CPU load here).
+`TerminateProcess` (NOT `taskkill`/PowerShell — those hang for tens of seconds under CPU load here). It also
+hosts the **"Avatar preset"** card (swap the whole avatar identity — Nimbus female / Leo his-face-and-voice; see the
+`/studio/` + presets note under Architecture) alongside the CosyVoice-model, CUDA-graphs, and Avatar-output cards.
 
 **MOSS-TTS-Realtime (`TTS_PROVIDER=moss`):** a streaming server (`local_services/moss_server/app.py`,
 `moss-tts` conda env) speaking the SAME `/tts/stream` raw-PCM contract as CosyVoice, so it reuses the
@@ -249,16 +251,26 @@ the phone self-reports to `[speaker-debug]` in pipeline.log. P24),
 `CLIENT_JITTER_BUFFER_MS` (raise only for a remote/WAN viewer),
 `WEBRTC_VIDEO_BITRATE_MAX` (caps aiortc's VP8 ceiling so the video fits a WAN link), and
 `WEBRTC_ICE_SUBNET` (**`100.64.0.0/10`** = pin WebRTC ICE to the Tailscale interface; fixes the
-intermittent remote mic — `0` disables), and — for a **PUBLIC link** a non-tailnet browser can use
-(over `tailscale funnel`, which proxies only the page + signaling, NEVER the WebRTC media) —
-`WEBRTC_PUBLIC` (**`0` = default, tailnet-only baseline**; `1` = advertise STUN so a public/CGNAT
-browser reaches the media. This box's NAT is port-preserving (cone), so STUN-only works with no TURN
-signup. When on, `_restrict_ice_to_subnet` keeps a SET = {Tailscale 100.64/10 for tailnet/same-LAN
-pairs + the internet-facing default-route `/32` for the public srflx}, dropping hyper-v/radmin noise —
-pinning to EITHER one alone breaks the other's clients) and `TURN_URLS`/`TURN_USERNAME`/`TURN_CREDENTIAL`
-(a relay fallback for a visitor whose own NAT is symmetric; also enables the feature). Both gate
-`_install_turn_ice_servers` (server-side ICE-server injection + `/client` head-patch + `/client/ice-config`
-for `/nimbus`). Still single-client + unauth. `docs/PROBLEMS-AND-FIXES.md` P38. **Full reference: `WORKFLOW.md` §8.**
+intermittent remote mic — `0` disables), and — for a **PUBLIC link anyone can use** (no Tailscale).
+The public **front door is a Cloudflare quick tunnel** (2026-07-11; `scripts/tunnel.ps1`, auto-started
+by `launch.ps1` step [4/5], prints a random `https://<random>.trycloudflare.com` URL) — it replaced
+Tailscale Funnel (which stopped working: a login-gated admin toggle, and `funnel reset` wipes serve).
+Like Funnel, the tunnel carries only the page + `/api/offer` signaling, NEVER the WebRTC media, so the
+media is enabled separately by `WEBRTC_PUBLIC` (**now `1` = baseline**; `0` = tailnet-only. `1` advertises
+STUN so an off-tailnet browser reaches the media. This box's NAT is port-preserving (cone), so STUN-only
+reaches many networks. When on, `_restrict_ice_to_subnet` keeps a SET = {Tailscale 100.64/10 for
+tailnet/same-LAN pairs + the internet-facing default-route `/32` for the public srflx}, dropping
+hyper-v/radmin noise — pinning to EITHER one alone breaks the other's clients). For a visitor whose own
+network is **symmetric-NAT / UDP-restricted** (STUN can't punch it — the "page loads but avatar stuck on
+connecting" symptom), a TURN **relay** is required: **`TURN_CLOUDFLARE`** (**default ON when
+`WEBRTC_PUBLIC=1` and no static `TURN_URLS`; `0` opts out**) fetches a FRESH zero-signup relay per
+connection from Cloudflare's speed-test endpoint (`speed.cloudflare.com/turn-creds`, `main.py::_cloudflare_turn`,
+5-min cache, silent STUN-only fallback) — verified live: a relay-only client connects over `turns:5349`
+(firewall-proof). `TURN_URLS`/`TURN_USERNAME`/`TURN_CREDENTIAL` (a static relay — e.g. an official free
+Cloudflare Realtime TURN key, same `turn.cloudflare.com` servers) override the Cloudflare-fetch path.
+All gate `_install_turn_ice_servers` (server-side ICE-server injection + `/client` head-patch +
+`/client/ice-config` for `/nimbus` + `/studio`). Still single-client + unauth. `docs/PROBLEMS-AND-FIXES.md`
+P38. **Full reference: `WORKFLOW.md` §8.**
 
 ## Commands
 
@@ -451,6 +463,22 @@ audio/video drift.
   path leaves it False → gating on it dropped every user bubble). The mic button **mutes** (toggles the audio track,
   not disconnect) once connected. **Single-connection:** a new `/api/offer` disconnects the previous session
   (`_active_connection`) so two clients never fight the single-client avatar server.
+- **The `/studio/` client + AVATAR PRESETS (2026-07-11).** `/studio/` (`local_services/studio_client/`, mounted by
+  `_install_studio_client` next to nimbus) is a **sibling** custom client for the **"Leo"** avatar — a man's face + his
+  cloned voice, built from a source clip. It is a WHITE-theme copy of nimbus reusing the SAME signaling + split-compositor
+  + transcript JS verbatim; only the theme/branding differ. `/nimbus/` and `/client/` are untouched fallbacks. Because one
+  GPU runs one avatar, the two pages share whichever **preset** is live. A preset = a full backend swap (portrait
+  `AVATAR_REF` + cloned voice `COSYVOICE_PROMPT_WAV/TEXT` + `LANGUAGE`), defined in `config_panel/server.py::PRESETS`
+  (`nimbus` = female weather en; `leo` = his face + voice, zh). The config panel's **"Avatar preset"** card
+  (`POST /preset`) writes those `.env` keys + `AVATAR_PRESET`, writes the CJK transcript to a WSL-sourced file
+  (`.preset_voice.env` — keeps CJK OFF the mangling-prone WSL command line), then relaunches **CosyVoice → avatar →
+  pipeline in the P15 load order** (frees `:8002` VRAM first). Leo's portrait is the full rectangular source frame (the
+  server derives the split bbox+background from it). His voice reference must be **Simplified** zh (the clean CosyVoice
+  path; Traditional garbles, P43) with an accurate transcript (verified by transcribe-back). ~2–4 min to switch.
+- **Fullscreen-avatar button (2026-07-11)** — both `/nimbus/` and `/studio/` have a top-right button that fullscreens the
+  **`.presenter`** (bg + mouth-crop + name tag together, not the bare `<video>`). On `fullscreenchange` it recomputes
+  `layoutSplitVideo()` so the split mouth-crop re-scales/re-positions onto the face at the new size (else the mouth lands
+  wrong fullscreen). Handles standard + `webkit` fullscreen APIs; static files, so a reload picks it up (no restart).
 
 ## Conventions
 

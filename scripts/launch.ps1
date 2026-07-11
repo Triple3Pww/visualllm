@@ -8,7 +8,8 @@
     1. CosyVoice TTS server in WSL  (:8001, only if TTS_PROVIDER=cosyvoice)
     2. MuseTalk avatar + pipeline   (delegates to scripts\run.ps1 -> :8002 + :7860)
     3. Web config panel             (:7870)
-    4. Opens http://localhost:7860/client/
+    4. Cloudflare quick tunnel      (public https://<random>.trycloudflare.com link)
+    5. Opens http://localhost:7860/client/
 
   The launcher window stays open as the system's "running" indicator: press Enter
   in it (or close it) to shut every service down. Per-process logs land in logs\.
@@ -72,7 +73,7 @@ $ttsProvider = Get-EnvVal "TTS_PROVIDER"
 $cosyUrl     = Get-EnvVal "COSYVOICE_URL"
 if ($ttsProvider -eq "cosyvoice" -and $cosyUrl) {
     $health = "$cosyUrl/health"
-    Write-Host "[1/4] CosyVoice TTS ($cosyUrl)" -ForegroundColor Cyan
+    Write-Host "[1/5] CosyVoice TTS ($cosyUrl)" -ForegroundColor Cyan
     if (Test-Url $health) {
         Write-Host "  already up -- reusing." -ForegroundColor Green
     } else {
@@ -98,14 +99,14 @@ if ($ttsProvider -eq "cosyvoice" -and $cosyUrl) {
         else { Write-Host "  TTS not healthy yet -- the bot may be silent until it finishes loading (check the WSL window)." -ForegroundColor Yellow }
     }
 } else {
-    Write-Host "[1/4] TTS_PROVIDER=$ttsProvider -- skipping WSL CosyVoice start." -ForegroundColor DarkGray
+    Write-Host "[1/5] TTS_PROVIDER=$ttsProvider -- skipping WSL CosyVoice start." -ForegroundColor DarkGray
 }
 Write-Host ""
 
 # ---------------------------------------------------------------------------
 # 2) MuseTalk avatar + pipeline (run.ps1 owns the env propagation + health waits).
 # ---------------------------------------------------------------------------
-Write-Host "[2/4] Avatar server + pipeline (via run.ps1)" -ForegroundColor Cyan
+Write-Host "[2/5] Avatar server + pipeline (via run.ps1)" -ForegroundColor Cyan
 & (Join-Path $PSScriptRoot "run.ps1") -MusetalkPython $MusetalkPython
 if (-not (Test-Url "http://127.0.0.1:7860/client/")) {
     Write-Host "  WARNING: pipeline client did not come up -- check logs\pipeline.err.log" -ForegroundColor Yellow
@@ -115,7 +116,7 @@ Write-Host ""
 # ---------------------------------------------------------------------------
 # 3) Web config panel (:7870), system python, logged to logs\config_panel.*.
 # ---------------------------------------------------------------------------
-Write-Host "[3/4] Config panel (http://localhost:7870)" -ForegroundColor Cyan
+Write-Host "[3/5] Config panel (http://localhost:7870)" -ForegroundColor Cyan
 $cp = $null
 if (Test-Url "http://127.0.0.1:7870/") {
     Write-Host "  already up -- reusing." -ForegroundColor Green
@@ -136,9 +137,27 @@ if (Test-Url "http://127.0.0.1:7870/") {
 Write-Host ""
 
 # ---------------------------------------------------------------------------
-# 4) Open the client.
+# 4) Cloudflare quick tunnel -- the PUBLIC link anyone can open. tunnel.ps1 starts
+#    cloudflared, waits for the https://<random>.trycloudflare.com URL, and returns
+#    {Process, Url}. The tunnel carries only the page + signaling; media reachability
+#    is .env WEBRTC_PUBLIC=1 (STUN). Never fails the launch -- local stack still runs.
 # ---------------------------------------------------------------------------
-Write-Host "[4/4] Opening the client in your browser..." -ForegroundColor Cyan
+Write-Host "[4/5] Cloudflare public tunnel" -ForegroundColor Cyan
+$tunnel = $null
+try {
+    $tunnel = & (Join-Path $PSScriptRoot "tunnel.ps1") -Port 7860
+    if (-not ($tunnel -and $tunnel.Url)) {
+        Write-Host "  no public URL yet -- see logs\cloudflared.log; the local stack is still up." -ForegroundColor Yellow
+    }
+} catch {
+    Write-Host "  tunnel failed to start ($($_.Exception.Message)) -- local stack is still up." -ForegroundColor Yellow
+}
+Write-Host ""
+
+# ---------------------------------------------------------------------------
+# 5) Open the client.
+# ---------------------------------------------------------------------------
+Write-Host "[5/5] Opening the client in your browser..." -ForegroundColor Cyan
 Start-Process "http://localhost:7860/client/"
 Write-Host ""
 
@@ -147,6 +166,11 @@ Write-Host "   VisualLLm is RUNNING"                          -ForegroundColor G
 Write-Host "===============================================" -ForegroundColor Green
 Write-Host "  Client      : http://localhost:7860/client/"
 Write-Host "  Config panel: http://localhost:7870"
+if ($tunnel -and $tunnel.Url) {
+    Write-Host "  PUBLIC link : $($tunnel.Url)$($tunnel.ClientPath)  <-- share this" -ForegroundColor Green
+} else {
+    Write-Host "  PUBLIC link : (not up -- check logs\cloudflared.log)" -ForegroundColor Yellow
+}
 Write-Host "  Logs        : $logs"
 Write-Host ""
 Read-Host "Press Enter to STOP everything and exit (closing this window also stops it)"
@@ -155,6 +179,7 @@ Write-Host "Shutting down..." -ForegroundColor Yellow
 Stop-Port 7860      # pipeline / client
 Stop-Port 8002      # musetalk avatar server
 Stop-Port 7870      # config panel
+if ($tunnel -and $tunnel.Process) { try { Stop-Process -Id $tunnel.Process.Id -Force -ErrorAction SilentlyContinue } catch { } }
 if ($cp) { try { Stop-Process -Id $cp.Id -Force -ErrorAction SilentlyContinue } catch { } }
 if ($startedWsl) { try { Stop-Process -Id $startedWsl.Id -Force -ErrorAction SilentlyContinue } catch { } }
 Write-Host "Stopped. (CosyVoice inside WSL may keep running -- 'wsl --shutdown' to fully stop it.)" -ForegroundColor DarkGray

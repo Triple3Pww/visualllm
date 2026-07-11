@@ -54,6 +54,21 @@
 
   <div id="curated"></div>
 
+  <div class="card" id="presetCard" style="display:none">
+    <h2>Avatar preset</h2>
+    <div class="row">
+      <div class="lab"><b>Who is on screen</b><span class="h">One GPU = one live avatar, so a preset is a
+        full backend swap: portrait + cloned voice + language. <b>Nimbus</b> = female weather presenter
+        (<code>/nimbus</code>); <b>Leo</b> = his face + cloned voice, Chinese (<code>/studio</code>).
+        Applying relaunches CosyVoice&rarr;avatar&rarr;pipeline in the safe order (~2&ndash;4&nbsp;min, all
+        three briefly stop). Then open that preset's page.</span></div>
+      <div>
+        <select id="presetSel"></select>
+        <button class="restart" id="presetApply" style="margin-top:8px; width:100%">Apply preset</button>
+      </div>
+    </div>
+  </div>
+
   <div class="card" id="modelCard" style="display:none">
     <h2>CosyVoice model</h2>
     <div class="row">
@@ -106,7 +121,14 @@
 
 <script>
 const $=s=>document.querySelector(s);
-let FIELDS=[], VALUES={}, dirty={}, GRAPHS=null, COSYMODEL="v2", SPLIT=false;
+let FIELDS=[], VALUES={}, dirty={}, GRAPHS=null, COSYMODEL="v2", SPLIT=false, PRESET="nimbus", PRESETS=[];
+
+function renderPreset(){
+  if(!PRESETS.length){ $("#presetCard").style.display="none"; return; }
+  $("#presetCard").style.display="";
+  $("#presetSel").innerHTML = PRESETS.map(p=>`<option value="${p.name}">${p.label}</option>`).join("");
+  $("#presetSel").value = PRESET;
+}
 
 function renderGraphs(){
   if(GRAPHS===null){ $("#graphsCard").style.display="none"; return; }
@@ -161,7 +183,8 @@ function render(){
 async function load(){
   const c = await (await fetch("/config")).json();
   FIELDS=c.fields; VALUES=c.values; dirty={}; GRAPHS=c.graphs; COSYMODEL=c.cosyModel||"v2"; SPLIT=!!c.split;
-  render(); renderGraphs(); renderModel(); renderSplit();
+  PRESET=c.preset||"nimbus"; PRESETS=c.presets||[];
+  render(); renderPreset(); renderGraphs(); renderModel(); renderSplit();
   $("#saveBtn").disabled=true; $("#msg").textContent="";
 }
 
@@ -240,6 +263,24 @@ $("#splitApply").addEventListener("click", async ()=>{
     $("#msg").textContent = r.message || (r.ok?"applied":"failed");
   }catch(e){ $("#msg").textContent="split request error"; }
   $("#splitApply").disabled=false; $("#splitApply").textContent="Apply + restart avatar";
+  refreshStatus();
+});
+
+$("#presetApply").addEventListener("click", async ()=>{
+  const name = $("#presetSel").value;
+  const p = PRESETS.find(x=>x.name===name) || {};
+  if(name===PRESET){ $("#msg").textContent="Preset already active ("+name+")"; return; }
+  if(!confirm("Switch avatar to \""+(p.label||name)+"\"? This relaunches CosyVoice -> avatar -> pipeline (~2-4 min; all three briefly stop), then open "+(p.page||"the page")+".")) return;
+  $("#presetApply").disabled=true; $("#presetApply").textContent="switching (~2-4 min)...";
+  $("#msg").textContent="applying preset: voice + portrait + language, relaunching all three...";
+  try{
+    const r = await (await fetch("/preset",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({preset:name})})).json();
+    if(r.preset) PRESET=r.preset;
+    await load();
+    $("#msg").textContent = (r.message || (r.ok?"applied":"failed")) + (r.ok&&p.page?("  -> open "+p.page):"");
+  }catch(e){ $("#msg").textContent="preset request error"; }
+  $("#presetApply").disabled=false; $("#presetApply").textContent="Apply preset";
   refreshStatus();
 });
 
