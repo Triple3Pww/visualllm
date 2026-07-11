@@ -63,6 +63,10 @@ The default stack is **3 processes** (TTS server + avatar server + pipeline). Se
 `.env` reference), and **`docs/PROBLEMS-AND-FIXES.md`** (every bug found + how it was
 fixed — read before re-debugging the avatar/audio).
 
+**New to the system?** Open **`learn/index.html`** — a four-module course that follows one turn
+through the stack (audio → streaming → model inference → GPU and A/V sync), each module ending on
+the real bug it explains. Runnable toys, stdlib Python, no GPU needed.
+
 **Quickest start:** double-click **`Run VisualLLm.exe`** in the repo root — it starts the WSL TTS,
 the avatar + pipeline, and the config panel, then opens the client. Press Enter in its window to stop
 everything. Manual version:
