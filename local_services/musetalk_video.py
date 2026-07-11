@@ -332,6 +332,19 @@ class MuseTalkVideoService(FrameProcessor):
                 await asyncio.sleep(0.5)
 
     # --- sync core --------------------------------------------------------
+    def _img_size(self, img: bytes) -> tuple[int, int]:
+        """Derive the (square) frame size from the RGB byte length so every OutputImageRawFrame
+        SELF-DESCRIBES its true dimensions. A fixed self._size crashes aiortc's VP8 sender
+        ('cannot reshape array of size N into (S,S,3)') the instant the avatar server and this
+        pipeline briefly disagree on frame size -- e.g. during a MUSETALK_SPLIT toggle, when the
+        server may still emit a 512 frame while the pipeline is configured for the 256 crop (or
+        vice-versa). That ValueError kills the video RTP task -> the avatar FREEZES for the rest of
+        the session (audio is a separate task and keeps working -> 'voice but no moving avatar').
+        Sizing from the bytes turns any such mismatch into a harmless transient, never a freeze."""
+        n = len(img) // 3
+        side = int(round(n ** 0.5))
+        return (side, side) if side > 0 and side * side == n else self._size
+
     async def _on_frame(self, img: bytes):
         """A rendered RGB frame from the server."""
         if self._flushing:
@@ -364,7 +377,7 @@ class MuseTalkVideoService(FrameProcessor):
                 logger.info(f"[avatar offset] {voice_s:0.1f}s in: lips {tag}")
         if not self._sync:
             await self.push_frame(
-                OutputImageRawFrame(image=img, size=self._size, format="RGB"),
+                OutputImageRawFrame(image=img, size=self._img_size(img), format="RGB"),
                 FrameDirection.DOWNSTREAM,
             )
             return
@@ -398,7 +411,7 @@ class MuseTalkVideoService(FrameProcessor):
                 if asyncio.get_running_loop().time() < self._suppress_until:
                     return
             await self.push_frame(
-                OutputImageRawFrame(image=img, size=self._size, format="RGB"),
+                OutputImageRawFrame(image=img, size=self._img_size(img), format="RGB"),
                 FrameDirection.DOWNSTREAM,
             )
 
@@ -465,7 +478,7 @@ class MuseTalkVideoService(FrameProcessor):
             self._aidx += 1
             await self.push_frame(af, ad)
         if i < len(self._vbuf):
-            fr = OutputImageRawFrame(image=self._vbuf[i], size=self._size, format="RGB")
+            fr = OutputImageRawFrame(image=self._vbuf[i], size=self._img_size(self._vbuf[i]), format="RGB")
             fr.sync_with_audio = True
             await self.push_frame(fr, FrameDirection.DOWNSTREAM)
 
@@ -506,7 +519,7 @@ class MuseTalkVideoService(FrameProcessor):
                 a = j / self._close_fade                    # linear: lands exactly on the rest pose
                 blended = ((1.0 - a) * last + a * rest).astype(np.uint8).tobytes()
                 await self.push_frame(
-                    OutputImageRawFrame(image=blended, size=self._size, format="RGB"),
+                    OutputImageRawFrame(image=blended, size=self._img_size(blended), format="RGB"),
                     FrameDirection.DOWNSTREAM)
                 await asyncio.sleep(interval)
         except Exception:  # noqa: BLE001 -- close polish only; never disrupt the next turn
