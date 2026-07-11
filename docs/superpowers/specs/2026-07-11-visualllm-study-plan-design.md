@@ -84,7 +84,7 @@ The full punch of P40 is preserved with the blank-file overload removed — v1 f
 
 ### Module structure (every module, in order)
 
-1. **Cold pretest (~10 min)** — predict answers *before any reading*, into `study/PREDICTIONS.md`.
+1. **Cold pretest (~10 min)** — predict answers *before any reading*, into `learn/PREDICTIONS.md`.
    Wrong guesses are the point (Finding 5).
 2. **Spaced interleaved retrieval (~10 min)** — cold questions drawn from *previous* modules, not
    this one (Finding 1). Module 1 skips this; it has no past.
