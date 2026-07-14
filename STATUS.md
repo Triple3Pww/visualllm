@@ -1,5 +1,33 @@
 # VisualLLm — Project Status & Next Steps
 
+_Last updated: 2026-07-15 (**23rd session continued — committed the audit fixes, a robustness batch, removed
+`/nimbus`, and re-measured the session-degradation bug. Branch `chore/cleanup-and-tts-merge`, still NOT
+merged/pushed.**
+
+**(0) Committed the prior audit work** (3 logical commits: the middleware-gate/WSL-restart/STT-raise/dead-code
+fixes; the launch.ps1 preset-page + WSL-log-tee fix; the reversed-P33/steady-sync doc corrections). **Live-verified
+the CREATE_NEW_CONSOLE fix for real**: `POST :7870/cosy-model {"model":"v2"}` completed clean (`{"ok": true}`),
+`:8001/health` came back 200, and `logs/cosyvoice_wsl.log` shows a full clean boot (model load, warmup, health
+checks) — the panel's WSL restart card, and by extension the CosyVoice-model/CUDA-graphs/Avatar-preset cards, work.
+**(1) Robustness batch** (`c48fcc5`): `_get_int()` env guard (a config-panel typo no longer crashes the pipeline
+at import); a `chunk_thai()` fallback for space-less Thai (closes the long-generation "alien warble" trigger for
+text without spaces); a 5s timeout on `_webrtc_probe.wait_ice`; `weather_chain_llm.py` now closes its httpx
+client on shutdown; the `/studio/` client tolerates a 5s `disconnected` blip instead of tearing down instantly.
+**(2) `/nimbus/` removed** (`71de080`) — it was a second, ~740-line verbatim JS copy of `/studio/` differing only
+in theme, so `/studio/` is now the single custom client for every avatar preset (the "nimbus" female-weather
+preset still exists, it just opens at `/studio/`). Live-verified after a pipeline restart: `GET /studio/` -> 200,
+`GET /nimbus/` -> 404, `GET /client/ice-config` -> 200.
+**(3) Session-degradation bug (CLAUDE.md / P-notes) re-measured with `OPENROUTER_MAX_TOKENS=500` live**: a
+5-turn same-question zh probe (35s inter-turn gap) showed **flat TTFO across all 5 turns (3.05/2.44/2.58/2.58/2.31s,
+no growth)**, and the two turns whose replies completed uninterrupted (1st and 5th — zh replies still run
+28-40s of audio even capped at 500 tokens, so 3 of 5 mid-session turns were self-interrupted by the next probed
+turn before their `lips start` line could log) also stayed flat (**+0.61s -> +0.51s**, no creep toward the
+documented +1.47s). **Read: degradation NOT reproduced in this run, MODERATE confidence** (only 2 of 5 turns
+have `lips start` data; a first-run attempt at 15s gaps was too short and produced overlapping/interrupted turns,
+discarded as low-confidence). Recommend a live-eye check for a fully confident verdict — the probe passes what
+the eye rejects (P19).)_
+<!-- prior handoff -->
+
 _Last updated: 2026-07-14 (**23rd session — LINE-BY-LINE DEAD-CODE AUDIT + the TTS server merged INTO this repo.
 −1670 lines. Two "dead knobs" turned out to be live BUGS. Branch `chore/cleanup-and-tts-merge`, NOT merged/pushed.**
 
