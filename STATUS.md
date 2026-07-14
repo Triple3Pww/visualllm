@@ -1,5 +1,98 @@
 # VisualLLm — Project Status & Next Steps
 
+_Last updated: 2026-07-14 (**22nd session — TTFO measured IN A REAL BROWSER for the first time; two levers shipped;
+one NEW unresolved bug found. Plus: the VAD is now panel-editable.**
+
+**(0) THE HEADLINE — a real-browser turn now reaches the ear in ~2.8–3.1s on a fresh session (was 3.69s).**
+Measured end-to-end with a real Chromium (WebRTC, real audio decode), timing **click → first voice onset** via the
+`MEASURE_BUTTON` + `CLIENT_PLAYOUT_PROBE` beacon — not a server-side stopwatch. Two levers, each verified in
+ISOLATION before being trusted in the pipeline:
+- **`OPENROUTER_PROVIDER_ONLY=Groq`** (was empty = unpinned). Isolated OpenRouter probe: TTFT **1.28s → 0.83s**, and
+  it stops bouncing between Groq/DeepInfra/Novita — which is where ALL the LLM variance came from. In-pipeline:
+  LLM TTFB **1.26s → 0.94s**, spread 0.51–1.78 → 0.92–1.03.
+- **zh leading-breath trim** (cosyvoice repo `290d17e`, `COSYVOICE_TRIM_LEAD=1`; **P34 is now FIXED**, having been
+  "accepted, no fix" since 2026-07-05). Probed against the TTS server directly: inaudible lead-in before the first
+  word **0.23s median (max 0.60) → a deterministic 0.03s**. Trim is **server-side on whole tensors** — the only safe
+  place; the old client-side byte trim crashed on aiohttp's odd chunks. Detect on **frame RMS, not per-sample abs**
+  (a breath spikes above any sample threshold while staying inaudible — a per-sample test left 0.35–0.46s in 3 of 8
+  pieces). **NEEDS YOUR EYE:** MuseTalk lip-syncs off a Whisper of the waveform, so this changes what Whisper sees at
+  turn start. The numbers cannot judge the first viseme. `COSYVOICE_TRIM_LEAD=0` reverts.
+
+**(1) NEW, UNRESOLVED — the avatar's turn-start silently gains ~1.0s after ~3 long turns, and never recovers.**
+Six consecutive turns: **3.02 → 3.09 → 2.74 → 3.75 → 3.68 → 4.37s**. It is a **step, not a ramp**: at turn 4 the
+avatar log jumps `lips start +0.48s → +1.47s` and stays. The buffer log shows why — audio piled up ahead of the render
+goes **2.9s → 4.2s** while video sits at 0.1s, and under `steady` the voice is paced to rendered frames, so it starts
+later. **Localized:** a **pipeline-only restart restores it** (same warm GPU, same avatar-server *process*) → it is
+accumulated **per-connection state, NOT GPU thermal**. Render is innocent (fps holds 12.0, `held/dup` 4/440). The
+obvious suspect — stale frames in `out_q` — is already handled (`speech_start` sets `seg_restart`, which drains it),
+so the culprit is elsewhere in the render/pump path. **NOT root-caused; I stopped rather than guess in the sync code.**
+Consequence that bites: **any median over a long session measures the drift, not the pipeline** — measure a FRESH one.
+Proposed next step: read-only server-side timing around the lead-gate fill (first audio byte of a turn → 14th frame in
+`out_q`, plus `out_q.qsize()` at turn start). No sync-path risk.
+
+**(2) The VAD is now editable in the config panel** (`0dc8e68`). `VAD_STOP_SECS` (curated) + `VAD_START_SECS` /
+`VAD_CONFIDENCE` / `VAD_MIN_VOLUME` (advanced). They were **hardcoded** in `stages/vad.py` — the one stage the panel
+could not reach — and are now `.env`-driven with the old values as defaults (behavior unchanged until edited).
+`build_vad_params()` now logs the live values. **Honest scope:** with `ALLOW_INTERRUPTIONS=1` (baseline) pipecat's
+DEFAULT turn strategies apply, and the log shows end-of-**turn** is called by `TurnAnalyzerUserTurnStopStrategy`
+(Smart Turn v3) — the VAD only feeds it. So the knob *shapes* responsiveness, it doesn't dictate it. And it never
+shows in TTFO, whose t0 IS the turn-end.
+
+**(3) TWO MEASUREMENT TRAPS, documented so they are not re-paid.** Both produced confident, wrong numbers:
+- **Chromium throttles `requestAnimationFrame` to ~1 Hz in an occluded window**, quantizing every browser-side onset
+  to ~1.01s multiples — three turns with very different upstream cost all reported *exactly* 5050ms. Launch with
+  `--disable-backgrounding-occluded-windows` (+ `--disable-background-timer-throttling`).
+- **Deepgram drops the head character of a short clip with no lead-in silence**, which looks EXACTLY like the trim
+  clipping the first phoneme. `人工智慧很簡單` came back as `工智慧很簡`. Pad silence and re-transcribe before
+  concluding — it then returns in full.
+- Also: the synthetic mic wavs `_zh_q_wx/_def/_why` each hold **TWO utterances**, so under `ALLOW_INTERRUPTIONS=1`
+  the mic **barges in on itself** and kills the turn before TTS ever runs (`TTFO summary: {'count': 0}`). Use
+  `output/_zh_q.wav` (single utterance).
+
+**Also:** `LLM_PROVIDER` is now **`openrouter`** in `.env` (was `weather_chain`, whose remote NCU hop cost 1.5–4.8s and
+carried all the variance). `.env` is git-ignored, so that is a live-machine state, not a commit. `scripts/measure.py
+--from-browser` is **broken** for this path — it finds no `Bot started speaking` within 6s of the beacon, silently
+falls back to a stale `[TTFO]` turn, and emits a fabricated `+247.98s` row. It should refuse instead.
+**Commits:** cosyvoice `290d17e`; VisualLLm `05f5001` (P34 + baseline docs), `0dc8e68` (VAD panel).)_
+<!-- prior handoff -->
+
+_Last updated: 2026-07-11 (**21st session — LINE-BY-LINE CODE AUDIT. Found + fixed a bug that was corrupting
+every chat bubble, plus the duplicate-bubble race and 5 latent defects. UNCOMMITTED; needs a pipeline restart.**
+
+**(1) THE ONE THAT MATTERED — `docs/PROBLEMS-AND-FIXES.md` P45.** The `/nimbus` + `/studio` transcript observer
+deduped frames on **`id(frame)`** — a CPython **memory address**, which is recycled the instant a frame is freed. New
+tokens landed on dead frames' addresses and were **silently dropped from the bubble**: `自然語言處理` → `自言處理`,
+`醫療保健` → `療保健`, `AI正在` → `A在`. **The voice was always perfect** (TTS reads the frames itself; the observer is
+a read-only tap), so a bubble missing one character just read as a mediocre LLM — it hid for weeks. Fix = pipecat's own
+monotonic **`frame.id`** + reset `_seen` per turn (it also grew unbounded). Verified with a harness against the real
+observer: **53/53 chars lost → 0 lost**, dedupe still holds. **If you have been judging model quality off the chat
+bubbles, re-judge it — the text you were reading was damaged.**
+
+**(2) Duplicate bubbles — P46.** Two independent causes. **A (client bug, FIXED):** `setInterval(pollTranscript, 200)`
+had no re-entrancy guard and `transcriptSeq` advanced only after a response landed, so a >200 ms browser main-thread
+hitch sent the next poll out with the **stale `since`** → the server returned the same rows to both → **identical bubble
+twice**. Fixed with an in-flight flag + an idempotent `it.seq > transcriptSeq` render, in BOTH clients; static files, so
+a **page reload** is enough. **B (environment, NOT a bug):** the live mic is transcribing the avatar's own voice off the
+speakers — every committed "user" turn on speakers is junk (`奶奶有皮革戀愛`, `Payment pin pop.`), each a **real extra
+turn** → junk query bubble + a real reply, and with `ALLOW_INTERRUPTIONS=1` (P44) it **truncates the bot mid-sentence**
+(145 interrupts logged). That is the standing `ECHO_GUARD=0` tradeoff: **headphones**, or the mic-Mute button, or a
+~5-line client-side auto-mute-while-bot-speaks (kills barge-in). **Open question for the user.**
+
+**(3) Five latent defects — P47.** `_active_task = None` released without an ownership guard (a late zombie disconnect
+would 409 the live session's typed turns); `_cloudflare_turn` did a **blocking 8 s `urlopen` ON THE MEDIA EVENT LOOP**
+(would freeze a live call's audio+video; now cache-first + thread-refresh + negative cache → measured 0.0006 s);
+the MuseTalk pump **half-applied** the client's `config` fps (rendered at the client's rate, emitted at the server env's
+→ silent A/V drift, reachable via the config panel's `MUSETALK_FPS` card); a loguru `%`-style call made the
+`MUSETALK_GPU_COMPOSITE` CPU-fallback warning print **literal `%s`** (check it after the Leo portrait swap — the
+fallback is portrait-dependent and was effectively silent); `write_env` could **weld two `.env` keys together** when
+appending a key that is not already in the file (the preset / cosy-model / avatar-split buttons do exactly that).
+
+**Files:** `pipeline/main.py`, `local_services/musetalk_server/app.py`, `local_services/musetalk_video.py`,
+`local_services/config_panel/server.py`, `local_services/{nimbus_client,studio_client}/index.html`, `.env` (one stale
+comment), `docs/PROBLEMS-AND-FIXES.md` (P45–P47). `python -m scripts.preflight` → no drift. **NOT committed.**
+**The pipeline must be RESTARTED for (1) and (3) to be live; (2)'s client half only needs a page reload.**)_
+<!-- prior handoff -->
+
 _Last updated: 2026-07-11 (**PUBLIC LINK anyone can use — no Tailscale, no signup. VERIFIED LIVE.**
 The front door moved from Tailscale Funnel (stopped working) to a **Cloudflare quick tunnel**
 (`scripts/tunnel.ps1`, auto-started by `launch.ps1` step [4/5]; random `trycloudflare.com` URL). `.env`

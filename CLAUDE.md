@@ -158,6 +158,16 @@ Python: `python -m local_services.config_panel.server`. Its Restart kills `:7860
 `TerminateProcess` (NOT `taskkill`/PowerShell — those hang for tens of seconds under CPU load here). It also
 hosts the **"Avatar preset"** card (swap the whole avatar identity — Nimbus female / Leo his-face-and-voice; see the
 `/studio/` + presets note under Architecture) alongside the CosyVoice-model, CUDA-graphs, and Avatar-output cards.
+It also exposes the **VAD** knobs (2026-07-14) — `VAD_STOP_SECS` (curated) + `VAD_START_SECS`/`VAD_CONFIDENCE`/
+`VAD_MIN_VOLUME` (advanced). These were **hardcoded** in `stages/vad.py` (the one stage the panel couldn't reach);
+they are now `.env`-driven like everything else, with the old values as defaults, and `build_vad_params()` **logs the
+live values** (`VAD: stop=… start=… …`) so you can confirm a panel edit took effect. **Scope, so the knob isn't
+over-trusted:** under the baseline `ALLOW_INTERRUPTIONS=1`, `main.py` passes NO `user_turn_strategies`, so pipecat's
+defaults apply and end-of-**turn** is called by `TurnAnalyzerUserTurnStopStrategy` (**Smart Turn v3**, semantic) — the
+VAD only supplies the speech segmentation it runs on. So `VAD_STOP_SECS` *shapes* responsiveness, it does not dictate
+it. And none of it ever appears in TTFO, whose **t0 IS the turn-end** — it is latency the user feels but the metric
+cannot see. (Log quirk: on the FIRST connection of a process that `VAD:` line goes to stdout only — the file sink
+attaches later — so look for it on a subsequent connection.)
 
 **MOSS-TTS-Realtime (`TTS_PROVIDER=moss`):** a streaming server (`local_services/moss_server/app.py`,
 `moss-tts` conda env) speaking the SAME `/tts/stream` raw-PCM contract as CosyVoice, so it reuses the
@@ -167,6 +177,13 @@ sentence-length, felt as between-sentence stalls. Launch recipe (incl. the `CC`/
 ffmpeg-7/`nvidia-npp`/`LD_LIBRARY_PATH` fixes) is in the server's module docstring.
 
 Core `.env` knobs: `LANGUAGE` (en/zh/th), `TTFO_TARGET_SECONDS`, `TTS_PROVIDER`,
+`VAD_STOP_SECS`/`VAD_START_SECS`/`VAD_CONFIDENCE`/`VAD_MIN_VOLUME` (**0.5/0.2/0.7/0.6**, Silero; panel-editable —
+see the config-panel note above for what they do and do NOT control),
+`COSYVOICE_TRIM_LEAD` (**1 = default, in the cosyvoice repo**: strips the inaudible leading breath CosyVoice
+prepends to every zh piece — 0.23s median, up to 0.60s of pure TTFO dead time. Server-side, on whole tensors, which is
+the ONLY safe place (the client-side byte-stream trim crashed — P34). `0` reverts. **Wants an eye check:** MuseTalk
+lip-syncs off a Whisper of the waveform, so this changes what Whisper sees at turn start; the probes cannot judge the
+first viseme),
 `COSYVOICE_MODEL` (**`v3`** = current baseline, Fun-CosyVoice3-0.5B, +flow-decoder TRT + CUDA graphs; `v2` =
 CosyVoice2-0.5B. Read by `run_vllm_server.sh` + the launcher; the v3 block also defaults `COSYVOICE_FLOW_TRT=1`.
 Switchable in the config panel's **CosyVoice model** card, which relaunches the WSL TTS server — a plain `.env` edit
