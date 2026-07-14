@@ -156,15 +156,14 @@ class MuseTalkVideoService(FrameProcessor):
         # --- smooth end-of-turn close (steady) ---
         # MuseTalk can't ease the mouth shut itself (silence renders a PARTED mouth, not closed
         # lips -- measured), so at end of turn we cross-dissolve the last spoken frame -> the rest
-        # pose over K frames. To survive steady's NON-LIVE transport (which drops audio-less
-        # trailing frames) each close frame is paired with one frame of trailing SILENCE and pushed
-        # through the SAME _emit_pair path as every speech frame. Gated by MUSETALK_CLOSE_FADE_FRAMES
-        # (0 = off, the old clean snap). Use with MUSETALK_END_TAIL_FRAMES=0 so the last buffered
-        # frame is the last SPOKEN frame, not a neutral tail copy.
+        # pose over K frames. Those frames are pushed FREE-RUN (untagged, like the idle loop) by
+        # _play_close_fade, NOT paired with silence through _emit_pair -- the audio-cap in _advance
+        # would strand them whenever the render fell behind the voice. Gated by
+        # MUSETALK_CLOSE_FADE_FRAMES (0 = off, the old clean snap). Use with
+        # MUSETALK_END_TAIL_FRAMES=0 so the last buffered frame is the last SPOKEN frame, not a
+        # neutral tail copy.
         self._close_fade = int(os.getenv("MUSETALK_CLOSE_FADE_FRAMES", "0") or "0")
         self._rest_frame: bytes | None = None   # cached between-turn rest pose (crossfade target)
-        self._tts_sr = MUSETALK_SR              # last turn's TTS sample rate (for the silence pad)
-        self._tts_ch = 1
         self._suppress_until = 0.0              # drop server idle frames until here so they can't
         #   preempt the crossfade playout (the burst-flush collapse P12 hit)
 
@@ -696,7 +695,6 @@ class MuseTalkVideoService(FrameProcessor):
         elif isinstance(frame, TTSAudioRawFrame):
             sr = getattr(frame, "sample_rate", MUSETALK_SR) or MUSETALK_SR
             ch = getattr(frame, "num_channels", 1) or 1
-            self._tts_sr, self._tts_ch = sr, ch   # for the close crossfade's silence pad
             dur = (len(frame.audio) // (2 * ch)) / sr
             if self._t_audio_first is None:   # first voice chunk of the turn = audio start
                 self._t_audio_first = asyncio.get_running_loop().time()

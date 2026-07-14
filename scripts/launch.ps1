@@ -22,7 +22,14 @@
 param(
     [string]$MusetalkPython = "E:\miniconda3\envs\musetalk\python.exe",
     [string]$WslDistro      = "Ubuntu",
-    [string]$CosyRunScript  = "/mnt/e/Claude/cosyvoice-local-tts/run_vllm_server.sh"
+    [string]$CosyRunScript  = "/mnt/e/Claude/cosyvoice-local-tts/run_vllm_server.sh",
+    # The avatar-preset voice file the config panel writes (COSYVOICE_PROMPT_WAV/TEXT for the
+    # active preset). We SOURCE it before launching CosyVoice so a plain launch uses the preset's
+    # cloned voice -- without this, launch.ps1 started the engine with NO prompt env, so it fell
+    # back to the default pro_ref.wav (= the Nimbus voice) even when the Leo preset was active:
+    # "Leo face, Nimbus voice". The config panel's restart_cosyvoice already sources this; the
+    # launcher did not. WSL path.
+    [string]$CosyVoiceEnv   = "/mnt/e/Claude/cosyvoice-local-tts/.preset_voice.env"
 )
 
 $ErrorActionPreference = "Stop"
@@ -44,6 +51,24 @@ function Get-EnvVal([string]$key) {
 function Test-Url([string]$u) {
     try { return ((Invoke-WebRequest -Uri $u -TimeoutSec 3 -UseBasicParsing -DisableKeepAlive).StatusCode -eq 200) }
     catch { return $false }
+}
+
+# Best-effort tailnet hostname (this machine's MagicDNS name, e.g. porsche-pc.tail21bb8a.ts.net)
+# so the summary can print the tailnet config-panel URL. Returns $null if tailscale isn't
+# installed/logged-in -- callers must tolerate that (never fail the launch on it).
+function Get-TailnetHost {
+    $exe = (Get-Command tailscale -ErrorAction SilentlyContinue).Source
+    if (-not $exe) {
+        $known = "C:\Program Files\Tailscale\tailscale.exe"
+        if (Test-Path $known) { $exe = $known }
+    }
+    if (-not $exe) { return $null }
+    try {
+        $j = & $exe status --json 2>$null | ConvertFrom-Json
+        $name = $j.Self.DNSName
+        if ($name) { return $name.TrimEnd('.') }   # DNSName carries a trailing dot
+    } catch { }
+    return $null
 }
 
 # Stop whatever LISTENS on a port (best-effort shutdown). Uses native netstat,
@@ -81,11 +106,15 @@ if ($ttsProvider -eq "cosyvoice" -and $cosyUrl) {
         # COSYVOICE_MODEL (.env) selects the model: v2 (default) or v3 (Fun-CosyVoice3-0.5B).
         # Forwarded as an env prefix; run_vllm_server.sh expands it into MODEL_DIR + PROMPT_TEXT.
         $cosyModel = Get-EnvVal "COSYVOICE_MODEL"
+        # Source the active preset's voice file first (set -a auto-exports COSYVOICE_PROMPT_WAV/TEXT
+        # to the bash-script child) so the launcher honors the selected voice, same as the config
+        # panel's restart_cosyvoice. No-op if the file doesn't exist (never applied a preset).
+        $src = "set -a; [ -f $CosyVoiceEnv ] && . $CosyVoiceEnv; set +a; "
         if ($cosyModel) {
             Write-Host "  COSYVOICE_MODEL=$cosyModel" -ForegroundColor DarkGray
-            $inner = "COSYVOICE_MODEL=$cosyModel bash $CosyRunScript"
+            $inner = "$src COSYVOICE_MODEL=$cosyModel bash $CosyRunScript"
         } else {
-            $inner = "bash $CosyRunScript"
+            $inner = "$src bash $CosyRunScript"
         }
         $cmd = ('-d {0} -e bash -c "{1}"' -f $WslDistro, $inner)
         $startedWsl = Start-Process -FilePath "wsl.exe" -ArgumentList $cmd -PassThru
@@ -166,10 +195,17 @@ Write-Host "   VisualLLm is RUNNING"                          -ForegroundColor G
 Write-Host "===============================================" -ForegroundColor Green
 Write-Host "  Client      : http://localhost:7860/client/"
 Write-Host "  Config panel: http://localhost:7870"
+# Tailnet URL for the config panel (tailscale serve :8444 -> 7870). Tailnet-only by design: the
+# panel is UNAUTHENTICATED and can rewrite .env + restart/run processes, so it is deliberately NOT
+# on the public Cloudflare tunnel. Reach it from another device by joining this tailnet.
+$tnet = Get-TailnetHost
+if ($tnet) {
+    Write-Host "  Config (remote): https://${tnet}:8444  (tailnet only -- do NOT expose publicly)" -ForegroundColor DarkCyan
+}
 if ($tunnel -and $tunnel.Url) {
     Write-Host "  PUBLIC link : $($tunnel.Url)$($tunnel.ClientPath)  <-- share this" -ForegroundColor Green
 } else {
-    Write-Host "  PUBLIC link : (not up -- check logs\cloudflared.log)" -ForegroundColor Yellow
+    Write-Host "  PUBLIC link : (not up -- check logs\cloudflared.err.log)" -ForegroundColor Yellow
 }
 Write-Host "  Logs        : $logs"
 Write-Host ""

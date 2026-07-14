@@ -828,13 +828,28 @@
 
     // Poll the server transcript for new lines (bot replies + finalized user speech) -> bubbles,
     // plus the in-progress user utterance (STT interim) -> the live bubble.
+    //
+    // DUPLICATE BUBBLES (fixed): this used to be setInterval(poll, 200) with `transcriptSeq`
+    // advanced only AFTER a response landed. `transcriptSeq` is read when the fetch is ISSUED, so
+    // if one poll hadn't resolved within 200ms -- a main-thread hitch is routine here: full-screen
+    // video decode + the rAF audio analyser + DOM writes -- the next poll went out carrying the
+    // SAME stale `since`, the server (correctly) returned the same rows to both, and BOTH rendered
+    // them: the identical bubble, twice. Two guards, because either alone is enough and together
+    // they make it impossible:
+    //   1. `polling` -- never have two polls in flight (the race can't start).
+    //   2. `it.seq > transcriptSeq` -- render only rows we have not rendered, so even a duplicate
+    //      response is a no-op (the render is idempotent).
+    let polling = false;
     async function pollTranscript() {
+      if (polling) return;                 // guard 1: a poll is still in flight
+      polling = true;
       try {
         const r = await fetch('/client/transcript?since=' + transcriptSeq);
         if (r.ok) {
           const data = await r.json();
           let committedUser = false;
           for (const it of (data.items || [])) {
+            if (it.seq <= transcriptSeq) continue;   // guard 2: already rendered -> skip
             transcriptSeq = it.seq;
             if (it.role === 'bot') addBotMessage(it.text);
             else if (it.role === 'user') { removeLiveBubble(); addUserMessage(it.text); committedUser = true; }  // voice turns (typed are echoed already)
@@ -842,8 +857,9 @@
           updateLivePartial(committedUser ? null : data.partial);
         }
       } catch (_) { /* transient; keep polling */ }
+      finally { polling = false; }
     }
-    function startPolling() { if (!pollTimer) pollTimer = setInterval(pollTranscript, 200); }
+    function startPolling() { if (!pollTimer) { polling = false; pollTimer = setInterval(pollTranscript, 200); } }
     function stopPolling()  { if (pollTimer) { clearInterval(pollTimer); pollTimer = 0; } }
 
     function iceComplete(pc) {

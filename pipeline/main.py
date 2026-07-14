@@ -179,9 +179,14 @@ async def run_bot(transport: BaseTransport, conn=None) -> None:
     @transport.event_handler("on_client_disconnected")
     async def _on_disconnected(transport, client):
         global _active_task, _active_connection
-        _active_task = None
-        # Only release the single-connection slot if it's still ours -- a newer client
-        # may have already claimed it (then this disconnect is us being kicked).
+        # Only release EITHER global if it is still OURS -- a newer client may have already
+        # claimed the slot (then this disconnect is us being kicked). The task global used to be
+        # nulled unconditionally: a zombie session whose disconnect lands LATE (an ICE timeout
+        # from a tab closed without a clean teardown) would then wipe the task of the LIVE session
+        # that replaced it -> /client/say + /client/measure-turn answer 409 "no active session"
+        # while the avatar is visibly working.
+        if _active_task is task:
+            _active_task = None
         if _active_connection is conn:
             _active_connection = None
         logger.info(f"Client disconnected. TTFO summary: {meter.summary()}")
@@ -443,11 +448,20 @@ def _make_transcript_observer(store: "_TranscriptStore"):
             super().__init__()
             self._buf = ""    # bot reply, accumulated between LLMFullResponseStart/End
             self._user = ""   # user turn, accumulated across STT segments until the bot replies
-            self._seen = set()  # dedupe: observers can see a frame pushed by multiple processors
+            # Dedupe: one frame OBJECT is pushed by several processors in turn, so the observer
+            # sees it more than once and would append its text twice. Key on pipecat's own
+            # `frame.id` (a monotonic per-frame counter) -- NEVER on `id(frame)`, which is the
+            # MEMORY ADDRESS: CPython hands a freed frame's address straight back to the next
+            # frame it allocates, so a brand-new token would hit this set and be silently DROPPED
+            # from the bubble. That is exactly what happened (verified in pipeline.log: 自然語言處理
+            # committed as 自言處理, 醫療保健 as 療保健 -- single chars deleted at random). The voice
+            # was always fine (TTS reads the frames itself; this tap only feeds the chat bubbles),
+            # which is why a corrupt transcript read as a mediocre LLM for weeks.
+            self._seen: set[int] = set()
 
         async def on_push_frame(self, data):
             frame = data.frame
-            fid = id(frame)
+            fid = frame.id
             if fid in self._seen:
                 return
             if isinstance(frame, LLMFullResponseStartFrame):
@@ -468,6 +482,10 @@ def _make_transcript_observer(store: "_TranscriptStore"):
                 self._buf = ""
                 store.clear_partial()  # backstop: drop any partial that never got a bot reply
                 self._seen.add(fid)
+                # Bound the dedupe set: frame ids are monotonic and never reused, so ids from a
+                # FINISHED turn can never collide with a future frame -- keeping them would just
+                # grow the set (one int per frame) for the whole process lifetime.
+                self._seen = {fid}
             elif isinstance(frame, InterimTranscriptionFrame):
                 # In-progress segment: show finalized-so-far + this live interim in the bubble.
                 interim = (frame.text or "").strip()
@@ -1105,10 +1123,47 @@ def _restrict_ice_to_subnet() -> None:
 
 
 _cf_turn_cache: dict = {"exp": 0.0, "js": None, "rtc": None}
+_cf_refreshing = False   # a background refresh is in flight (don't stack them)
 
 
 def _cloudflare_turn():
+    """NON-BLOCKING accessor for the Cloudflare relay. Returns the cached (js, rtc) entry.
+
+    Why this is not just `_cf_fetch()`: the fetch is a synchronous urlopen with an 8s timeout, and
+    its two callers -- the GET /client/ice-config middleware and the patched
+    SmallWebRTCConnection.__init__ (built while handling POST /api/offer) -- both run on THE SAME
+    asyncio loop that carries aiortc's RTP media and the pipecat pipeline. Calling it there stalled
+    the WHOLE LOOP: no packets out, no audio pumped -- a live call's voice and avatar freeze for up
+    to 8s. Worse, a FAILED fetch cached nothing, so a dead endpoint was re-probed (and re-blocked)
+    on every single request.
+
+    So: never fetch on the loop. Serve the cache immediately (Cloudflare's creds outlive our 5-min
+    cache window, so a slightly stale entry is still a working relay) and refresh in a THREAD when
+    it ages out. A cold cache costs that ONE connection its relay (silent STUN-only fallback, the
+    pre-existing failure mode) and self-heals for the next. Startup has no running loop, so the
+    prime in _install_turn_ice_servers still fetches inline -- which is exactly where blocking is
+    free."""
+    global _cf_refreshing
+    if time.time() >= _cf_turn_cache["exp"] and not _cf_refreshing:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return _cf_fetch()   # no loop yet (startup prime): blocking here is safe
+        _cf_refreshing = True
+
+        def _done(_fut):
+            global _cf_refreshing
+            _cf_refreshing = False
+
+        loop.run_in_executor(None, _cf_fetch).add_done_callback(_done)
+    return _cf_turn_cache["js"], _cf_turn_cache["rtc"]
+
+
+def _cf_fetch():
     """Fetch FRESH Cloudflare TURN credentials with NO signup/account.
+
+    BLOCKING (synchronous urlopen). Call it from a thread or before the loop starts -- never from
+    the event loop itself; go through _cloudflare_turn() above.
 
     Cloudflare's speed test exposes a relay-credential endpoint (turn.cloudflare.com) that
     hands out short-lived username/credential pairs to any browser-style caller (a Referer
@@ -1117,14 +1172,11 @@ def _cloudflare_turn():
     relay candidate on turn:3478 udp/tcp AND turns:5349 TLS, the firewall-proof one).
 
     Returns (js_entry: dict, rtc_entry: RTCIceServer) or (None, None) on any failure -> the
-    caller silently degrades to STUN-only. Cached ~5 min (well under the credential TTL) so we
+    caller silently degrades to STUN-only. Caches ~5 min (well under the credential TTL) so we
     don't hammer the endpoint. Best-effort by nature (undocumented endpoint); the drop-in
     upgrade is an official Cloudflare Realtime TURN key -> same turn.cloudflare.com servers,
     set TURN_URLS/TURN_USERNAME/TURN_CREDENTIAL instead and this path is bypassed."""
-    import time
     now = time.time()
-    if _cf_turn_cache["js"] and now < _cf_turn_cache["exp"]:
-        return _cf_turn_cache["js"], _cf_turn_cache["rtc"]
     try:
         import json as _json
         import urllib.request
@@ -1136,16 +1188,19 @@ def _cloudflare_turn():
         urls = [u for u in data.get("urls", []) if u.startswith(("turn:", "turns:"))]
         user, cred = data.get("username"), data.get("credential")
         if not urls or not user or not cred:
-            logger.warning("Cloudflare TURN: endpoint returned no usable creds; relay unavailable.")
-            return None, None
+            raise RuntimeError("endpoint returned no usable creds")
         from aiortc import RTCIceServer
         js = {"urls": urls, "username": user, "credential": cred}
         rtc = RTCIceServer(urls=urls, username=user, credential=cred)
         _cf_turn_cache.update(exp=now + 300, js=js, rtc=rtc)
         return js, rtc
     except Exception as e:  # noqa: BLE001
+        # NEGATIVE cache: back off 30s. Without it a dead endpoint was re-fetched on EVERY
+        # request. Keep any previously-good creds -- they outlive our cache window, so a stale
+        # relay still beats no relay.
+        _cf_turn_cache["exp"] = max(_cf_turn_cache["exp"], now + 30)
         logger.warning(f"Cloudflare TURN fetch failed ({e!r}); relay unavailable this attempt.")
-        return None, None
+        return _cf_turn_cache["js"], _cf_turn_cache["rtc"]
 
 
 def _install_turn_ice_servers() -> None:

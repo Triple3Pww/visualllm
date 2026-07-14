@@ -795,13 +795,23 @@
 
     // Poll the server transcript for new lines (bot replies + finalized user speech) -> bubbles,
     // plus the in-progress user utterance (STT interim) -> the live bubble.
+    // DUPLICATE BUBBLES (fixed -- same as /nimbus): setInterval fires every 200ms whether or not
+    // the previous poll resolved, and `transcriptSeq` is read when the fetch is ISSUED. One
+    // main-thread hitch (video decode / rAF analyser / DOM) and the next poll goes out with the
+    // SAME stale `since`; the server returns the same rows to both, and BOTH render them -> the
+    // identical bubble twice. Guard 1: never two polls in flight. Guard 2: only render rows newer
+    // than what we already rendered, so a duplicate response is a no-op.
+    let polling = false;
     async function pollTranscript() {
+      if (polling) return;                 // guard 1: a poll is still in flight
+      polling = true;
       try {
         const r = await fetch('/client/transcript?since=' + transcriptSeq);
         if (r.ok) {
           const data = await r.json();
           let committedUser = false;
           for (const it of (data.items || [])) {
+            if (it.seq <= transcriptSeq) continue;   // guard 2: already rendered -> skip
             transcriptSeq = it.seq;
             if (it.role === 'bot') addBotMessage(it.text);
             else if (it.role === 'user') { removeLiveBubble(); addUserMessage(it.text); committedUser = true; }
@@ -809,8 +819,9 @@
           updateLivePartial(committedUser ? null : data.partial);
         }
       } catch (_) { /* transient; keep polling */ }
+      finally { polling = false; }
     }
-    function startPolling() { if (!pollTimer) pollTimer = setInterval(pollTranscript, 200); }
+    function startPolling() { if (!pollTimer) { polling = false; pollTimer = setInterval(pollTranscript, 200); } }
     function stopPolling()  { if (pollTimer) { clearInterval(pollTimer); pollTimer = 0; } }
 
     function iceComplete(pc) {

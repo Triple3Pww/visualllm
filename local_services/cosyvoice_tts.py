@@ -30,7 +30,6 @@ class CosyVoiceTTSService(TTSService):
         self,
         *,
         base_url: str,
-        voice: str = "weather",          # the server's registered female zero-shot speaker
         sample_rate: int = 24000,
         **kwargs,
     ):
@@ -45,7 +44,6 @@ class CosyVoiceTTSService(TTSService):
             **kwargs,
         )
         self._base_url = base_url.rstrip("/")
-        self._voice = voice
         self._session: aiohttp.ClientSession | None = None
 
         # TTFO knob: emit a short opening clause first so the bot starts speaking ~0.8s
@@ -87,9 +85,10 @@ class CosyVoiceTTSService(TTSService):
         try:
             await self.start_ttfb_metrics()
             session = await self._get_session()
+            # No `voice`: the server ignores it (one registered reference voice, set by
+            # COSYVOICE_PROMPT_WAV/TEXT). Its request field defaults, so omitting it is safe.
             payload = {
                 "text": text,
-                "voice": self._voice,
                 "sample_rate": self.sample_rate,
             }
             async with session.post(f"{self._base_url}/tts/stream", json=payload) as resp:

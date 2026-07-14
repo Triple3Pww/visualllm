@@ -51,21 +51,37 @@ if (Test-Path $envFile) {
 }
 $clientPath = if ($preset -eq "leo") { "/studio/" } else { "/nimbus/" }
 
-# Fresh log so we only parse THIS run's URL, then start the tunnel detached.
-Set-Content -Path $log -Value "" -Encoding ascii
-$args = @("tunnel", "--no-autoupdate", "--url", ("http://localhost:{0}" -f $Port))
-$proc = Start-Process -FilePath $exe -ArgumentList $args -NoNewWindow -PassThru `
-    -RedirectStandardOutput $log -RedirectStandardError (Join-Path $logs "cloudflared.err.log")
+# Only one quick tunnel should exist, and a lingering cloudflared from a previous session keeps
+# logs\cloudflared.log OPEN -- then Set-Content below throws (ErrorAction Stop) and the whole
+# script aborts BEFORE starting the tunnel, so the launcher reports "not up" even though the URL
+# was available (the real "PUBLIC link not up" bug). Kill any stale cloudflared first: it frees
+# the log AND prevents a second, stale tunnel. (This box uses cloudflared only for this.)
+Get-Process -Name cloudflared -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Start-Sleep -Milliseconds 400   # let the OS release the file handles before we truncate the logs
 
-Write-Host "Starting Cloudflare quick tunnel to http://localhost:$Port ..." -ForegroundColor Cyan
+$errLog = Join-Path $logs "cloudflared.err.log"
+# Fresh logs so we only ever parse THIS run's URL (cloudflared APPENDS; it writes the banner to
+# STDERR, so the err log is the one that matters). Best-effort truncate -- never abort on a lock.
+foreach ($f in @($log, $errLog)) { try { Set-Content -Path $f -Value "" -Encoding ascii -ErrorAction Stop } catch { } }
 
-# Poll the log for the assigned trycloudflare URL (~30s budget; cloudflared prints it in a banner).
+# --url 127.0.0.1 (NOT localhost): on Windows cloudflared resolves "localhost" to ::1 (IPv6) FIRST,
+# but the pipeline binds IPv4 -- so every request 502'd ("dial tcp [::1]:7860: refused" in the log)
+# and the public link, even when shown, reached nothing. 127.0.0.1 forces IPv4. (Same fix run.ps1
+# already applies to its health probes.)
+$cfArgs = @("tunnel", "--no-autoupdate", "--url", ("http://127.0.0.1:{0}" -f $Port))
+$proc = Start-Process -FilePath $exe -ArgumentList $cfArgs -NoNewWindow -PassThru `
+    -RedirectStandardOutput $log -RedirectStandardError $errLog
+
+Write-Host "Starting Cloudflare quick tunnel to http://127.0.0.1:$Port ..." -ForegroundColor Cyan
+
+# Poll for the assigned trycloudflare URL (~30s budget; cloudflared prints it to STDERR). Take the
+# LAST match so a stale line can never win (logs are freshly cleared, but stay safe).
 $url = $null
 for ($i = 0; $i -lt 60; $i++) {
     Start-Sleep -Milliseconds 500
-    foreach ($file in @($log, (Join-Path $logs "cloudflared.err.log"))) {
+    foreach ($file in @($errLog, $log)) {
         if (Test-Path $file) {
-            $hit = Select-String -Path $file -Pattern 'https://[-a-z0-9]+\.trycloudflare\.com' -ErrorAction SilentlyContinue | Select-Object -First 1
+            $hit = Select-String -Path $file -Pattern 'https://[-a-z0-9]+\.trycloudflare\.com' -ErrorAction SilentlyContinue | Select-Object -Last 1
             if ($hit) { $url = $hit.Matches[0].Value; break }
         }
     }

@@ -67,7 +67,8 @@ IMAGE_SIZE = int(os.getenv("MUSETALK_SIZE", "512"))   # output frame is SIZE x S
 AUDIO_SR = 16000                                       # Whisper expects 16 kHz
 DEFAULT_FPS = int(os.getenv("MUSETALK_FPS", "20"))  # ~32ms/frame GPU floor -> 20fps keeps realtime headroom
 SEG_FRAMES = int(os.getenv("MUSETALK_SEG_FRAMES", "8"))   # frames per UNet segment
-IDLE_FPS = int(os.getenv("MUSETALK_IDLE_FPS", "10"))       # neutral-frame rate between turns
+# (no MUSETALK_IDLE_FPS: the pump plays idle frames at the main fps, so a separate idle rate was
+#  read but never used -- an inert knob that looked live. Removed rather than left to mislead.)
 BATCH_SIZE = int(os.getenv("MUSETALK_BATCH", "8"))
 PAD_LEFT = int(os.getenv("MUSETALK_PAD_LEFT", "2"))
 PAD_RIGHT = int(os.getenv("MUSETALK_PAD_RIGHT", "2"))
@@ -559,8 +560,12 @@ class MuseTalkEngine:
             H, W = frame.shape[:2]
             x_s, y_s, x_e, y_e = cb
             if x_s < 0 or y_s < 0 or x_e > W or y_e > H:
+                # f-string, NOT %-args: loguru formats with str.format(), so a %-style message
+                # prints its placeholders LITERALLY and silently discards the values -- and this is
+                # the only line that tells you why MUSETALK_GPU_COMPOSITE=1 fell back to the (6x
+                # slower) CPU composite.
                 logger.warning(
-                    "GPU composite disabled: crop_box %s off frame %dx%d; using CPU path.", cb, W, H
+                    f"GPU composite disabled: crop_box {cb} off frame {W}x{H}; using CPU path."
                 )
                 return
         # base frames as RGB[0,1] (cv2 gives BGR); masks as [0,1] alpha -- all on GPU, once.
@@ -742,7 +747,6 @@ async def stream(ws: WebSocket):
         ready. When idle (between turns) we play a gentle breathing loop so the
         face stays alive instead of freezing on the neutral portrait; while
         speaking we hold the last frame if rendering momentarily lags."""
-        interval = 1.0 / max(1, fps)
         idle = engine.idle_frames()
         idle_n = len(idle)
         idle_i = 0
@@ -758,6 +762,15 @@ async def stream(ws: WebSocket):
         empty_since = None
         try:
             while not closed.is_set():
+                # Re-read the fps EVERY tick instead of capturing it when the task starts. The pump
+                # is created BEFORE the client's {"type":"config","fps":N} arrives, so a captured
+                # interval was always the SERVER ENV's fps -- the config message updated the render
+                # sizing (engine.fps / seg_samples) but never the pump's pacing. The server then
+                # RENDERED at the client's fps and EMITTED at its own: silent A/V drift, and exactly
+                # the "one fps everywhere is load-bearing" invariant broken. Reachable today via the
+                # config panel, which writes MUSETALK_FPS to .env and restarts only the pipeline --
+                # leaving :8002 on its old env fps while the reconnecting client configures a new one.
+                interval = 1.0 / max(1, engine.fps)
                 # A new turn began (speech_start). The CLIENT reset its frame buffer on
                 # TTSStartedFrame, so this segment MUST be re-marked or the client never
                 # re-enters synced pairing. Without this, a speech_start arriving while the
