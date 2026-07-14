@@ -16,7 +16,7 @@ jump to the source file. **Dashed** edges are fallback branches, the barge-in lo
 flowchart LR
     BR["🌐 Browser<br/>WebRTC client · /client/"]
     PL["⚙️ Pipeline · :7860<br/>system Python 3.11 (Pipecat 1.3.0)<br/>VAD→STT→LLM→TTS→avatar glue"]
-    CV["🔊 CosyVoice TTS · :8001<br/>tts conda env · separate repo<br/>E:\\Claude\\cosyvoice-local-tts"]
+    CV["🔊 CosyVoice TTS · :8001<br/>cosyvllm conda env in WSL<br/>in-repo: tts/cosyvoice-server/"]
     MT["🎭 MuseTalk avatar · :8002<br/>musetalk conda env<br/>mouth-region GPU render"]
 
     BR <-->|"WebRTC: mic up / A+V down"| PL
@@ -74,9 +74,7 @@ flowchart TD
     P4b["COSYVOICE_PACE_RATE=1.3<br/>caps GPU burst on shared card"]
     P4c["Streamed chunks → resample 16 kHz mono"]
     P4a --> P4b --> P4c
-    P4f1["fallback: ElevenLabs flash_v2_5"]
     P4f2["fallback: Deepgram Aura (en-only)"]
-    P4a -.->|"TTS_PROVIDER=elevenlabs"| P4f1
     P4a -.->|"TTS_PROVIDER=deepgram"| P4f2
   end
 
@@ -117,7 +115,7 @@ flowchart TD
   P6 -.->|"barge-in: user speaks over avatar → cancel + new turn"| P1
 
   %% ----- remote viewing -----
-  P6r["Remote: tailscale serve HTTPS<br/>_install_client_jitter_buffer (CLIENT_JITTER_BUFFER_MS)<br/>WEBRTC_VIDEO_BITRATE_MAX · fit-the-stream size<br/>open /client/ WITH trailing slash"]
+  P6r["Remote: tailscale serve HTTPS<br/>jitter buffer via /client/ice-config (CLIENT_JITTER_BUFFER_MS)<br/>WEBRTC_VIDEO_BITRATE_MAX · fit-the-stream size<br/>open /client/ WITH trailing slash"]
   P6b -.->|"WAN viewer"| P6r
 
   %% ----- click-throughs to source -----

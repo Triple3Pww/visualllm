@@ -1,49 +1,56 @@
 # local_services
 
-Local models running on the 5060 Ti, for Phase 2/3. Two layers:
+The local pieces of the pipeline: the Pipecat client wrappers, the GPU model servers they
+talk to, and the two custom browser clients.
 
-**Pipecat client wrappers** (drop into the pipeline via `pipeline/stages/*.py`):
+## Pipecat client wrappers
 
-| Module | Class | Stage | Phase |
-|--------|-------|-------|-------|
-| `funasr_stt.py` | `FunASRSTTService` | Mandarin STT (in-process, Paraformer) | 2 |
-| `cosyvoice_tts.py` | `CosyVoiceTTSService` | zh-TW streaming TTS (HTTP client) | 2/3 |
-| `musetalk_video.py` | `MuseTalkVideoService` | local lip-sync avatar (websocket client) | 3 |
+Dropped into the pipeline by the factories in `pipeline/stages/*.py`, chosen by `.env`.
 
-**Model servers** (the heavy processes the clients talk to):
+| Module | Class | Stage |
+|--------|-------|-------|
+| `cosyvoice_tts.py` | `CosyVoiceTTSService` | streaming TTS (HTTP client). Also serves `TTS_PROVIDER=jaitts` — same `/tts/stream` raw-PCM contract, just a different URL |
+| `sherpa_stt.py` | `SherpaStreamingSTTService` | offline streaming STT (`STT_PROVIDER=sherpa`), in-process on CPU, ~0 VRAM |
+| `musetalk_video.py` | `MuseTalkVideoService` | the lip-sync avatar (websocket client) — **owns the A/V sync**; read it before touching sync |
+| `first_piece_aggregator.py` | `FirstClauseAggregator` | the TTFO first-clause split + the filler-word opener |
+| `weather_chain_llm.py` | `WeatherChainLLMService` | `LLM_PROVIDER=weather_chain` — the NCU Chinese weather bot |
+| `avatar_memory.py` | `MemoryStore` | the weather bot's growing memory (local CPU qwen). Only active with `weather_chain` |
 
-| Folder | Port | Talks to | VRAM |
-|--------|------|----------|------|
-| `cosyvoice_server/` | 8001 | `CosyVoiceTTSService` | ~2 GB |
-| `musetalk_server/`  | 8002 | `MuseTalkVideoService` | ~4–6 GB |
+## Servers
 
-`musetalk_server/` defaults to the **TensorRT** render path (`MUSETALK_TRT=1`, ~1.5× faster — holds A/V
-sync under shared-GPU contention; `docs/PROBLEMS-AND-FIXES.md` P16). Engines (`trt_cache/`, ~1.75 GB,
-gitignored, GPU-specific) are built once with `musetalk_server/trt_build.py`; any load failure falls back
-to PyTorch.
+| Folder | Port | Env | Talks to |
+|--------|------|-----|----------|
+| `musetalk_server/` | 8002 | `musetalk` conda env | `MuseTalkVideoService` |
+| `jaitts_server/` | 8004 | the shared F5 venv | `CosyVoiceTTSService` (Thai only) |
+| `config_panel/` | 7870 | system python | the browser — edits `.env` + restarts the stack |
 
-FunASR runs in-process (no server); the first call downloads its weights.
+**The CosyVoice TTS server is NOT here** — it lives at **`tts/cosyvoice-server/`** (repo root) and runs
+on vLLM inside WSL on `:8001`. It was merged into this repo on 2026-07-14; before that it was a separate
+repo, and a stale copy of it here had silently rotted.
 
-## Wiring them in (`.env`)
+`musetalk_server/` defaults to the **TensorRT** render path (`MUSETALK_TRT=1`, ~1.5× faster — it is what
+holds A/V sync under shared-GPU contention; `docs/PROBLEMS-AND-FIXES.md` P16). Engines (`trt_cache/`,
+~1.75 GB, gitignored, GPU-specific) are built once with `musetalk_server/trt_build.py`; any load failure
+falls back to PyTorch silently.
 
-```
-STT_PROVIDER=funasr
-TTS_PROVIDER=cosyvoice_local      # start: python -m local_services.cosyvoice_server.app
-AVATAR_PROVIDER=musetalk_local    # start: python -m local_services.musetalk_server.app
-```
+## Browser clients
 
-## Status / what's left
+`nimbus_client/` (`/nimbus/`) and `studio_client/` (`/studio/`) — self-contained vanilla-JS pages, no build
+step, mounted by `pipeline/main.py`. They speak the same `POST /api/offer` SmallWebRTC signaling as the
+prebuilt `/client` bundle, and additionally do the split-mode mouth-crop compositing, the chat transcript,
+and (since 2026-07-14) the receive-side jitter buffer + the phone-loudspeaker route — all fed by
+`GET /client/ice-config`.
 
-- `funasr_stt.py`, `cosyvoice_tts.py`, `musetalk_video.py` — **complete** client logic.
-- `cosyvoice_server/app.py` — **near-complete**; needs CosyVoice installed +
-  the `CosyVoice2-0.5B` checkpoint (see its `requirements.txt`).
-- `musetalk_server/app.py` — websocket protocol + audio-windowing **complete**;
-  the two model calls (`MuseTalkEngine.load` / `.render`) are marked `TODO[MuseTalk]`
-  and map onto MuseTalk's `realtime_inference`. Until weights are wired it emits
-  neutral gray frames so the transport + A/V-sync path can be tested end-to-end.
+**`/client` (the pipecat prebuilt bundle) is unsupported while `MUSETALK_SPLIT=1`** — it cannot composite,
+so it would show a floating mouth crop. Use `/nimbus/` or `/studio/`.
 
-## VRAM reality (16 GB)
+## Removed 2026-07-14
 
-Don't run everything local at once: MuseTalk (~5) + CosyVoice2 (~2) + FunASR
-(~2) + Qwen-7B-4bit (~6) ≈ 15 GB with no headroom. Keep **either the LLM or the
-avatar on API** in steady state (decide in Phase 3 from measured numbers).
+`moss_server/` (MOSS-TTS-Realtime, `:8003`), `funasr_server/` + `funasr_stt.py` (SenseVoice STT). Neither
+was ever selected in `.env` — an untried fallback is not a safety net. Both are in git history.
+
+## VRAM reality (16 GB, shared)
+
+CosyVoice on vLLM (~4 GB) and MuseTalk (~5 GB) share the one card. **Load order matters: start CosyVoice
+BEFORE MuseTalk** — vLLM needs the card mostly free to claim its KV cache, or it dies with "No available
+memory for the cache blocks" (`docs/PROBLEMS-AND-FIXES.md` P15). `scripts/launch.ps1` already does this.

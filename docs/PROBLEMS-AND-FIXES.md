@@ -1998,3 +1998,78 @@ voice**.
 
 **To fix a server that is already running the wrong voice** (the launcher change only applies on next launch): re-apply the
 preset in the config panel's Avatar-preset card (runs `restart_cosyvoice`, which sources the voice file), or relaunch the stack.
+
+---
+
+## P49 — audit sweep: two "dead knobs" that were actually LIVE BUGS, + the TTS split-brain ✅ SHIPPED (2026-07-14, 23rd session — line-by-line audit)
+
+Second line-by-line read of `pipeline/`, `local_services/`, `scripts/` and both clients (the first was P45–P47).
+Net **−1670 lines**. Most of what came out was genuinely dead. **Two things were not dead — they were broken**,
+and both had been broken *silently*, which is why nobody noticed.
+
+**Symptom (1): the bot rambles — "35–38s of audio for a one short sentence question".**
+Blamed for weeks on a mysterious session-degradation latency bug (STATUS 22nd session §1).
+
+**Root cause (1): `OPENROUTER_MAX_TOKENS` was never read by ANY code.** `.env` documented it as a
+"hard reply cap … raised 200→500 so the fuller zh prompt isn't clipped mid-word" — but `config.py` never
+declared the field and `stages/llm.py` never passed it to the service. **Replies have always been uncapped.**
+The comment was the only thing implementing the cap. **Fix:** `config.openrouter_max_tokens` →
+`OpenAILLMService.Settings(max_tokens=…)`, passed **only when non-zero** (the settings object is applied as a
+delta, so omitting it keeps pipecat's `NOT_GIVEN` default; passing `0` would cap every reply at zero tokens).
+Verified the value reaches `svc._settings.max_tokens`. *Re-measure the 22nd session's degradation bug now that
+the cap is real — it may simply have been long replies.*
+
+**Symptom (2): the phone plays the avatar's voice through the EARPIECE, despite `CLIENT_FORCE_SPEAKER=1`.**
+
+**Root cause (2): all six `<head>`-patch installers in `main.py` were INERT.** They inject into the *prebuilt
+`/client` page only* — and `.env` runs `MUSETALK_SPLIT=1`, which (per this repo's own docs) makes `/client`
+unsupported, because it cannot composite the mouth crop. The pages actually used, `/nimbus` and `/studio`,
+implemented **none** of them (verified: zero occurrences of `setSinkId`, `jitterBufferTarget`,
+`playoutDelayHint`, `getStats`, `requestVideoFrameCallback`). So `CLIENT_FORCE_SPEAKER=1`,
+`CLIENT_JITTER_BUFFER_MS=150`, `CLIENT_AV_STATS_MONITOR=1`, `CLIENT_PLAYOUT_PROBE=1` and `MEASURE_BUTTON=1`
+were all switched **on** in `.env` and **loading nothing**. The phone-speaker fix (P24) was not dead code —
+it was a **missing feature** on the pages being demoed.
+**Fix:** the two that are real features (**jitter buffer** + **phone loudspeaker**) now live INSIDE the static
+clients, fed by `GET /client/ice-config`, which already existed and is already fetched before the peer
+connection is built; it now returns `jitterBufferMs` + `forceSpeaker` alongside `iceServers`. The other four
+were one-off diagnostics and are deleted with their beacon endpoints (`/client/video-stall`, `/client/av-stats`,
+`/client/playout`, `/client/measure-turn`, `/client/speaker-debug`). `measure.py --from-browser` is removed with
+the beacon it read, rather than left to report `unknown` forever — its **headless** last-mile probe (the
+always-on source) is untouched. The patch middleware STAYS: it serves `/client/transcript`, `/say`,
+`/ice-config`, `/avatar-overlay` for nimbus + studio.
+**Consequence:** the 22nd session's "~2.8–3.1s measured in a real browser" headline was measured through
+`MEASURE_BUTTON` + `CLIENT_PLAYOUT_PROBE` on `/client` — a page split mode disables. Treat it as provisional.
+
+**Symptom (3): edits to the CosyVoice server had no effect.**
+
+**Root cause (3): there were TWO copies of it, and the one in this repo was a corpse.** The live server was a
+separate git repo (`E:\Claude\cosyvoice-local-tts`); a **stale 2026-07-02 snapshot** of the same source sat here
+under `tts/cosyvoice-server/`. They had diverged badly — in-repo `tts_engine.py` **210 lines**, live one **337**
+(missing the OpenCC `t2s` fix P43, the lead-in breath trim P34, and v3 support). Nothing in the tree said which
+was real. **Fix:** merged via `git subtree` with **full history preserved** (`290d17e`, `bb43be1`, `f48a9cb`
+reachable here; the merge has 2 parents, not a squash). The 17.6 GB `CosyVoice/` checkout moved alongside and
+stays gitignored. Old repo deleted (its GitHub remote survives as backup). **Verified:** boots from the new path
+and synthesizes zh, first chunk **1.01s**.
+
+**🔴 STILL OPEN — the config panel's WSL restart is broken (found here, NOT fixed).**
+`config_panel/server.py::restart_cosyvoice()` spawns `wsl.exe` with `creationflags=DETACHED_PROCESS`. **`wsl.exe`
+needs a console** — detached it dies instantly and writes nothing, so the log is empty and the panel just reports
+`":8001 not healthy in ~150s"`. Proven by calling the function directly (twice); the same script in the
+foreground, or via `Start-Process` **with** a window (which is what `launch.ps1` deliberately does — see its
+comment "a separate window will show its logs"), boots fine. **Blast radius: the CUDA-graphs, CosyVoice-model AND
+Avatar-preset cards** (the preset swap calls `restart_cosyvoice` as step 1 of its P15-ordered relaunch), so the
+nimbus↔leo swap has probably never worked from the browser. `restart_pipeline()` / `restart_avatar()` are fine —
+they spawn plain Windows `python.exe`, which is happy detached. **Fix direction:** `CREATE_NEW_CONSOLE`
+(`0x00000010`) instead of `DETACHED_PROCESS`, or mirror `launch.ps1`.
+
+**Also removed (never once selected, so never a real safety net):** the `moss` / `elevenlabs` / `deepgram` TTS
+branches + `local_services/moss_server/`; the `funasr` STT branch + `funasr_server/` + `funasr_stt.py`;
+`trt_quant_fp8.py` (the measured 4.5×-slower FP8 dead end); 5 zero-reference orphan files; the config panel's
+**`memory-sim :7900`** health dot (**no service has ever existed on that port** — that dot could only ever read
+red); and 4 phantom `.env` keys (`AVATAR`, `DITTO_SIZE`, `OPENROUTER_REASONING_EFFORT`, + the above).
+**A typo'd `TTS_PROVIDER` now RAISES** instead of silently falling through to ElevenLabs — a cloud voice, and a bill.
+
+**The lesson, and it is the same one as P47/P48: a knob's COMMENT is not evidence that the knob is wired.**
+Both live bugs here were invisible precisely because `.env` confidently described behaviour that no code
+implemented. When auditing, grep for a *reader* before believing a knob exists. And **docs lie**: CLAUDE.md
+claimed `COSYVOICE_MODEL=v3` was "the current baseline" while `.env` has always run `v2`.

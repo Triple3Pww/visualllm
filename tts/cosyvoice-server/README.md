@@ -1,7 +1,7 @@
 # Local TTS — CosyVoice2 (zh-TW / English)
 
 Local, open-source Text-to-Speech for the **AI Weather Forecaster Virtual Human**
-project (NCU). Replaces ElevenLabs in the `STT → LLM → TTS → MuseTalk` pipeline
+project (NCU). The TTS stage of the `STT -> LLM -> TTS -> MuseTalk` pipeline
 with a fully local **CosyVoice2-0.5B** engine, exposed as a FastAPI service on
 port **8001** (matches the pipeline's `COSYVOICE_URL`).
 

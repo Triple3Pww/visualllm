@@ -42,7 +42,6 @@ own GPU/Python setup, and isolating them stops one crash from taking down the ot
 | **`musetalk` conda env** | Windows | MuseTalk avatar GPU server (`:8002`) |
 | **system Python 3.11** (has Pipecat — *not* a conda env) | Windows | the pipeline + web client (`:7860`) |
 | Miniconda on **both** Windows and WSL | — | provisions the two conda envs |
-| _opt._ `moss-tts` conda env | Windows | alternative MOSS TTS (`:8003`) |
 
 ### Cloud accounts (both free-tier)
 
@@ -77,7 +76,7 @@ of the system's hard decisions:
 
 | Process | Runs in | Port | Job |
 |---|---|---|---|
-| **CosyVoice TTS** (`run_vllm_server.sh`) | `cosyvllm` conda env in **WSL** (vLLM/GPU) | **8001** | Text → streamed voice audio. Separate repo `E:\Claude\cosyvoice-local-tts` |
+| **CosyVoice TTS** (`run_vllm_server.sh`) | `cosyvllm` conda env in **WSL** (vLLM/GPU) | **8001** | Text → streamed voice audio. In-repo at `tts/cosyvoice-server/` |
 | **Avatar server** (`musetalk_server/app.py`) | `musetalk` conda env (GPU) | **8002** | Voice audio → lip-synced RGB frames (MuseTalk) |
 | **Pipeline** (`pipeline/main.py`) | system Python 3.11 | **7860** | VAD→STT→LLM→TTS→avatar glue; serves the web client; owns the WebRTC connection |
 | _opt._ **Config panel** (`config_panel/server.py`) | system Python 3.11 | **7870** (`8444` over Tailscale) | Edit `.env` + restart the pipeline from a browser |

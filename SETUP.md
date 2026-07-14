@@ -112,9 +112,9 @@ pipeline reaches it via `.env` `COSYVOICE_URL`. CosyVoice2-0.5B is open-source
 **Get the upstream code + weights first (both paths need this):**
 
 ```bash
-# On this box the CosyVoice repo is a SIBLING: E:\Claude\cosyvoice-local-tts
-# (the public repo vendors it at tts/cosyvoice-server/ instead — same files).
-cd /e/Claude/cosyvoice-local-tts          # or: cd tts/cosyvoice-server  (public layout)
+# The CosyVoice server lives IN THIS REPO (merged 2026-07-14; it used to be a
+# separate sibling repo at E:\Claude\cosyvoice-local-tts, now deleted).
+cd /e/Claude/VisualLLm/tts/cosyvoice-server
 git clone --recursive https://github.com/FunAudioLLM/CosyVoice.git
 python -c "from modelscope import snapshot_download; \
   snapshot_download('iic/CosyVoice2-0.5B', \
@@ -123,8 +123,8 @@ python -c "from modelscope import snapshot_download; \
 
 (The `CosyVoice/` clone + weights are git-ignored — never committed.)
 
-> **Already done here:** `E:\Claude\cosyvoice-local-tts\CosyVoice\pretrained_models\CosyVoice2-0.5B`
-> exists with weights.
+> **Already done here:** `E:\Claude\VisualLLm	ts\cosyvoice-server\CosyVoice\pretrained_models\`
+> holds both `CosyVoice2-0.5B` (the `COSYVOICE_MODEL=v2` baseline) and `Fun-CosyVoice3-0.5B-2512` (`v3`).
 
 ### Path A — WSL2 + vLLM (RECOMMENDED, first-chunk TTFB ~1.1 s)
 
@@ -141,7 +141,7 @@ The known-good recipe:
 conda create -y -n cosyvllm -c conda-forge python=3.10 c-compiler cxx-compiler ffmpeg
 conda activate cosyvllm
 pip install vllm==0.23.0                 # pulls torch 2.11.0+cu130 (Blackwell sm_120)
-cd /mnt/e/Claude/cosyvoice-local-tts
+cd /mnt/e/Claude/VisualLLm/tts/cosyvoice-server
 pip install -r requirements.txt          # CosyVoice deps
 pip install lightning matplotlib tensorboard pyarrow torchcodec   # extras the vLLM path needs
 # pyworld is SKIPPED on purpose (no wheel, training-only); processor.py imports it optionally.
@@ -159,7 +159,7 @@ Why each piece (each was a real blocker — all baked into `run_vllm_server.sh`)
 
 **Launch it:**
 ```bash
-bash /mnt/e/Claude/cosyvoice-local-tts/run_vllm_server.sh     # serves :8001 inside WSL
+bash /mnt/e/Claude/VisualLLm/tts/cosyvoice-server/run_vllm_server.sh     # serves :8001 inside WSL
 # health (from WSL):  curl 127.0.0.1:8001/health      (~25-35 s to load + warm up)
 ```
 
@@ -183,7 +183,7 @@ conda-forge — they don't pip-install):
 conda create -y -n tts -c conda-forge python=3.10 pynini=2.1.5 ffmpeg
 conda activate tts
 pip install torch torchaudio
-cd E:\Claude\cosyvoice-local-tts        # (or tts\cosyvoice-server in the public layout)
+cd E:\Claude\VisualLLm	ts\cosyvoice-server
 pip install -r requirements.txt
 # the conda env's cert store is broken (see §5) -> point SSL at certifi:
 $env:SSL_CERT_FILE = (python -c "import certifi;print(certifi.where())")
@@ -246,7 +246,7 @@ the **OS env only** (no python-dotenv in its env) — `scripts/run.ps1` propagat
 
 ---
 
-## 6. (Optional) Offline STT + MOSS TTS — fully local
+## 6. (Optional) Offline STT — fully local
 
 Default STT is **Deepgram** (cloud). For a fully-offline STT (CPU, ~0 VRAM, no GPU
 contention):
@@ -264,19 +264,9 @@ cd models && tar xjf m.tar.bz2 && cd ..
 Then `.env`: `STT_PROVIDER=sherpa` (knobs `SHERPA_ENDPOINT_SILENCE=0.5`, `SHERPA_TRADITIONAL=1`).
 > **Already done here:** the sherpa model is unpacked under `models/`.
 
-**Option B — `funasr` (segmented SenseVoice server, `:8004`).**
-```powershell
-conda create -y -n funasr-stt python=3.11
-conda activate funasr-stt
-pip install -r local_services/funasr_server/requirements.txt   # model ~1GB auto-downloads
-```
-`.env`: `STT_PROVIDER=funasr`; `run.ps1` auto-starts `:8004`. **Caveat:** segmented — needs
-the energy-VAD to fire end-of-turn; on a too-quiet mic the turn never flushes. Prefer
-`sherpa`. (Env exists here.)
-
-**Optional MOSS-TTS** (`TTS_PROVIDER=moss`, `:8003`, `moss-tts` conda env) — alternative
-streaming TTS, same PCM contract. Launch recipe (Triton/torchcodec/ffmpeg-7 fixes) is in
-`local_services/moss_server/app.py`'s docstring. Run it **eager** (default).
+> The `funasr` (SenseVoice, `:8004`) and MOSS-TTS (`:8003`) servers were **removed 2026-07-14** —
+> neither was ever selected in `.env`, and an untried fallback is not a safety net. They are in git
+> history if you ever want them back. `sherpa` above is the offline STT path.
 
 ---
 
@@ -290,10 +280,10 @@ Minimum to fill:
 LANGUAGE=en                              # en | zh | th
 DEEPGRAM_API_KEY=...
 OPENROUTER_API_KEY=...
-OPENROUTER_MODEL=google/gemini-2.5-flash-lite   # cloud (the baseline). Local Ollama: base_url->:11434/v1 + a NON-reasoning model (qwen2.5:3b). Do NOT use a thinking model (qwen3.5:4b): it returns empty `content` -> avatar silent, and OPENROUTER_REASONING_EFFORT is a dead knob the pipeline never reads. See WORKFLOW.md §8.
+OPENROUTER_MODEL=google/gemini-2.5-flash-lite   # cloud (the baseline). Local Ollama: base_url->:11434/v1 + a NON-reasoning model (qwen2.5:3b). Do NOT use a thinking model (qwen3.5:4b): it returns empty `content` -> avatar silent, (OPENROUTER_REASONING_EFFORT was a dead knob and is now deleted from .env). See WORKFLOW.md §8.
 
-STT_PROVIDER=deepgram                    # or sherpa (offline) / funasr
-TTS_PROVIDER=cosyvoice
+STT_PROVIDER=deepgram                    # or sherpa (offline, in-process)
+TTS_PROVIDER=cosyvoice                   # or jaitts (Thai -- CosyVoice cannot speak Thai)
 COSYVOICE_URL=http://172.24.44.238:8001  # Path A: the WSL IP (wsl hostname -I). Path B: http://localhost:8001
 MUSETALK_SYNC_MODE=steady                # steady = video-master, synced start (default) | live = voice-instant, lips trail
 MUSETALK_TRT=1                           # TensorRT render (default). Build engines first (below) or it falls back to PyTorch
@@ -331,7 +321,7 @@ to stop everything.
 **Manual — the load order MATTERS (start CosyVoice BEFORE MuseTalk; §10):**
 ```powershell
 # 1. CosyVoice TTS (Path A: in WSL)
-wsl -d Ubuntu -e bash -c "bash /mnt/e/Claude/cosyvoice-local-tts/run_vllm_server.sh"
+wsl -d Ubuntu -e bash -c "bash /mnt/e/Claude/VisualLLm/tts/cosyvoice-server/run_vllm_server.sh"
 # 2 + 3. MuseTalk avatar + pipeline (one script; propagates MuseTalk env from .env)
 .\scripts\run.ps1
 # 4. (optional) config panel — edit .env + restart the pipeline from the browser

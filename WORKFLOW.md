@@ -17,10 +17,10 @@ intentionally separate: the TTS LLM and the avatar render each need their own GP
 
 | Process | Runs in | Port | Job |
 |---|---|---|---|
-| **CosyVoice TTS** (`run_vllm_server.sh`) | `cosyvllm` conda env in **WSL** (GPU/vLLM) | **8001** | Text → streamed voice audio. Separate repo `E:\Claude\cosyvoice-local-tts` |
+| **CosyVoice TTS** (`run_vllm_server.sh`) | `cosyvllm` conda env in **WSL** (GPU/vLLM) | **8001** | Text → streamed voice audio. **In-repo at `tts/cosyvoice-server/`** (merged 2026-07-14) |
 | **Avatar server** (`local_services/musetalk_server/app.py`) | `musetalk` conda env (GPU) | **8002** | Turns voice audio into lip-synced RGB frames (MuseTalk) |
 | **Pipeline** (`pipeline/main.py`) | system Python 3.11 (has Pipecat) | **7860** | VAD→STT→LLM→TTS→avatar glue, serves the web client, owns the WebRTC connection |
-| _opt._ **MOSS TTS** (`local_services/moss_server/app.py`) | `moss-tts` conda env (GPU) | **8003** | Alternative TTS (`TTS_PROVIDER=moss`); same `/tts/stream` contract as CosyVoice |
+| _opt._ **JaiTTS** (`local_services/jaitts_server/app.py`) | the shared F5 venv (GPU) | **8004** | Thai TTS (`TTS_PROVIDER=jaitts`); same `/tts/stream` contract as CosyVoice |
 | _opt._ **Config panel** (`local_services/config_panel/server.py`) | system Python 3.11 | **7870** | Edit `.env` + restart the pipeline from a browser (`§8`) |
 
 The LLM stage runs cloud (OpenRouter), a **local Ollama** model (point `OPENROUTER_BASE_URL` at
@@ -91,22 +91,20 @@ in the NCU zh weather bot instead (see `§3` weather note + STATUS.md). **Curren
 fragmented Chinese; cloud frees the CPU and gives coherent zh. NOTE: the LLM is **not** the reason
 Chinese voice starts later than English — that's CosyVoice's zh first-chunk TTFB (`docs/PROBLEMS-AND-FIXES.md` P15).
 
-### TTS — CosyVoice2 on vLLM (default) / ElevenLabs / Deepgram Aura (fallbacks)
+### TTS — CosyVoice2 on vLLM (default) / JaiTTS (Thai)
 `pipeline/stages/tts.py`. Converts the LLM text to voice audio chunks, streamed.
 - **Default**: `TTS_PROVIDER=cosyvoice` → the local CosyVoice2-0.5B server at `COSYVOICE_URL`
   (female zero-shot voice, covers en/zh). It runs its autoregressive LLM on **vLLM in WSL** →
-  first-chunk latency ~3.4s → **~1.1s** (separate repo `E:\Claude\cosyvoice-local-tts`,
-  `run_vllm_server.sh`). **`COSYVOICE_URL` must be the WSL IP, NOT localhost** (WSL2's localhost
-  relay buffers the streaming audio ~2s). The original Windows `tts`-env PyTorch server is the
-  fallback (set `COSYVOICE_URL=http://localhost:8001` + start it).
-- **MOSS** (`TTS_PROVIDER=moss`): the local MOSS-TTS-Realtime server at `MOSS_URL` (`:8003`, `moss-tts`
-  env). It speaks the **same `/tts/stream` raw-PCM contract**, so the CosyVoice client is reused as-is.
-  Voice = a fixed reference clip (`MOSS_REF`, clone-only). Run it **eager** (`TORCHDYNAMO_DISABLE=1`,
-  the server default) or new sentence-lengths trigger ~3–40s `torch.compile` recompiles felt as
-  between-sentence stalls. Full launch recipe (CC/triton + torchcodec ffmpeg-7/nvidia-npp/LD path) is in
-  `local_services/moss_server/app.py`'s docstring.
-- **Cloud fallbacks**: `TTS_PROVIDER=elevenlabs` (`flash_v2_5`, multilingual cloud) or `deepgram`
-  (Deepgram **Aura**, reuses `DEEPGRAM_API_KEY`, English-only).
+  first-chunk latency ~3.4s → **~1.1s**. The server lives **in this repo** at
+  `tts/cosyvoice-server/` (`run_vllm_server.sh`); before 2026-07-14 it was a separate repo.
+  **`COSYVOICE_URL` must be the WSL IP, NOT localhost** (WSL2's localhost relay buffers the
+  streaming audio ~2s). The Windows `tts`-env PyTorch server is the fallback (set
+  `COSYVOICE_URL=http://localhost:8001` + start it).
+- **Thai**: `TTS_PROVIDER=jaitts` → the local JaiTTS-F5TTS server (`:8004`). CosyVoice **cannot
+  speak Thai**. It speaks the same `/tts/stream` raw-PCM contract, so the CosyVoice client is
+  reused pointed at `JAITTS_URL`.
+- **Removed 2026-07-14**: the `moss` / `elevenlabs` / `deepgram` branches — never once selected.
+  An unknown `TTS_PROVIDER` now **raises** rather than silently falling through to a cloud voice.
 
 ### Avatar (client side) — `MuseTalkVideoService`
 `local_services/musetalk_video.py`, a Pipecat `FrameProcessor` sitting between TTS and the
@@ -202,7 +200,7 @@ everything. It's a C# shim (`scripts/Launcher.cs`) over `scripts/launch.ps1`; re
 
 ```bash
 # 1. CosyVoice TTS server — vLLM in WSL (TTFB ~1.1s). Then set COSYVOICE_URL to the WSL IP.
-wsl -d Ubuntu -e bash -c "bash /mnt/e/Claude/cosyvoice-local-tts/run_vllm_server.sh"   # :8001
+wsl -d Ubuntu -e bash -c "bash /mnt/e/Claude/VisualLLm/tts/cosyvoice-server/run_vllm_server.sh"   # :8001
 #   vLLM shares the 16GB card with MuseTalk. gpu_memory_utilization (COSYVOICE_VLLM_GPU_UTIL,
 #   default 0.3, in the cosyvoice repo) must be high enough for vLLM's ~4GB footprint or it
 #   crashes "No available memory for the cache blocks" (0.2 was too low). Raise toward 0.35 if a
@@ -270,13 +268,12 @@ in order of effectiveness:
 |---|---|---|
 | `LANGUAGE` | `en` | `en` / `zh` / `th` (STT + voice) |
 | `ECHO_GUARD` | `0` | barge-in (mic always live -- use headphones). `1` = half-duplex mute, but it's BROKEN under steady (mic stuck-muted after a turn, P11); only use `1` with `MUSETALK_SYNC_MODE=live` |
-| `TTS_PROVIDER` | `cosyvoice` | `moss` (local MOSS-TTS-Realtime, `:8003`) / `elevenlabs` (cloud) / `deepgram` (Aura, en-only) |
+| `TTS_PROVIDER` | `cosyvoice` | `jaitts` (local Thai server, `:8004`). Anything else raises |
 | `COSYVOICE_URL` | `http://localhost:8001` | the CosyVoice server — set to the **WSL IP** for the vLLM server (NOT localhost; the relay buffers the stream), localhost for the Windows fallback |
 | `COSYVOICE_VOICE` / `COSYVOICE_PACE_RATE` | `weather` / `1.3` | zero-shot speaker id / GPU-pacing cap (server-side) |
 | `COSYVOICE_PROMPT_WAV` / `_TEXT` / `_SPK_ID` | *(unset → "weather")* | *(set in the **cosyvoice repo** env)* override the registered reference voice with any clean clip + its exact transcript — how a "professional" voice is selected without editing source |
-| `MOSS_URL` / `MOSS_REF` | `http://localhost:8003` / `assets/moss_pro_ref.wav` | the MOSS server (set to the **WSL IP**, same rule as CosyVoice) + its fixed reference voice clip (`MOSS_REF` is read by the server, not the pipeline) |
-| `DEEPGRAM_TTS_VOICE` | `aura-2-helena-en` | Aura voice when `TTS_PROVIDER=deepgram` |
 | `OPENROUTER_MODEL` / `OPENROUTER_BASE_URL` | `google/gemini-2.5-flash-lite` / `https://openrouter.ai/api/v1` | model + endpoint. Point the base URL at `http://localhost:11434/v1` (+ `OPENROUTER_API_KEY=ollama`, `OPENROUTER_MODEL=qwen2.5:3b-cpu`) to run a **local CPU Ollama** chat model (~0.5s TTFB, GPU-free) |
+| `OPENROUTER_MAX_TOKENS` | *(unset)* | hard cap on the reply length. **It was a PHANTOM knob until 2026-07-14** — `.env` described it as a cap while no code read it, so replies were uncapped (a fair suspect for the 35s rambles). Now wired through; unset/0 = no cap |
 | `LLM_PROVIDER` | `openrouter` | `weather_chain` = dedicated zh weather bot (NCU LangServe `/stream`); needs `LANGUAGE=zh`. One flip reverts to general chat |
 | `WEATHER_CHAIN_URL` / `_MODEL` / `_VERIFY_TLS` | `https://140.115.54.87/chain/resWeatherChain` / **`qwen2.5:7b`** / `0` | the remote weather chain (NCU moved to **HTTPS/443**; self-signed cert → keep `VERIFY_TLS=0`). **`qwen2.5:7b` (~1.2s) is the fast working model; `gemma3:27b` ~3.85s; lighter sizes 500 (not installed on NCU)** — see STATUS.md weather table |
 | `AVATAR_MEMORY` | `1` | grow the virtual human's memory (profile + rolling summary) across conversations; `0` = off. Wrapped around the stateless chain |
@@ -297,10 +294,8 @@ in order of effectiveness:
 | `WEBRTC_PUBLIC` | `0` | **PUBLIC link for a non-tailnet browser** (over `tailscale funnel`, which proxies only the page + signaling, never the media). `1` = advertise STUN so a public/CGNAT browser reaches the media; this box's NAT is port-preserving (cone) so STUN-only works with no TURN signup. When on, `_restrict_ice_to_subnet` keeps `{Tailscale 100.64/10 + the internet-facing default-route /32}` (both — pinning to either alone breaks the other's clients) and drops hyper-v/radmin noise. Off = tailnet-only baseline. Single-client + unauth (`docs/PROBLEMS-AND-FIXES.md` P38) |
 | `TURN_URLS` / `TURN_USERNAME` / `TURN_CREDENTIAL` | *(empty)* | TURN relay fallback for a visitor whose OWN NAT is symmetric (Cloudflare Realtime / metered.ca free tier). Comma-sep `turn:`/`turns:` URLs. Setting `TURN_URLS` also enables the public feature. `STUN_URLS` (default `stun:stun.l.google.com:19302`) is used whenever the feature is on (`docs/PROBLEMS-AND-FIXES.md` P38) |
 | `CLIENT_JITTER_BUFFER_MS` | `400` | receive-side WebRTC jitter buffer (0 = off); raise for a remote viewer |
-| `CLIENT_FORCE_SPEAKER` | `1` | phone browsers: play the voice on the **loudspeaker**, not the earpiece (Android Chrome flips to ear-style 'communication' routing while the mic is live; iOS gets a WebAudio fallback). Mobile-UA only — desktop/headphones untouched. The phone self-reports to `[speaker-debug]` in `pipeline.log`. `0` = off (`docs/PROBLEMS-AND-FIXES.md` P24) |
+| `CLIENT_FORCE_SPEAKER` | `1` | phone browsers: play the voice on the **loudspeaker**, not the earpiece (Android Chrome flips to ear-style 'communication' routing while the mic is live; iOS gets a WebAudio fallback). Mobile-UA only — desktop/headphones untouched. **Served to `/nimbus` + `/studio` via `GET /client/ice-config`** and applied in their `connect()`. It used to be a `/client`-only `<head>` patch, which `MUSETALK_SPLIT=1` made INERT — so this knob did nothing at all until 2026-07-14. `0` = off (`docs/PROBLEMS-AND-FIXES.md` P24) |
 | `WEBRTC_VIDEO_BITRATE_MAX` | `600000` | VP8 send-bitrate ceiling, bits/s (0 = aiortc default 1.5M) |
-| `CLIENT_PLAYOUT_PROBE` | `0` | **measurement scaffolding (default OFF).** `1` = inject a `<head>` AnalyserNode that beacons the instant the bot's voice first plays in the browser (`[client-playout]` → `/client/playout`), so `python -m scripts.measure --from-browser` can close the latency waterfall's to-the-ear last mile with a real device instead of an estimate (`docs/PROBLEMS-AND-FIXES.md` P35) |
-| `MEASURE_BUTTON` | `0` | **measurement scaffolding (default OFF).** `1` = inject a "Measure turn" button into `/client/`. On click it resumes the AudioContext (a user gesture — why it fires where the passive `CLIENT_PLAYOUT_PROBE` may not), POSTs `/client/measure-turn` (the server injects a fixed-question turn through the full LLM→TTS→avatar path into the live task), times **click→first-voice-onset** and shows it in-page, and beacons the onset to `/client/playout` for `--from-browser`. The one-click way to measure a real device WITHOUT mic/VAD/STT turn-taking (real browser turns log no `[TTFO]`). **The in-page number (click→ear, one browser clock) is the trustworthy figure**; the server-clock `--from-browser` Δ over-counts on a REMOTE device (adds the beacon's return network hop). `main.py::_install_measure_button` |
 | `COSYVOICE_FIRST_PIECE` | `1` | **en TTFO lever**: flush the LLM's first CLAUSE to TTS early (ASCII comma/space past `COSYVOICE_FIRST_PIECE_MIN_CHARS`/`_MAX_CHARS` = 18/32) — CosyVoice's first-chunk TTFB scales with input length, so the short opener starts speech ~1.3s sooner (TTFO ~4.6→~3.2s). `0` = whole sentences (`local_services/first_piece_aggregator.py`) |
 | `COSYVOICE_FIRST_PIECE_ZH` | `1` | **zh TTFO lever (2026-07-04)**: same idea for Chinese, which the en split never touches (full-width ，vs ASCII comma, no spaces). Splits the turn's FIRST piece at a full-width ，；： ONLY — never a char cap (cuts mid-word) — min `COSYVOICE_FIRST_PIECE_ZH_MIN_CHARS` (=5) CJK chars so the opening audio covers the next piece's synthesis. Long-opener turns 4.78→3.08s, no between-clause pause (`docs/PROBLEMS-AND-FIXES.md` P23) |
 | `COSYVOICE_FIRST_HOP_ZH` | `0` | *(cosyvoice repo's `run_vllm_server.sh`, not this `.env`)* zh opening-chunk size hop. **Keep 0** — hop=5's small first chunk fills the `lead=14` cushion slowly → the steady-hold balloons (zh median 4.14→3.09s at hop=0; P22 reversed the earlier hop=5 advice) |
@@ -308,8 +303,8 @@ in order of effectiveness:
 | `FILLER_WORDS_COUNT` | `1` | how many fillers to chain at turn start; each adds ~1.2s of "thinking" before the real answer |
 | `TTFO_TARGET_SECONDS` | `3` | the < 3 s target for logging |
 
-Keys required: `DEEPGRAM_API_KEY`, `OPENROUTER_API_KEY` (and `ELEVENLABS_API_KEY` +
-`ELEVENLABS_VOICE_ID` only if `TTS_PROVIDER=elevenlabs`). With `LLM_PROVIDER=weather_chain`
+Keys required: `DEEPGRAM_API_KEY`, `OPENROUTER_API_KEY`. (The ElevenLabs keys are gone — that
+provider was removed 2026-07-14, and TTS is now fully local.) With `LLM_PROVIDER=weather_chain`
 the OpenRouter key isn't used; instead the NCU chain must be reachable and Ollama running
 with the `MEMORY_LLM_MODEL` (`qwen2.5:3b-cpu`). For a **local LLM** the key can be the literal
 `ollama` (no real key) since the request goes to localhost.
@@ -335,8 +330,8 @@ TTS/avatar servers are managed separately (the status dots tell you if the provi
 | `pipeline/metrics.py` | `TtfoMeter` (the < 3 s metric) |
 | `local_services/musetalk_video.py` | Client-side avatar processor + frame-clocked A/V sync + `_align_even` |
 | `local_services/musetalk_server/app.py` | MuseTalk GPU server (ws, frame pump, sync markers, session guard) |
-| `local_services/cosyvoice_tts.py` | CosyVoice streaming TTS client (reused by `TTS_PROVIDER=moss`) |
-| `local_services/moss_server/app.py` | MOSS-TTS-Realtime streaming server (same wire contract as cosy) |
+| `local_services/cosyvoice_tts.py` | CosyVoice streaming TTS client (reused by `TTS_PROVIDER=jaitts`) |
+| `tts/cosyvoice-server/` | **The CosyVoice TTS server itself** (vLLM in WSL, `:8001`) — merged into this repo 2026-07-14 |
 | `local_services/config_panel/` | The web config panel (`server.py` + `index.html`, `:7870`) |
 | `scripts/preflight.py` | Import/drift check. `scripts/_capture_synced.py` = A/V-synced offline capture |
 | `STATUS.md` | Live state + decision log (source of truth) |

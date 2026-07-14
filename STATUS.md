@@ -1,5 +1,63 @@
 # VisualLLm — Project Status & Next Steps
 
+_Last updated: 2026-07-14 (**23rd session — LINE-BY-LINE DEAD-CODE AUDIT + the TTS server merged INTO this repo.
+−1670 lines. Two "dead knobs" turned out to be live BUGS. Branch `chore/cleanup-and-tts-merge`, NOT merged/pushed.**
+
+**(0) THE TTS SERVER NOW LIVES IN THIS REPO: `tts/cosyvoice-server/`.** It used to be a separate git repo at
+`E:\Claude\cosyvoice-local-tts`, while a **stale 2026-07-02 snapshot of the same source** sat here under `tts/`. They
+had diverged badly — the in-repo `tts_engine.py` was **210 lines, the live one 337** (the OpenCC `t2s` fix, the
+lead-in breath trim, v3 support). **Editing the in-repo copy edited a corpse, and nothing said so.** Merged via
+`git subtree` with **full history preserved** (`290d17e`, `bb43be1`, `f48a9cb` are reachable here; the merge has 2
+parents, not a squash). The **17.6 GB `CosyVoice/`** checkout moved alongside it and stays gitignored, so git carries
+only the ~30 source files. WSL path is now `/mnt/e/Claude/VisualLLm/tts/cosyvoice-server/`, rewritten in
+`run_vllm_server.sh`, `config_panel/server.py`, `launch.ps1` and the docs. The old folder is **deleted** (its GitHub
+remote `ttoppre/cosyvoice-local-tts` survives as an off-machine backup). **Verified live:** boots from the new path
+and synthesizes zh, first chunk **1.01s** (matches the ~1.1s baseline).
+
+**(1) `OPENROUTER_MAX_TOKENS` WAS NEVER READ BY ANY CODE — replies were UNCAPPED.** `.env` described it as a
+"hard reply cap … raised 200→500", but `config.py` never declared it and `stages/llm.py` never passed it. **A prime
+suspect for the "bot emits 35–38s of audio for a one-sentence question" complaint** that §(1) of the 22nd session
+blamed on a mystery session-degradation bug — worth re-measuring that bug now the cap is real. Wired through
+(`config.openrouter_max_tokens` → `Settings(max_tokens=…)`); unset still yields `NOT_GIVEN`, never a 0-token cap.
+
+**(2) THE SIX `/client` `<head>`-PATCHES WERE INERT — so `CLIENT_FORCE_SPEAKER=1` was doing NOTHING on the pages you
+demo.** They inject into the prebuilt `/client` page ONLY, and `.env` runs `MUSETALK_SPLIT=1`, which makes `/client`
+unsupported. `/nimbus` + `/studio` implemented none of them (verified: 0 hits for `setSinkId` / `jitterBufferTarget` /
+`getStats` / `rVFC`). So `CLIENT_JITTER_BUFFER_MS`, `CLIENT_FORCE_SPEAKER`, `CLIENT_AV_STATS_MONITOR=1`,
+`CLIENT_PLAYOUT_PROBE=1` and `MEASURE_BUTTON=1` were all switched **on** and loading nothing. **The phone-loudspeaker
+fix was not dead code — it was a MISSING FEATURE.** The two real ones (jitter buffer + speaker route) now live IN the
+static clients, fed by `GET /client/ice-config` (which now also returns `jitterBufferMs` + `forceSpeaker`). The other
+four were one-off diagnostics and are gone, with their beacon endpoints. **Consequence for the 22nd session's
+headline:** that ~2.8–3.1s "real browser" number was measured through `MEASURE_BUTTON` + `CLIENT_PLAYOUT_PROBE` on
+`/client` — a page that split mode disables. Treat it as provisional. `measure.py --from-browser` is removed with the
+beacon it read (the STATUS §"broken, emits a fabricated +247.98s row" note is now moot); the **headless** probe, its
+always-on last-mile source, is untouched.
+
+**(3) 🔴 NEW OPEN BUG — the config panel's WSL restart is broken (found, NOT fixed).** `restart_cosyvoice()` spawns
+`wsl.exe` with `DETACHED_PROCESS`, but **`wsl.exe` needs a console** — detached it dies instantly and writes nothing,
+so the panel just reports `":8001 not healthy in ~150s"`. Proven by calling the function directly. **Blast radius:
+the CUDA-graphs, CosyVoice-model AND Avatar-preset cards** (the preset swap calls it as step 1), so the nimbus↔leo
+swap likely never worked from the browser. `restart_pipeline()`/`restart_avatar()` are fine (plain Windows python).
+Fix = `CREATE_NEW_CONSOLE`, or mirror `launch.ps1`, which gives WSL a window on purpose.
+
+**(4) CUT (never once selected):** the `moss` / `elevenlabs` / `deepgram` TTS branches + `local_services/moss_server/`;
+the `funasr` STT branch + `funasr_server/` + `funasr_stt.py`; `trt_quant_fp8.py` (the measured 4.5×-slower FP8 dead
+end); 5 zero-reference orphan files; the config panel's **`memory-sim :7900`** health dot (**no service has ever
+existed on that port**); and 4 phantom `.env` keys (`AVATAR`, `DITTO_SIZE`, `OPENROUTER_REASONING_EFFORT`, …). **KEPT
+deliberately:** `weather_chain` + the avatar-memory harness (the NCU path), `sherpa` STT, `jaitts` (Thai), and the
+default-off `MUSETALK_DUMP_*` diagnostics (per P40, the only trustworthy way to debug the mouth). **A typo'd
+`TTS_PROVIDER` now RAISES** instead of silently falling through to ElevenLabs — a cloud voice, and a bill.
+
+**(5) DOCS WERE LYING, and that is what hid all of this.** CLAUDE.md claimed `COSYVOICE_MODEL=v3` was "the current
+baseline" — `.env` has always run **`v2`**. Corrected. The lesson the audit keeps re-proving: **verify a knob has a
+reader before believing its comment.**
+
+**NOT VERIFIED:** the phone-loudspeaker route on a real handset (no device here). The JS mirrors the previously-proven
+`/client` patch and both clients parse clean, but it wants one look on an actual phone.
+**Commits (branch `chore/cleanup-and-tts-merge`):** `ae96415` TTS merge + max_tokens, `287a58a` head-patches,
+`9032c4a` provider cuts, `3cf7586` docs.)_
+<!-- prior handoff -->
+
 _Last updated: 2026-07-14 (**22nd session — TTFO measured IN A REAL BROWSER for the first time; two levers shipped;
 one NEW unresolved bug found. Plus: the VAD is now panel-editable.**
 
