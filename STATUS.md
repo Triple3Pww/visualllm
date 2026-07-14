@@ -233,11 +233,11 @@ relaunches the WSL TTS server; also fixed a latent bug where the graphs toggle s
 (`restart_cosyvoice()` now forwards the model).
 (5) **RUNNING BASELINE: `COSYVOICE_MODEL=v3` + CUDA graphs + flow-TRT, `LANGUAGE=en`, `MUSETALK_IDLE_MOTION=0`** (idle
 breathing OFF — a manual-launch regression, now fixed by relaunching MuseTalk with the full `.env` server-side set).
-**CAVEAT (UNVERIFIED for v3): CUDA graphs are the config P33 REJECTED for v2's Chinese** — graph decode perturbs the RAS
-sampling (P18) -> longer/gappier zh audio -> the mouth can stop tracking the words (MuseTalk lip-syncs off a Whisper of the
-waveform). **en is spared** (no RAS reliance), which is why graphs-on is fine for the current en baseline; **before trusting
-v3+graphs for zh, re-check the lipsync by eye** (or flip `COSYVOICE_VLLM_EAGER=1` / the panel's CUDA-graphs toggle). Phase-2
-v2-vs-v3 zh clips (`output/zh_v{2,3}_synced.mp4`) were rendered but NOT yet eye-judged. Two follow-ups still open: the RAS
+**~~CAVEAT: CUDA graphs are the config P33 REJECTED for v2's Chinese~~ — RESOLVED 2026-07-14: graphs are FINE on zh.**
+The live baseline is v2 + `LANGUAGE=zh` + `COSYVOICE_VLLM_EAGER=0` (graphs ON) and **the user's eye says the Chinese
+lipsync is not degraded**, so P33's eager-for-zh verdict is reversed (see the banner on P33). Graphs ON is correct for
+every language; do NOT flip `COSYVOICE_VLLM_EAGER` back to `1`. P33's *audio* measurement (graphs slightly lengthen /
+add silence to the zh waveform) may still be true — it just never reached the eye. Two follow-ups still open: the RAS
 processor firing on v3 is unverified, and the P18 RAS fix lives in the gitignored `CosyVoice/` submodule (versioned nowhere).
 **Committed + pushed to `main` in both repos.**)_
 <!-- prior handoff -->
@@ -622,11 +622,16 @@ in CosyVoice** (whole buffers), not in the byte-stream client.
 
 ---
 
-## ⭐ HANDOFF → next session (2026-07-05, later 8th): CUDA graphs CLOSED = keep eager (zh-lipsync cost); + config-panel graphs toggle + freeze logging
+## ⭐ HANDOFF → next session (2026-07-05, later 8th): ~~CUDA graphs CLOSED = keep eager (zh-lipsync cost)~~ **[graphs verdict REVERSED 2026-07-14 — see §1]**; + config-panel graphs toggle + freeze logging
 
 **TL;DR — three threads this session, all left in a safe, verified state; NOTHING committed (both repos).**
 
-### 1. CUDA graphs — FINAL VERDICT: KEEP EAGER (`COSYVOICE_VLLM_EAGER=1`). Do NOT re-open as "no drawback."
+### 1. ~~CUDA graphs — FINAL VERDICT: KEEP EAGER~~ **REVERSED 2026-07-14 — graphs ON is correct, zh included.**
+> The verdict in this 2026-07-05 handoff **did not hold**. Live on v2 + `LANGUAGE=zh` + `COSYVOICE_VLLM_EAGER=0`
+> (graphs ON), the user's eye reports the Chinese lipsync is **fine**. The zh-audio delta measured below is real but
+> never reached the eye. Keep `COSYVOICE_VLLM_EAGER=0`. See the P33 banner in `docs/PROBLEMS-AND-FIXES.md`. The rest of
+> this section is history.
+
 The user asked "can we use graphs without the drawback?" I re-tested and first concluded "yes, no drawback" —
 **that was measuring the WRONG side.** A TTS-TTFB variance probe (`cosyvoice-local-tts/_ttfb_variance.py`) shows
 graphs are genuinely faster + lower-variance on the TTS stopwatch (96 samp under real MuseTalk render: graphs
@@ -732,7 +737,8 @@ turn hit 2.50s (hold →0.48s), proving the hold cost is real — but that lever
 **Do next, in order (full impl detail in P20's HANDOFF section):**
 1. **Lever 3a — turn-start stagger (preferred, low risk):** throttle CosyVoice's generation nearer real-time
    at turn start so its opening vocoder burst stops starving MuseTalk's first render segment. Knob:
-   `COSYVOICE_PACE_RATE` (1.3) lives in the **cosyvoice repo** (`E:\Claude\cosyvoice-local-tts`), likely needs
+   `COSYVOICE_PACE_RATE` (**UNSET = OFF**, verified 2026-07-14; the "1.3" this line used to claim was never actually
+   set — code default is `0`) now lives in-repo at `tts/cosyvoice-server/`, likely needs
    a dedicated turn-start-only throttle rather than a global rate cut. Variant 3b (delay the first render feed
    ~150–250ms in `musetalk_video.py`) trades lip-start delay — try 3a first.
 2. **Lever 1 — CUDA stream priority (~10-line probe, may be dead on arrival):** high-priority
@@ -892,8 +898,8 @@ WITHOUT CosyVoice. Lesson (again, per P19): the shared-GPU cost only shows on th
 - **Lever 3 — stagger the two bursts so they don't overlap.** They only collide because both peak at the same
   instant; CosyVoice's burst is **short + front-loaded** (it sprints the opening audio faster than real-time,
   then quiets). Two implementation options: **(a)** throttle CosyVoice's generation nearer real-time at turn
-  start so it doesn't front-load the GPU — lever on `COSYVOICE_PACE_RATE` (currently 1.3, in the cosyvoice
-  repo's server), possibly a dedicated turn-start throttle, so it spreads GPU use and leaves the avatar's first
+  start so it doesn't front-load the GPU — lever on `COSYVOICE_PACE_RATE` (**currently UNSET = OFF**, verified
+  2026-07-14; not 1.3 as this line used to say), possibly a dedicated turn-start throttle, so it spreads GPU use and leaves the avatar's first
   render room; **(b)** on the MuseTalk client (`musetalk_video.py`), delay feeding the first render segment by
   ~150–250ms so CosyVoice's opening burst clears first, then render against a quieter GPU (trade: adds that
   fixed delay to lip-start). **(a) is lower-risk** (a TTS-side throttle, no sync surgery) and preferred first.

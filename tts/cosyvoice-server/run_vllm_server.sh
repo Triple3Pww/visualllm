@@ -8,7 +8,7 @@
 #   VLLM_ENABLE_V1_MULTIPROCESSING=0 -> run the engine in-process (no spawn re-import crash)
 #   VLLM_USE_FLASHINFER_SAMPLER=0    -> native torch sampler (flashinfer's needs nvcc, not present)
 #   CC/CXX + PATH                    -> Triton JITs kernels at runtime; point it at the conda gcc
-#   COSYVOICE_VLLM_EAGER=1 (default) -> skip torch.compile/CUDA-graph capture (needs more toolchain)
+#   COSYVOICE_VLLM_EAGER=0 (default) -> CUDA graphs ON (=1 skips capture; slower, only for debug)
 set -e
 ENV=/home/porsche/miniconda3/envs/cosyvllm
 export PATH=$ENV/bin:$PATH
@@ -34,20 +34,20 @@ if [ "$COSYVOICE_MODEL" = "v3" ]; then
   # in ~30s on first load (cached to flow.decoder.estimator.fp32.mygpu.plan), audio stays correct,
   # isolated first-chunk TTFB zh 1.48->1.08s / en 1.34->0.80s WITH CUDA graphs (EAGER=0 below) also on.
   # fp16 DiT TRT is NOT used (upstream warns of perf issues); fp32 only. Override with COSYVOICE_FLOW_TRT=0.
-  # CAVEAT: graphs are the config the project rejected for v2 (P33: graph decode perturbs RAS -> zh
-  # LIPSYNC degrades to the EYE though the TTS stopwatch looks faster). UNVERIFIED for v3's zh lipsync.
+  # (Graphs are fine for zh too -- the old P33 "graphs rejected for v2/zh" verdict was REVERSED
+  #  2026-07-14 by the user's live eye; see the Lever 2 note below.)
   export COSYVOICE_FLOW_TRT=${COSYVOICE_FLOW_TRT:-1}
 fi
 # Lever 2 (CUDA graphs): default 0 = capture graphs (faster per-token TTS decode).
-# BASELINE 2026-07-10 (user decision): graphs ON, paired with v3 + flow-TRT, on LANGUAGE=en.
-# Isolated first-chunk TTFB with graphs+flow-TRT: zh 1.08s / en 0.80s.
-# KNOWN RISK, carried from the P27-P33 saga and NOT re-cleared for v3: graphs perturb the
-# zh-critical RAS sampling (P18) -> the zh AUDIO gets longer + more internal silence, and since
-# MuseTalk lip-syncs off a WHISPER of that waveform, the mouth can stop tracking the words. That
-# is why graphs were kept OFF for the v2/zh baseline (the user's eye rejected them, P33). en is
-# spared (no RAS reliance), which is why graphs-on is fine for the current en baseline. If you
-# switch to zh, re-check the lipsync by eye (or flip COSYVOICE_VLLM_EAGER=1 / the panel toggle).
-# (docs P27/P31/P32/P33; the config panel's CUDA-graphs toggle flips this + relaunches.)
+# BASELINE 2026-07-14: graphs ON for EVERY language, zh INCLUDED -- this REVERSES P33.
+# The live baseline (v2 + LANGUAGE=zh + graphs) passed the user's live eye: zh lipsync is fine.
+# P33 had turned a small measured zh-audio delta (graphs perturb the RAS sampling, P18) into a
+# PREDICTED lipsync defect the eye never confirmed -- the same "probe vs eye" lesson (P19) run
+# backwards. Graphs are also the TTS-first-chunk win (avg ~2.0 -> ~0.85s, P32; isolated TTFB
+# with graphs+flow-TRT: zh 1.08s / en 0.80s). Do NOT flip EAGER back to 1 on the strength of
+# the old P33 text; if a future model change re-opens the question, judge it by the live eye.
+# (docs P27/P31/P32/P33 + the 2026-07-14 reversal note in CLAUDE.md; the config panel's
+#  CUDA-graphs toggle flips this + relaunches.)
 export COSYVOICE_VLLM_EAGER=${COSYVOICE_VLLM_EAGER:-0}
 # zh TTFO lever -- REVERTED to 0 (2026-07-04, live-measured twice): hop=5's isolated first-chunk
 # TTFB win (~2.5s -> ~1.8s) is ERASED live in steady mode -- the SMALLER opening chunk fills the

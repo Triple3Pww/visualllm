@@ -356,11 +356,14 @@ def build_events(turn):
                    why="The avatar forwards the first PCM chunk to the :8002 render server the instant TTS emits it (real-time-paced).",
                    src="~ TTS first chunk"))
     ev.append(dict(stage="deliver", t=bs, kind="turn", big=True, label=f"Bot started speaking -> TTFO {turn['ttfo_s']}s",
-                   why="The VOICE starts reaching the client here - audio is forwarded immediately WITHOUT waiting for a rendered frame. "
-                       f"TTFO measures this audio start: {turn['ttfo_s']}s vs the 3s target. Lip-synced video is rendered best-effort (decoupled).",
+                   why="The VOICE starts reaching the client here. Under the default steady (video-master) sync the voice "
+                       "is HELD until MUSETALK_LEAD_FRAMES lip frames are rendered, then released in step with them -- "
+                       f"so this instant is the synced A/V start. TTFO measures it: {turn['ttfo_s']}s vs the 3s target.",
                    src="log [TTFO] (audio-path event)"))
     ev.append(dict(stage="avatar", t=bs, end=bstop, kind="span", label="MuseTalk lip-sync render",
-                   why="Mouth-region frames, live/audio-master sync: the voice is forwarded immediately so it can never freeze; lips track best-effort on the shared GPU.",
+                   why="Mouth-region frames, steady/video-master sync (default): the voice is paced to the REAL rendered "
+                       "frames, so a render stall pauses the voice instead of drifting. (MUSETALK_SYNC_MODE=live is the "
+                       "audio-master alternative: voice instant, lips trail best-effort.)",
                    src="log render window"))
     ev.append(dict(stage="deliver", t=bstop, kind="turn", label="Bot stopped speaking - turn complete",
                    why="Full answer delivered. Mic un-mutes; the assistant aggregator records the turn so the next turn has full history.",
@@ -379,9 +382,9 @@ def build_handoffs(turn):
              note="First complete sentence flushed early, so speech can begin before the full answer exists."),
         dict(**{"from": "tts"}, to="avatar", t=first_tts_fb, what="first voice chunk (16kHz PCM)", star=True,
              note="CosyVoice -> MuseTalk: the avatar forwards the chunk to the :8002 render server the instant TTS emits it."),
-        dict(**{"from": "avatar"}, to="deliver", t=turn["bot_started"], what="voice starts (audio forwarded)",
-             note="MuseTalk -> browser: the VOICE starts immediately - audio is NOT gated on a rendered frame. This is TTFO. "
-                  "Lip frames are rendered best-effort and can lag the voice under GPU load."),
+        dict(**{"from": "avatar"}, to="deliver", t=turn["bot_started"], what="voice starts (synced A/V start)",
+             note="MuseTalk -> browser: under steady (default) the voice is held for the MUSETALK_LEAD_FRAMES render "
+                  "cushion, then released paced to the real rendered frames. This synced start is TTFO."),
     ]
 
 

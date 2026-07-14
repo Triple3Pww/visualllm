@@ -1231,7 +1231,26 @@ strictly better, and the band-warmup fix I'd designed was NOT built (mechanism A
 **BUT this measured the wrong side — see P33.** Spec: `docs/superpowers/specs/2026-07-05-cuda-graphs-without-drawback-design.md`.
 Lesson: a green TTS-TTFB probe is not a green avatar.
 
-## P33 — VERDICT: keep EAGER — CUDA graphs degrade zh LIPSYNC (the real, measured cost) (2026-07-05, later 8th session)
+## P33 — ~~keep EAGER — CUDA graphs degrade zh LIPSYNC~~ **REVERSED 2026-07-14: graphs do NOT degrade zh lipsync** (2026-07-05, later 8th session)
+
+> **REVERSED 2026-07-14 — DO NOT ACT ON THIS SECTION'S VERDICT.** The live baseline runs `COSYVOICE_MODEL=v2` +
+> `LANGUAGE=zh` + `COSYVOICE_VLLM_EAGER=0` (**graphs ON**) — confirmed in the running WSL server's own
+> `/proc/<pid>/environ` — and **the user's live eye says the Chinese lipsync is fine.** Graphs ON is the correct
+> setting for every language. Do not flip `COSYVOICE_VLLM_EAGER` back to `1`, and do not "repair" a live config that
+> has graphs on for zh.
+>
+> **What survives:** the audio measurement below (graphs ON does slightly alter the zh waveform) may well still be true.
+> **What was wrong:** the *inference* that this delta reaches the eye as bad lipsync. It doesn't — the delta is too
+> small to perceive.
+>
+> **The lesson, and it cuts the other way from the usual one.** The house rule is "the probe passes what the eye
+> rejects" (P19/P22): the stopwatch is too generous, so let the eye veto it. **P33 ran that rule backwards** — it took
+> a *measured difference* (a slightly longer, slightly gappier zh waveform) and *predicted* a perceptual defect the eye
+> had never confirmed, then wrote it down as a verdict. A measurable delta is not automatically a perceived one. The
+> live eye is the arbiter in **both** directions: it can acquit as well as convict. Before a measurement becomes a
+> verdict, it needs the eye either way.
+>
+> (Kept below in full for its numbers + history. The P27/P31/P32 chain is unaffected.)
 
 **Symptom (user's eye).** With graphs ON the zh **mouth shapes stop matching the words** (voice sounds right, lips
 wrong); graphs OFF the zh lips match. English fine either way. NOT timing/fps — per-turn render held ~14fps in every
@@ -1244,10 +1263,12 @@ what stops zh looping on the silence token). MuseTalk lip-syncs off a **Whisper 
 text — so a degraded/altered zh waveform → mouth shapes that don't track the phonemes the user hears. en doesn't lean
 on RAS, so it's spared.
 
-**Fix / verdict.** Keep `COSYVOICE_VLLM_EAGER=1` (eager). Graphs win the TTS stopwatch (P32) but lose the avatar,
-and the avatar is the product. This **reconciles with P31's original revert** — the eye was right; the TTS-side probe
-(P32) structurally cannot see the zh-audio cost. Set `=0` only for an en-only / TTS-throughput setup. The config
-panel's CUDA-graphs toggle flips + persists this. (Recurring lesson, now 3×: the probe passes what the eye rejects.)
+**~~Fix / verdict~~ (REVERSED — see the banner at the top of P33).** ~~Keep `COSYVOICE_VLLM_EAGER=1` (eager). Graphs win
+the TTS stopwatch (P32) but lose the avatar, and the avatar is the product. This **reconciles with P31's original
+revert** — the eye was right; the TTS-side probe (P32) structurally cannot see the zh-audio cost. Set `=0` only for an
+en-only / TTS-throughput setup.~~ **The 2026-07-14 live baseline is graphs ON (`COSYVOICE_VLLM_EAGER=0`) on zh, and the
+lipsync is fine — this verdict did not survive contact with the eye it claimed to be defending.** The config panel's
+CUDA-graphs toggle flips + persists the flag if you need it.
 
 ## P34 — zh turn-start "breathing sound" = CosyVoice's leading breath. FIXED 2026-07-14 by a SERVER-SIDE trim (the old client-side trim stays rejected)
 
@@ -1734,10 +1755,11 @@ builds an fp32 engine from the shipped `flow.decoder.estimator.fp32.onnx` in ~30
 card (saves `.env` + relaunches the WSL server); `restart_cosyvoice()` now forwards `COSYVOICE_MODEL` so a graphs toggle no
 longer silently resets a v3 user back to v2.
 
-**CAVEAT — graphs on zh is UNVERIFIED for v3.** Graphs are exactly the config P33 rejected for v2's Chinese (graph decode
-perturbs RAS → gappier zh audio → mouth mistracks). The baseline is graphs-on ONLY because it is also `LANGUAGE=en`, which
-is spared (no RAS reliance). Before trusting v3+graphs for zh, re-check lipsync by eye (or `COSYVOICE_VLLM_EAGER=1`). Phase-2
-v2-vs-v3 zh clips (`output/zh_v{2,3}_synced.mp4`) rendered but NOT eye-judged.
+**~~CAVEAT — graphs on zh is UNVERIFIED for v3~~ — RESOLVED 2026-07-14: graphs on zh are FINE.** The concern was that
+graphs are the config P33 rejected for v2's Chinese (graph decode perturbs RAS → gappier zh audio → mouth mistracks).
+**P33 is reversed** (see its banner): the live baseline runs v2 + `LANGUAGE=zh` + graphs ON and the user's eye reports the
+Chinese lipsync is fine, so graphs-on is not an en-only escape hatch — it is correct for every language. Phase-2
+v2-vs-v3 zh clips (`output/zh_v{2,3}_synced.mp4`) rendered but NOT eye-judged (a v2-vs-v3 question, not a graphs one).
 
 **METROLOGY LESSON (cost most of the session; a P40-family trap).** Measuring zh with `curl` from git-bash MANGLES the UTF-8
 payload → the server receives non-Chinese bytes → `text_normalize` returns `[]` → synthesis silently yields **HTTP 200 with 0

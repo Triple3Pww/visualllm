@@ -22,7 +22,7 @@ A/V-sync architecture decision (read it before touching sync).**
 | VAD | Silero (local) | pipeline |
 | STT | Deepgram nova-2 (`en-US`/`zh-TW`/`th` by `LANGUAGE`) default; **local OFFLINE alt `STT_PROVIDER=sherpa`** (sherpa-onnx streaming zipformer, bilingual zh-en, in-process CPU/~0 VRAM, zh→Traditional via OpenCC) | cloud / **local CPU** |
 | LLM | `LLM_PROVIDER=openrouter` — OpenAI-compatible, so **cloud OR local Ollama** by `OPENROUTER_BASE_URL` (any model via `OPENROUTER_MODEL`); or `weather_chain` (Chinese weather bot) | cloud / local / remote |
-| TTS | **CosyVoice** local streaming on vLLM in WSL — **now IN THIS REPO at `tts/cosyvoice-server/`** (2026-07-14; it used to be a separate repo). `COSYVOICE_MODEL=v2` (CosyVoice2-0.5B, **what `.env` actually runs**) or `v3` (Fun-CosyVoice3-0.5B, +flow-TRT + CUDA graphs; graphs carry the P33 zh-lipsync caveat, safe on `en`). Thai only: `TTS_PROVIDER=jaitts` (`:8004`) | **`:8001`, WSL** |
+| TTS | **CosyVoice** local streaming on vLLM in WSL — **now IN THIS REPO at `tts/cosyvoice-server/`** (2026-07-14; it used to be a separate repo). `COSYVOICE_MODEL=v2` (CosyVoice2-0.5B, **what `.env` actually runs**) or `v3` (Fun-CosyVoice3-0.5B, +flow-TRT). CUDA graphs are **ON for all languages incl. zh** (2026-07-14, reverses P33 — see below). Thai only: `TTS_PROVIDER=jaitts` (`:8004`) | **`:8001`, WSL** |
 | Avatar | **MuseTalk** local mouth-region talking-head (**switchable preset**: `nimbus` female / `leo` his face+voice — `AVATAR_PRESET`), **TensorRT render by default** (`MUSETALK_TRT=1`) | **`:8002`, `musetalk` conda env** |
 | Config | **Web config panel** — edit `.env` + restart the pipeline from a browser | **`:7870` (`:8444` over Tailscale)** |
 
@@ -55,25 +55,24 @@ longer comma-less clause garbled. Fix = **`COSYVOICE_T2S=1` (default on)** conve
 Reproduced + verified locally (transcribe-back A/B): Traditional now synthesizes as cleanly as Simplified. `COSYVOICE_T2S=0`
 disables. A distinct root cause from the RAS silence-loop (P18) above.
 
-**vLLM CUDA graphs — BASELINE NOW GRAPHS-ON for v3 + `en` (2026-07-10, 17th session); the zh caveat below STILL STANDS
-(`docs/PROBLEMS-AND-FIXES.md` P27/P31/P32/P33):** `COSYVOICE_VLLM_EAGER` default is **`0`** (graphs on) in
-`run_vllm_server.sh`, paired with `COSYVOICE_MODEL=v3` + flow-TRT on `LANGUAGE=en` (isolated first-chunk zh 1.08/en 0.80s).
-This is SAFE ONLY because en does not rely on RAS (see below). **For `zh`, the eager verdict below holds — graphs degrade
-zh lipsync (UNVERIFIED for v3); flip `COSYVOICE_VLLM_EAGER=1` or re-check by eye before trusting v3+graphs for Chinese.**
-The full P27-P33 history (why graphs were kept eager for the v2/zh baseline):
-`COSYVOICE_VLLM_EAGER` was **`1`** (eager) for the v2 baseline. P27 set it `0` (CUDA-graph capture) to cut
-TTS first-chunk avg ~2.0→~0.85s; P31 reverted it for "live inconsistency." A P32 re-investigation then measured the
-TTS side directly (`tts/cosyvoice-server/_ttfb_variance.py`) and found graphs are actually **faster + lower-variance**
-than eager — even under real MuseTalk render (96 samp: graphs 1.29/2.23/0.37s vs eager 1.94/3.43/0.64) — so the P31
-"shape-spike" mechanism did NOT reproduce. **But that measured the WRONG side.** P33: the real cost is zh **lipsync** —
-graphs ON alter the zh AUDIO (measured `tts/cosyvoice-server/_zh_audio_ab.py`: longer + more internal silence, more
-variance) because the graph decode perturbs the zh-critical **RAS** sampling (the P18 fix). MuseTalk lip-syncs off a
-**Whisper of the waveform**, so a degraded zh waveform → mouth shapes that don't track the words; en is spared (no RAS
-reliance), render fps stays ~14 (not a render-starve). **Verdict for zh: eager — graphs win the TTS stopwatch but lose
-the avatar, and the avatar is the product** (reconciles with P31's revert; the eye caught what the TTS probe can't see).
-The independent Lever-4 poll-tighten (`model.py` 0.1→0.02) stays. **The 2026-07-10 baseline took the en escape hatch this
-section always noted** — graphs ON (`COSYVOICE_VLLM_EAGER=0`) because en is spared. Flip back to eager, or toggle it in the
-config panel's **CUDA graphs** card (rewrites the script + relaunches WSL), the moment the baseline moves to zh.
+**vLLM CUDA graphs — GRAPHS ON EVERYWHERE, zh INCLUDED (2026-07-14; this REVERSES P33).**
+`COSYVOICE_VLLM_EAGER` default is **`0`** (graphs on) in `run_vllm_server.sh`, and that is the correct setting for
+**every** language. The live baseline runs `COSYVOICE_MODEL=v2` + `LANGUAGE=zh` + graphs ON, and **the user's live eye
+says the Chinese lipsync is fine.** Graphs are also the TTS-first-chunk win (avg ~2.0→~0.85s, P27). So: **do not flip
+`COSYVOICE_VLLM_EAGER` back to `1`, and do not "fix" the live config to eager on the strength of P33** — that verdict
+was wrong. The config panel's **CUDA graphs** card toggles it (rewrites the script + relaunches WSL) if you ever need to.
+
+**Why P33 said the opposite, and why it was wrong** (`docs/PROBLEMS-AND-FIXES.md` P27/P31/P32/P33): P31 reverted graphs
+for "live inconsistency"; P32 measured the TTS side (`tts/cosyvoice-server/_ttfb_variance.py`) and found graphs
+*faster + lower-variance* than eager even under real MuseTalk render (96 samp: graphs 1.29/2.23/0.37s vs eager
+1.94/3.43/0.64), so P31's "shape-spike" mechanism did not reproduce. P33 then measured the zh **audio**
+(`_zh_audio_ab.py`) and found graphs ON does slightly alter the zh waveform (longer, more internal silence) — the graph
+decode perturbs the zh-critical **RAS** sampling (the P18 fix) — and *inferred* that, since MuseTalk lip-syncs off a
+**Whisper of the waveform**, this must degrade zh lipsync. **That inference never held up live.** The audio delta is real
+but too small to reach the eye. **The lesson cuts both ways:** the house rule is "the probe passes what the eye rejects"
+(P19) — P33 ran it backwards, turning a *measured difference* into a *predicted defect* the eye never confirmed. A
+measurable delta is not automatically a perceived one; the live eye is the arbiter in **both** directions.
+The independent Lever-4 poll-tighten (`model.py` 0.1→0.02) stays.
 
 **Shared-GPU VRAM (why "won't talk" can mean CosyVoice crashed):** vLLM and MuseTalk share the one
 16GB card. vLLM's `gpu_memory_utilization` (env `COSYVOICE_VLLM_GPU_UTIL`, **default `0.3`**, set in
@@ -250,8 +249,12 @@ shock absorber; lower starves the queue → freeze. The 2026-07-03 sweep rejecte
 2026-07-04 the user live-eye tested **every value below 14** and saw delay or avatar freezes — even `lead=8`
 at hop=0, which had measured zh 3.03/en 2.48s median probe-screen clean. The probe misses what the eye
 catches; do not re-try lower leads. Server-side knob: only a full relaunch applies it, not the panel Restart),
-`COSYVOICE_PACE_RATE` (1.3, in the cosyvoice server — caps voice production so it doesn't burst
-the shared GPU), `COSYVOICE_FIRST_PIECE` (**1 = default, TTFO win**: emit a short opening CLAUSE to
+`COSYVOICE_PACE_RATE` (**UNSET = OFF, verified 2026-07-14 in the running server's own `/proc/<pid>/environ`** —
+this doc used to claim "1.3"; it is not set in `.env`, not in `run_vllm_server.sh`, and the code default in
+`tts/cosyvoice-server/app.py` is `0` = no pacing. **CosyVoice already streams unthrottled.** When it IS set it caps
+the OPENING chunks to `rate`x real-time so the TTS GPU burst doesn't collide with MuseTalk's first render segment;
+it stops after `COSYVOICE_PACE_WINDOW_S` (2.0s) of emitted audio, and it **never delays the first chunk** — so it is
+NOT a TTFO lever in either direction), `COSYVOICE_FIRST_PIECE` (**1 = default, TTFO win**: emit a short opening CLAUSE to
 TTS first, then normal sentences. CosyVoice's first-chunk TTFB scales with the INPUT sentence length
 — it prefills the whole sentence before the first audio token, so a 16-word opener costs ~3.0s vs
 ~1.7s short. Splitting cut TTS first-chunk ~3.0s→~1.7s and **TTFO ~4.6s→~3.2s**, flow stays smooth
@@ -263,7 +266,8 @@ contention; smaller MAX = faster start but risks a between-clause pause). `0` = 
 2026-07-04**: the en split above never fires on Chinese — full-width ，vs ASCII comma, no spaces —
 so long zh openers cost ~3.1s TTFB; this flushes the first piece at a full-width ，；： ONLY, never
 a char cap, min `COSYVOICE_FIRST_PIECE_ZH_MIN_CHARS`=5 CJK chars. Long-opener turns 4.78→3.08s, no
-between-clause pause. P23), `FILLER_WORDS` (**1 = default baseline, 2026-07-05**: the turn OPENS on a
+between-clause pause. P23), `FILLER_WORDS` (**live `.env` = 0 (OFF) since the zh P30 caveat below; the 2026-07-05
+"1 = baseline" claim is stale — the knob remains available**: `1` OPENS the turn on a
 rotated natural "thinking" phrase ("嗯，讓我想一下喔，…") synthesized through the normal TTS path — one
 continuous turn, zero screech (audio gap ~60ms) — so the avatar starts talking + lip-moving ~0.7s sooner
 (zh def 2.91→2.23s, wx 2.38→2.03s). **HONEST: a PERCEPTION win, not a speedup — TTFO counts time-to-first-SOUND
@@ -322,7 +326,7 @@ wsl -d Ubuntu -e bash -c "bash /mnt/e/Claude/VisualLLm/tts/cosyvoice-server/run_
 #    Then set .env COSYVOICE_URL to the WSL IP (NOT localhost — WSL2 relay buffers the stream): `wsl hostname -I`.
 #    FALLBACK = Windows PyTorch server (slower, TTFB ~3.4s), set COSYVOICE_URL=http://localhost:8001 :
 #      E:\miniconda3\envs\tts\python.exe -m uvicorn app:app --host 0.0.0.0 --port 8001
-#    (COSYVOICE_PACE_RATE defaults to 1.3; the Windows server needs SSL_CERT_FILE=<certifi> —
+#    (COSYVOICE_PACE_RATE is UNSET -> code default 0 = pacing OFF; the Windows server needs SSL_CERT_FILE=<certifi> —
 #     the tts/musetalk conda envs have a broken Windows cert store; see STATUS.md/memory.)
 
 # 2. MuseTalk avatar server — `musetalk` conda env (NOT the pipeline env), serves :8002
