@@ -64,8 +64,10 @@ FIELDS = [
      "options": ["qwen2.5:7b", "gemma3:27b"], "help": "Used when LLM provider = weather_chain (must be installed on NCU)"},
     {"key": "TTS_PROVIDER", "group": "curated", "label": "TTS provider", "type": "select",
      "options": ["cosyvoice", "moss", "elevenlabs", "deepgram"], "help": "Voice engine"},
-    {"key": "COSYVOICE_VOICE", "group": "curated", "label": "CosyVoice voice", "type": "text",
-     "options": ["weather", "pro"], "help": "Registered zero-shot speaker id (CosyVoice)"},
+    # (No "CosyVoice voice" field: the server ACCEPTS a `voice` request field but IGNORES it -- the
+    #  engine has one registered reference voice, chosen by COSYVOICE_PROMPT_WAV/TEXT. The real
+    #  voice control is the "Avatar preset" card, which swaps those. A free-text speaker-id knob here
+    #  did nothing but mislead.)
     {"key": "MUSETALK_SYNC_MODE", "group": "curated", "label": "A/V sync", "type": "select",
      "options": ["steady", "live"], "help": "steady = synced start (voice may pause under load); live = voice instant, lips trail"},
     {"key": "FILLER_WORDS", "group": "curated", "label": "Filler opener", "type": "select",
@@ -74,6 +76,12 @@ FIELDS = [
      "options": ["1", "0"], "help": "1 = speak the opening clause early -> lower TTS first-chunk (TTFO win). Needed by filler opener."},
     {"key": "AVATAR_MEMORY", "group": "curated", "label": "Avatar memory", "type": "select",
      "options": ["1", "0"], "help": "1 = remember across turns (local CPU qwen); 0 = stateless"},
+    {"key": "VAD_STOP_SECS", "group": "curated", "label": "VAD end-of-turn silence (s)", "type": "text",
+     "options": ["0.3", "0.5", "0.8", "1.0"],
+     "help": "Silence the VAD must hear before it calls end-of-speech. Lower = snappier reply, too low cuts "
+             "you off at a mid-sentence pause. NOTE: with interruptions on, end-of-TURN is decided by the Smart "
+             "Turn v3 analyzer -- this feeds it, so it shapes responsiveness rather than dictating it. Never "
+             "shows in TTFO (the stopwatch starts when the turn ends) but you wait for it. Default 0.5."},
 
     # --- advanced ---
     {"key": "TTFO_TARGET_SECONDS", "group": "advanced", "label": "TTFO target (s)", "type": "text"},
@@ -97,6 +105,15 @@ FIELDS = [
      "options": ["1", "0"], "help": "1 = split the zh opener at a full-width comma (the en char-split never fires on zh)"},
     {"key": "CLIENT_FORCE_SPEAKER", "group": "advanced", "label": "Force phone speaker", "type": "select",
      "options": ["1", "0"], "help": "1 = play voice on the phone loudspeaker (mobile UA only); desktop untouched"},
+    {"key": "VAD_START_SECS", "group": "advanced", "label": "VAD start-of-turn speech (s)", "type": "text",
+     "options": ["0.1", "0.2", "0.3"], "help": "Speech needed before the VAD calls start-of-turn. Default 0.2."},
+    {"key": "VAD_CONFIDENCE", "group": "advanced", "label": "VAD confidence", "type": "text",
+     "options": ["0.5", "0.7", "0.9"],
+     "help": "Silero score above which a frame counts as speech. RAISE on a noisy mic that false-triggers; "
+             "lower if a quiet voice is missed. Default 0.7."},
+    {"key": "VAD_MIN_VOLUME", "group": "advanced", "label": "VAD min volume", "type": "text",
+     "options": ["0.4", "0.6", "0.8"],
+     "help": "Volume gate below which audio is never speech. Raise to ignore background noise. Default 0.6."},
     {"key": "CLIENT_JITTER_BUFFER_MS", "group": "advanced", "label": "Jitter buffer (ms)", "type": "text"},
     {"key": "WEBRTC_VIDEO_BITRATE_MAX", "group": "advanced", "label": "Max video bitrate", "type": "text"},
     {"key": "WEBRTC_ICE_SUBNET", "group": "advanced", "label": "ICE subnet", "type": "text"},
@@ -151,7 +168,14 @@ def write_env(updates: dict) -> list:
         if old_val != new_val:
             lines[i] = f"{indent}{key}{eq}{new_rest}{nl}"
             changed.append(key)
-    # append any updated keys that weren't already in the file
+    # append any updated keys that weren't already in the file. Make sure the file ENDS with a
+    # newline first: splitlines(keepends=True) leaves the last line WITHOUT one when the file has
+    # no trailing newline, so "".join would weld the new key onto it
+    # (MUSETALK_DUMP_DELIVERED=0AVATAR_PRESET=leo -- corrupting the old value AND losing the new
+    # key). Only bites when writing a key that is not already in .env, which is precisely what the
+    # preset / cosy-model / avatar-split buttons do.
+    if lines and not lines[-1].endswith("\n"):
+        lines[-1] += "\n"
     for key, val in updates.items():
         if key not in seen:
             lines.append(f"{key}={val}\n")

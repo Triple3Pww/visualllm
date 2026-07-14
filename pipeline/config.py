@@ -64,6 +64,20 @@ class Config:
     # machine so it's safe under the default steady mode. See main.py.
     allow_interruptions: bool = (_get("ALLOW_INTERRUPTIONS", "1") or "1").lower() in ("1", "true", "yes", "on")
 
+    # --- VAD (Silero, local, always-on) — turn-taking feel vs. perceived latency ---
+    # VAD_STOP_SECS is the big one: it is the silence the VAD must SEE before it calls
+    # end-of-turn, so it sits ENTIRELY BEFORE the TTFO stopwatch starts (t0 = user-stopped)
+    # -- it never shows up in a TTFO number, but the user waits every second of it. Lower =
+    # snappier replies; too low and it cuts the user off mid-sentence (a pause between clauses
+    # reads as end-of-turn). Raise it if the bot keeps interrupting; lower it to feel faster.
+    # The other three are sensitivity: CONFIDENCE/MIN_VOLUME gate what counts as speech at all
+    # (raise them on a noisy mic that keeps false-triggering), START_SECS is how much speech is
+    # needed to call start-of-turn. Defaults = the values these had hardcoded in stages/vad.py.
+    vad_stop_secs: float = _get_float("VAD_STOP_SECS", "0.5")
+    vad_start_secs: float = _get_float("VAD_START_SECS", "0.2")
+    vad_confidence: float = _get_float("VAD_CONFIDENCE", "0.7")
+    vad_min_volume: float = _get_float("VAD_MIN_VOLUME", "0.6")
+
     # --- STT (Deepgram) ---
     deepgram_api_key: str | None = _get("DEEPGRAM_API_KEY")
 
@@ -131,7 +145,8 @@ class Config:
     # the user's cosyvoice-local-tts FastAPI server). Voice "weather" is its registered
     # female Mandarin zero-shot reference; native rate 24 kHz (Pipecat resamples down).
     cosyvoice_url: str = _get("COSYVOICE_URL", "http://localhost:8001")
-    cosyvoice_voice: str = _get("COSYVOICE_VOICE", "weather") or "weather"
+    # (no cosyvoice_voice: the server ignores the per-request `voice` field -- it has ONE registered
+    #  reference voice set by COSYVOICE_PROMPT_WAV/TEXT, swapped via the config panel's avatar presets.)
     cosyvoice_sample_rate: int = int(_get("COSYVOICE_SAMPLE_RATE", "24000") or "24000")
     # MOSS-TTS-Realtime local streaming server (local_services/moss_server/app.py, runs
     # in the moss-tts conda env). Same /tts/stream raw-PCM wire contract as CosyVoice, so
@@ -139,6 +154,12 @@ class Config:
     # fixed reference clip pinned server-side (MOSS_REF); native rate 24 kHz.
     moss_url: str = _get("MOSS_URL", "http://localhost:8003")
     moss_sample_rate: int = int(_get("MOSS_SAMPLE_RATE", "24000") or "24000")
+    # JaiTTS-F5TTS local Thai server (local_services/jaitts_server/app.py, runs in the
+    # shared F5 venv E:/f5-spike/.venv-f5). THE Thai voice path -- CosyVoice cannot speak
+    # Thai. Same /tts/stream raw-PCM contract, so TTS_PROVIDER=jaitts reuses the CosyVoice
+    # client pointed at JAITTS_URL. Voice = a fixed reference clip (JAITTS_REF); 24 kHz.
+    jaitts_url: str = _get("JAITTS_URL", "http://localhost:8004")
+    jaitts_sample_rate: int = int(_get("JAITTS_SAMPLE_RATE", "24000") or "24000")
     elevenlabs_api_key: str | None = _get("ELEVENLABS_API_KEY")
     elevenlabs_voice_id: str | None = _get("ELEVENLABS_VOICE_ID")
     # flash_v2_5 is low-latency and multilingual (covers zh-TW); override for a
