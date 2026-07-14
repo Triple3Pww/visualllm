@@ -30,6 +30,15 @@ def build_stt(cfg: Config):
             pause_while_bot_speaks=cfg.echo_guard,
         )
 
+    if cfg.stt_provider != "deepgram":
+        # Fail loudly rather than silently transcribing on the wrong engine: a typo'd
+        # STT_PROVIDER used to fall through to Deepgram (a CLOUD service, and a bill) --
+        # the same bad default the TTS factory already refuses.
+        raise ValueError(
+            f"STT_PROVIDER={cfg.stt_provider!r} is not supported. Use 'deepgram' (default) "
+            f"or 'sherpa' (local offline)."
+        )
+
     from pipecat.services.deepgram.stt import DeepgramSTTService
 
     if cfg.is_thai:

@@ -410,9 +410,6 @@ class MuseTalkEngine:
             self.idx = 0
 
     # --- realtime inference ----------------------------------------------
-    def samples_per_frame(self, fps: int) -> int:
-        return int(AUDIO_SR / fps)
-
     def samples_for_frames(self, n_frames: int, fps: int | None = None) -> int:
         """Samples that render to EXACTLY n_frames lip frames.
 

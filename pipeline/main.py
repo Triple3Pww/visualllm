@@ -399,7 +399,9 @@ class _TranscriptStore:
         text = (text or "").strip()
         if not text:
             return
-        logger.info(f"[commit-dbg] {role} {text!r}")  # TEMP
+        # KEEP this line (P45): it is the only log of each turn's committed reply/user text --
+        # losing it is what hid the transcript corruption for weeks. Not temporary.
+        logger.info(f"[commit-dbg] {role} {text!r}")
         self._seq += 1
         self._items.append({"seq": self._seq, "role": role, "text": text})
         if len(self._items) > self._cap:
@@ -1015,6 +1017,13 @@ if __name__ == "__main__":
     _configure_webrtc_video_bitrate()
     # Serve the custom 'Nimbus AI' redesign at /nimbus/ (additive; /client stays the fallback).
     _install_nimbus_client()
+    # The /client/* API middleware (transcript, say, ice-config, avatar-overlay) is what makes
+    # the nimbus/studio clients work -- it must NOT depend on the public-WebRTC gate. It used to
+    # be installed only from inside _install_turn_ice_servers(), which returns early when
+    # WEBRTC_PUBLIC=0 and no TURN_URLS -- so going tailnet-only silently 404'd the chat bubbles,
+    # typed turns, AND the split-mode overlay (the avatar showed a raw mouth crop full-frame).
+    # Idempotent: the TURN installer's own call becomes a no-op.
+    _ensure_client_patch_middleware()
     # Pin ICE host candidates to the Tailscale interface so the stable 100.x<->100.x pair
     # wins immediately (kills the intermittent-mic ICE pollution -- see the function docstring).
     _restrict_ice_to_subnet()

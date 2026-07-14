@@ -24,7 +24,9 @@ PORT = 7870
 REPO = Path(__file__).resolve().parents[2]   # .../visualllm
 ENV = REPO / ".env"
 _HTML = Path(__file__).parent / "index.html"
-_PIPELINE_LOG = REPO / "scratchpad_pipeline.log"
+# Raw stdout/stderr of the panel-restarted pipeline. Lives with every other log under logs\
+# (it used to be a stray scratchpad_pipeline.log in the repo root).
+_PIPELINE_LOG = REPO / "logs" / "pipeline_restart.out.log"
 # The MuseTalk avatar server runs in its OWN conda env (reads OS env only, no python-dotenv).
 # MUSETALK_SPLIT changes what it STREAMS, so toggling it must relaunch :8002 -- the pipeline-only
 # Restart never touches the avatar server. Path mirrors run.ps1's -MusetalkPython default.
@@ -233,6 +235,7 @@ def restart_pipeline() -> dict:
                 pass
         time.sleep(2)
         DETACHED = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        _PIPELINE_LOG.parent.mkdir(exist_ok=True)
         log = open(_PIPELINE_LOG, "ab")
         subprocess.Popen(
             [sys.executable, "-m", "pipeline.main"], cwd=str(REPO),
@@ -243,7 +246,7 @@ def restart_pipeline() -> dict:
             time.sleep(1)
             if port_up(7860):
                 return {"ok": True, "message": "pipeline restarted (bound :7860)"}
-        return {"ok": False, "message": "started, but :7860 not up in 40s -- check scratchpad_pipeline.log"}
+        return {"ok": False, "message": "started, but :7860 not up in 40s -- check logs/pipeline_restart.out.log"}
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "message": f"restart failed: {type(e).__name__}: {e}"}
 
@@ -356,11 +359,16 @@ def restart_cosyvoice() -> dict:
     try:
         (REPO / "logs").mkdir(exist_ok=True)
         log = open(REPO / "logs" / "cosyvoice_wsl.log", "ab")
-        DETACHED = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        # CREATE_NEW_CONSOLE, NOT DETACHED_PROCESS: wsl.exe requires a console and dies
+        # instantly (rc=0, zero output) when launched detached -- that was the ":8001 not
+        # healthy, empty log" failure that broke the graphs/model/preset cards. A new console
+        # keeps wsl alive while stdout/stderr still land in the redirected log (verified:
+        # detached ran nothing; new-console ran to completion). launch.ps1 works the same way.
+        CREATE_NEW_CONSOLE = 0x00000010
         subprocess.Popen(
             ["wsl.exe", "-d", _WSL_DISTRO, "-e", "bash", "-c", inner],
             stdout=log, stderr=log, stdin=subprocess.DEVNULL,
-            creationflags=DETACHED if os.name == "nt" else 0,
+            creationflags=CREATE_NEW_CONSOLE if os.name == "nt" else 0,
         )
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "message": f"relaunch failed: {type(e).__name__}: {e}"}
