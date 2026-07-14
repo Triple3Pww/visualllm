@@ -176,48 +176,6 @@ def parse_turn():
     return _build_turn(lines, bi, lines[bi][0], ttfo_s, ttfo_pass)
 
 
-def parse_browser_turn(target_s=3.0, fresh_s=300.0):
-    """Anchor the most recent REAL BROWSER turn for --from-browser.
-
-    Browser turns don't emit a [TTFO line: pipecat's transcription turn-stop path (logged
-    'strategy: None') broadcasts no user-stop frame the TtfoMeter arms on, and a noisy real mic
-    yields no Silero VAD stop either — so parse_turn()'s [TTFO anchor would lock onto a STALE
-    headless turn. Instead we anchor on the real [client-playout] beacon: bot_started is the
-    'Bot started speaking' whose audio the beacon reports (the server emit precedes the browser
-    onset), and we compute the turn's TTFO ourselves. Returns a turn dict, or None if there is no
-    beacon / no matching bot-start (e.g. the browser page is stale and never armed the probe)."""
-    lines = _parse_lines()
-    # Anchor on the beacon's SERVER-CLOCK arrival time (its log timestamp), NOT the browser's
-    # Date.now() in the body: the client can be a DIFFERENT device whose clock is skewed from the
-    # server's (breaks the same-box assumption), but the server logs bot-start AND the beacon POST
-    # on one clock. server_arrival - bot_started = last mile + the onset->POST round-trip (~tens of
-    # ms on a LAN) — a small, honest overestimate that is robust to any client clock offset.
-    beacon = None
-    for dt, txt in reversed(lines):
-        if "[client-playout]" in txt and "audio-onset" in txt:
-            beacon = dt.timestamp()  # server-clock instant the onset beacon reached us
-            break
-    if beacon is None:
-        return None
-    # Freshness guard: reject a beacon logged minutes ago (a stale prior turn / a crafted test) so it
-    # can't fake a number — fall back with the "hard-reload + do one turn" guidance instead.
-    if time.time() - beacon > fresh_s:
-        return None
-    # The 'Bot started speaking' whose audio this beacon reports: the server emit precedes the
-    # beacon arrival by the last mile, so take the closest bot-start within a 6s window before it.
-    bi = None
-    for i in range(len(lines) - 1, -1, -1):
-        dt, txt = lines[i]
-        if "Bot started speaking" in txt and 0 <= beacon - dt.timestamp() <= 6.0:
-            bi = i
-            break
-    if bi is None:
-        return None
-    turn = _build_turn(lines, bi, lines[bi][0], None, None, target_s=target_s)
-    turn["playout_epoch"] = beacon  # server-clock beacon arrival -> the last-mile source
-    return turn
-
-
 def _build_turn(lines, bi, bot_started_t, ttfo_s, ttfo_pass, target_s=3.0):
     """Shared anchor extraction. bi indexes the turn's 'bot start' line (a [TTFO line for the
     headless path, a 'Bot started speaking' line for the browser path). ttfo_s=None means the
@@ -328,19 +286,6 @@ def build_waterfall(anchors, playout_source="est"):
     rows.append(dict(stage="END-TO-END, user hears", delta=None, cum=total,
                      source="", status="total"))
     return rows
-
-
-def parse_playout_beacon(lines, t0_dt):
-    """First real-browser [client-playout] audio-onset after t0. lines: list of (datetime, text)
-    (as _parse_lines returns). The beacon body is JSON {"ev":"audio-onset","t":<epoch_ms>}.
-    Returns the offset from t0 in seconds (same-box clock), or None."""
-    t0e = t0_dt.timestamp()
-    for dt, txt in lines:
-        if "[client-playout]" in txt and "audio-onset" in txt and dt >= t0_dt:
-            m = re.search(r'"t":\s*(\d+(?:\.\d+)?)', txt)
-            if m:
-                return round(float(m.group(1)) / 1000.0 - t0e, 3)
-    return None
 
 
 # --------------------------------------------------------- assemble timeline JS
@@ -574,26 +519,12 @@ def print_summary(report):
 
 
 async def main(args):
-    lines_cache = None
-    if args.from_browser:
-        print("[1/3] --from-browser: parsing the last real-browser turn (no headless probe)...")
-        vwall, awall, pm = [], [], {}
-    else:
-        print("[1/3] driving a real turn through the live pipeline (WebRTC)...")
-        vwall, awall, connect_t = await run_probe(args.mic, args.lead, args.tail, args.duration)
-        pm = probe_metrics(vwall, awall, connect_t, args.fps)
+    print("[1/3] driving a real turn through the live pipeline (WebRTC)...")
+    vwall, awall, connect_t = await run_probe(args.mic, args.lead, args.tail, args.duration)
+    pm = probe_metrics(vwall, awall, connect_t, args.fps)
 
     print("[2/3] parsing the pipeline.log delta for this turn...")
-    turn = None
-    if args.from_browser:
-        # Browser turns log no [TTFO, so anchor on the real [client-playout] beacon instead of
-        # letting parse_turn() lock onto a stale headless [TTFO turn.
-        turn = parse_browser_turn()
-        if turn is None:
-            print("  [warn] no [client-playout] beacon found — falling back to the last [TTFO turn. "
-                  "Hard-reload /client/ (so the probe injects), do ONE turn, then re-run.")
-    if turn is None:
-        turn = parse_turn()
+    turn = parse_turn()
     t0_epoch = turn["t0"].timestamp()
 
     # Last mile source 1 (headless): first ANSWER audio arriving at the client, on the log clock.
@@ -613,17 +544,6 @@ async def main(args):
         else:
             client_arrival = round(onset - t0_epoch, 3)
 
-    # Last mile source 2 (real browser): the [client-playout] onset beacon, if present.
-    playout = None
-    if args.from_browser:
-        if turn.get("playout_epoch") is not None:
-            # Use the exact beacon parse_browser_turn anchored on (avoids re-matching a stale/bogus
-            # beacon logged after t0). Its browser onset epoch is on the same-box clock as t0.
-            playout = round(turn["playout_epoch"] - t0_epoch, 3)
-        else:
-            lines_cache = _parse_lines()
-            playout = parse_playout_beacon(lines_cache, turn["t0"])
-
     anchors = dict(
         llm_recv=0.0,
         llm_ttfb=turn["llm_ttfb"][0] if turn["llm_ttfb"] else None,
@@ -631,22 +551,19 @@ async def main(args):
         tts_ttfb=turn["tts_ttfb"][0][0] if turn["tts_ttfb"] else None,
         bot_started=turn["bot_started"],
         client_arrival=client_arrival,
-        playout=playout,
+        playout=None,
     )
-    # Fill the playout row: measured browser beacon, else estimate = arrival + jitter buffer.
-    if anchors["playout"] is not None:
-        # When there's no headless client_arrival (browser-only mode), the transport row is
-        # 'unknown' so this beacon Delta absorbs server->browser transport+network too -- say so.
-        playout_source = "browser" if client_arrival is not None else "browser+net"
-    elif client_arrival is not None:
+    # Fill the playout row by ESTIMATE: headless arrival + the configured jitter buffer. (The
+    # real-browser [client-playout] beacon that used to measure this row was removed with the
+    # /client <head> patches -- it only ever injected into the prebuilt page, which MUSETALK_SPLIT=1
+    # makes unsupported, so it could not fire on /nimbus or /studio anyway.)
+    playout_source = "est"
+    if client_arrival is not None:
         jb = float(os.getenv("CLIENT_JITTER_BUFFER_MS", "400") or 400) / 1000.0
         anchors["playout"] = round(client_arrival + jb, 3)
-        playout_source = "est"
-    else:
-        playout_source = "est"
 
     offline_lip = None
-    if args.offline_capture and not args.from_browser:
+    if args.offline_capture:
         ow = args.offline_wav if Path(args.offline_wav).exists() else args.mic
         print(f"[3/3] offline avatar capture for a clean lip offset (wav={ow})...")
         offline_lip = await offline_capture(ow, args.fps)
@@ -685,10 +602,6 @@ if __name__ == "__main__":
     ap.add_argument("--fps", type=int, default=12)
     ap.add_argument("--offline-capture", action="store_true",
                     help="also drive the MuseTalk server directly for a guaranteed lip offset")
-    ap.add_argument("--from-browser", action="store_true",
-                    help="parse-only: use a real browser's [client-playout] beacon for the last "
-                         "mile instead of driving the headless probe (open /client, do one turn, "
-                         "with CLIENT_PLAYOUT_PROBE=1)")
     ap.add_argument("--offline-wav", default="output/reply_concise.wav",
                     help="wav for the offline avatar capture; a longer bot-reply clip gives a more reliable lip offset")
     ap.add_argument("--machine", default="this box (RTX 5060 Ti, Blackwell)")

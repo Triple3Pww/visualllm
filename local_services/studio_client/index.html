@@ -837,6 +837,40 @@
       });
     }
 
+    // PHONE LOUDSPEAKER. When a WebRTC page holds a live mic, Android Chrome flips the phone into
+    // 'communication' audio routing, which plays the remote track through the EARPIECE -- the
+    // avatar's voice is near-inaudible on a phone lying on a desk. Two routes, tried in order:
+    //   1. setSinkId to the 'Speakerphone/Speaker' audiooutput device (Android Chrome). Device
+    //      labels are empty until mic permission is granted, so this runs after we have the track.
+    //   2. WebAudio fallback (iOS Safari has no setSinkId): pipe the stream through an
+    //      AudioContext, whose output uses the media/playback route rather than the earpiece.
+    //      The element is muted only AFTER the context is confirmed running, so audio can never
+    //      disappear entirely; a one-shot pointerdown resume covers iOS's gesture rule.
+    // Mobile UA only -- on desktop the user may be on headphones and forcing a sink would yank
+    // audio away from them. Server knob: CLIENT_FORCE_SPEAKER (via /client/ice-config).
+    async function routeToLoudspeaker(el) {
+      if (!/Android|iPhone|iPad|Mobi/i.test(navigator.userAgent)) return;
+      try {
+        if (typeof el.setSinkId === 'function') {
+          const ds = await navigator.mediaDevices.enumerateDevices();
+          const spk = ds.find(d => d.kind === 'audiooutput' && /speaker/i.test(d.label || ''));
+          if (spk) { await el.setSinkId(spk.deviceId); return; }
+        }
+        const ms = el.srcObject;
+        if (!ms || !ms.getAudioTracks || !ms.getAudioTracks().length || el.__spk) return;
+        el.__spk = 1;
+        audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+        audioCtx.createMediaStreamSource(ms).connect(audioCtx.destination);
+        const mute = () => { el.muted = true; el.volume = 0; };
+        if (audioCtx.state === 'running') mute();
+        else {
+          audioCtx.resume().then(mute).catch(() => {});
+          document.addEventListener('pointerdown',
+            () => audioCtx.resume().then(mute).catch(() => {}), { once: true });
+        }
+      } catch (_) {}
+    }
+
     // Watch the bot audio energy -> flip Listening <-> Speaking (drives the equalizer).
     function watchBotAudio(stream) {
       try {
@@ -870,20 +904,38 @@
       setState('connecting', 'Connecting...');
       setOverlay('connecting');
       try {
-        let iceCfg = {};
+        // Client bootstrap config: ICE (STUN + TURN), the receive-side jitter-buffer target, and
+        // whether to force a phone's loudspeaker. The last two used to be <head> injections into
+        // the prebuilt /client page only -- which MUSETALK_SPLIT=1 makes unsupported -- so they
+        // never ran here. Fetched now so CLIENT_JITTER_BUFFER_MS / CLIENT_FORCE_SPEAKER are real.
+        let iceCfg = {}, jitterMs = 0, forceSpeaker = true;
         try {
           const r = await fetch('/client/ice-config');
-          if (r.ok) { const j = await r.json(); if (j.iceServers && j.iceServers.length) iceCfg = { iceServers: j.iceServers }; }
+          if (r.ok) {
+            const j = await r.json();
+            if (j.iceServers && j.iceServers.length) iceCfg = { iceServers: j.iceServers };
+            jitterMs = j.jitterBufferMs || 0;
+            forceSpeaker = j.forceSpeaker !== false;
+          }
         } catch (_) {}
         await loadOverlay();   // sets _split if MUSETALK_SPLIT is on; else full-frame <video> fallback
         pc = new RTCPeerConnection(iceCfg);
         pc.ontrack = (e) => {
           const stream = e.streams[0] || new MediaStream([e.track]);
+          // Receive-side jitter buffer: hold a few hundred ms so late packets still arrive in
+          // time (smoother over a WAN/Tailscale link, at the cost of that much added latency).
+          if (jitterMs > 0 && e.receiver) {
+            try {
+              if ('jitterBufferTarget' in e.receiver) e.receiver.jitterBufferTarget = jitterMs;
+              else if ('playoutDelayHint' in e.receiver) e.receiver.playoutDelayHint = jitterMs / 1000;
+            } catch (_) {}
+          }
           if (e.track.kind === 'video') {
             avatar.srcObject = stream; avatar.play().catch(()=>{});
             if (_split) startCompositor();
           } else if (e.track.kind === 'audio') {
             botAudio.srcObject = stream; botAudio.play().catch(()=>{});
+            if (forceSpeaker) routeToLoudspeaker(botAudio);
             watchBotAudio(stream);
           }
         };
