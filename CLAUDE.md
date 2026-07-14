@@ -20,9 +20,9 @@ A/V-sync architecture decision (read it before touching sync).**
 | Stage | Service | Where |
 |-------|---------|-------|
 | VAD | Silero (local) | pipeline |
-| STT | Deepgram nova-2 (`en-US`/`zh-TW`/`th` by `LANGUAGE`) default; **local OFFLINE alt `STT_PROVIDER=sherpa`** (sherpa-onnx streaming zipformer, bilingual zh-en, in-process CPU/~0 VRAM, zh→Traditional via OpenCC) or `funasr` (SenseVoice segmented, `:8004`, untested alt) | cloud / **local CPU** |
+| STT | Deepgram nova-2 (`en-US`/`zh-TW`/`th` by `LANGUAGE`) default; **local OFFLINE alt `STT_PROVIDER=sherpa`** (sherpa-onnx streaming zipformer, bilingual zh-en, in-process CPU/~0 VRAM, zh→Traditional via OpenCC) | cloud / **local CPU** |
 | LLM | `LLM_PROVIDER=openrouter` — OpenAI-compatible, so **cloud OR local Ollama** by `OPENROUTER_BASE_URL` (any model via `OPENROUTER_MODEL`); or `weather_chain` (Chinese weather bot) | cloud / local / remote |
-| TTS | **CosyVoice** local streaming on vLLM in WSL — `COSYVOICE_MODEL=v2` (CosyVoice2-0.5B) or **`v3`** (Fun-CosyVoice3-0.5B, **current baseline**, +flow-decoder TRT + CUDA graphs, isolated first-chunk zh~1.08/en~0.80s; graphs carry the P33 zh-lipsync caveat, safe on `en`). Or **MOSS-TTS-Realtime** (`TTS_PROVIDER=moss`, `:8003`) | **`:8001` cosy / `:8003` moss, both WSL** |
+| TTS | **CosyVoice** local streaming on vLLM in WSL — **now IN THIS REPO at `tts/cosyvoice-server/`** (2026-07-14; it used to be a separate repo). `COSYVOICE_MODEL=v2` (CosyVoice2-0.5B, **what `.env` actually runs**) or `v3` (Fun-CosyVoice3-0.5B, +flow-TRT + CUDA graphs; graphs carry the P33 zh-lipsync caveat, safe on `en`). Thai only: `TTS_PROVIDER=jaitts` (`:8004`) | **`:8001`, WSL** |
 | Avatar | **MuseTalk** local mouth-region talking-head (**switchable preset**: `nimbus` female / `leo` his face+voice — `AVATAR_PRESET`), **TensorRT render by default** (`MUSETALK_TRT=1`) | **`:8002`, `musetalk` conda env** |
 | Config | **Web config panel** — edit `.env` + restart the pipeline from a browser | **`:7870` (`:8444` over Tailscale)** |
 
@@ -30,7 +30,7 @@ A/V-sync architecture decision (read it before touching sync).**
 (`cosyvllm` conda env on the Blackwell 5060 Ti) — this cut first-chunk latency ~3.4s→~1.1s, the root
 cause of the avatar lip-lag. The pipeline reaches it via `COSYVOICE_URL` set to the **WSL IP**, NOT
 `localhost` (WSL2's localhost relay buffers the streaming audio ~2s). Run it with
-`bash /mnt/e/Claude/cosyvoice-local-tts/run_vllm_server.sh` in WSL. The original Windows `tts`-env
+`bash /mnt/e/Claude/VisualLLm/tts/cosyvoice-server/run_vllm_server.sh` in WSL. The original Windows `tts`-env
 PyTorch server is the fallback (set `COSYVOICE_URL=http://localhost:8001` + start it). Full build
 notes + gotchas: the `project-visualllm-cosyvoice-vllm` memory.
 
@@ -63,10 +63,10 @@ zh lipsync (UNVERIFIED for v3); flip `COSYVOICE_VLLM_EAGER=1` or re-check by eye
 The full P27-P33 history (why graphs were kept eager for the v2/zh baseline):
 `COSYVOICE_VLLM_EAGER` was **`1`** (eager) for the v2 baseline. P27 set it `0` (CUDA-graph capture) to cut
 TTS first-chunk avg ~2.0→~0.85s; P31 reverted it for "live inconsistency." A P32 re-investigation then measured the
-TTS side directly (`cosyvoice-local-tts/_ttfb_variance.py`) and found graphs are actually **faster + lower-variance**
+TTS side directly (`tts/cosyvoice-server/_ttfb_variance.py`) and found graphs are actually **faster + lower-variance**
 than eager — even under real MuseTalk render (96 samp: graphs 1.29/2.23/0.37s vs eager 1.94/3.43/0.64) — so the P31
 "shape-spike" mechanism did NOT reproduce. **But that measured the WRONG side.** P33: the real cost is zh **lipsync** —
-graphs ON alter the zh AUDIO (measured `cosyvoice-local-tts/_zh_audio_ab.py`: longer + more internal silence, more
+graphs ON alter the zh AUDIO (measured `tts/cosyvoice-server/_zh_audio_ab.py`: longer + more internal silence, more
 variance) because the graph decode perturbs the zh-critical **RAS** sampling (the P18 fix). MuseTalk lip-syncs off a
 **Whisper of the waveform**, so a degraded zh waveform → mouth shapes that don't track the words; en is spared (no RAS
 reliance), render fps stays ~14 (not a render-starve). **Verdict for zh: eager — graphs win the TTS stopwatch but lose
@@ -136,7 +136,9 @@ panel's Restart cycles the pipeline only, so a panel-edited lead never takes eff
 
 Each stage is a thin single-provider factory in `pipeline/stages/` chosen by `.env` — these
 are **deliberate fallback switches, not multi-provider branching**:
-- `TTS_PROVIDER` = `cosyvoice` (default) | `moss` (local MOSS-TTS-Realtime, `:8003`) | `elevenlabs` | `deepgram`.
+- `TTS_PROVIDER` = `cosyvoice` (default) | `jaitts` (the local Thai voice, `:8004` — CosyVoice cannot
+  speak Thai). Anything else now **raises** instead of silently falling through to a cloud voice.
+  (The `moss` / `elevenlabs` / `deepgram` branches were removed 2026-07-14 — never once selected. In git history.)
 - `LLM_PROVIDER` = `openrouter` (default; point `OPENROUTER_BASE_URL` at `https://openrouter.ai/api/v1` for
   cloud or `http://localhost:11434/v1` for a local Ollama model) | `weather_chain` (NCU zh weather bot).
   **`OPENROUTER_PROVIDER_ONLY` (2026-07-04, TTFO lever):** pin OpenRouter to a fast backend (default
@@ -169,12 +171,11 @@ it. And none of it ever appears in TTFO, whose **t0 IS the turn-end** — it is 
 cannot see. (Log quirk: on the FIRST connection of a process that `VAD:` line goes to stdout only — the file sink
 attaches later — so look for it on a subsequent connection.)
 
-**MOSS-TTS-Realtime (`TTS_PROVIDER=moss`):** a streaming server (`local_services/moss_server/app.py`,
-`moss-tts` conda env) speaking the SAME `/tts/stream` raw-PCM contract as CosyVoice, so it reuses the
-CosyVoice client pointed at `MOSS_URL`. The voice is a fixed reference clip (`MOSS_REF`, clone-only).
-**Run it eager** (`TORCHDYNAMO_DISABLE=1`, the default) — compiled mode recompiles ~3–40s on each new
-sentence-length, felt as between-sentence stalls. Launch recipe (incl. the `CC`/triton + `torchcodec`
-ffmpeg-7/`nvidia-npp`/`LD_LIBRARY_PATH` fixes) is in the server's module docstring.
+**Removed 2026-07-14 (dead-code audit): the `moss` / `elevenlabs` / `deepgram` TTS branches and the
+`funasr` STT branch.** None had ever been selected -- the stack has always been Deepgram STT ->
+OpenRouter LLM -> CosyVoice TTS -> MuseTalk. An untried fallback is not a safety net; `git revert`
+restores any of them. A typo'd `TTS_PROVIDER` now RAISES instead of silently falling through to
+ElevenLabs (a cloud voice, and a bill).
 
 Core `.env` knobs: `LANGUAGE` (en/zh/th), `TTFO_TARGET_SECONDS`, `TTS_PROVIDER`,
 `VAD_STOP_SECS`/`VAD_START_SECS`/`VAD_CONFIDENCE`/`VAD_MIN_VOLUME` (**0.5/0.2/0.7/0.6**, Silero; panel-editable —
@@ -316,8 +317,8 @@ needed if you change `Launcher.cs` — editing `launch.ps1` needs no rebuild). T
 below are still the way to run/debug a single stage.
 
 ```bash
-# 1. CosyVoice TTS server (DEFAULT = vLLM in WSL, TTFB ~1.1s) — its OWN repo E:\Claude\cosyvoice-local-tts
-wsl -d Ubuntu -e bash -c "bash /mnt/e/Claude/cosyvoice-local-tts/run_vllm_server.sh"   # serves :8001 in WSL
+# 1. CosyVoice TTS server (DEFAULT = vLLM in WSL, TTFB ~1.1s) -- NOW IN THIS REPO at tts/cosyvoice-server/
+wsl -d Ubuntu -e bash -c "bash /mnt/e/Claude/VisualLLm/tts/cosyvoice-server/run_vllm_server.sh"   # serves :8001 in WSL
 #    Then set .env COSYVOICE_URL to the WSL IP (NOT localhost — WSL2 relay buffers the stream): `wsl hostname -I`.
 #    FALLBACK = Windows PyTorch server (slower, TTFB ~3.4s), set COSYVOICE_URL=http://localhost:8001 :
 #      E:\miniconda3\envs\tts\python.exe -m uvicorn app:app --host 0.0.0.0 --port 8001
@@ -334,9 +335,8 @@ python -m pipeline.main            # prebuilt: localhost:7860/client/  |  custom
 # --- or start the avatar server + pipeline together ---
 .\scripts\run.ps1
 
-# 4. (optional) MOSS-TTS-Realtime server -- `moss-tts` conda env, serves :8003 (TTS_PROVIDER=moss).
-#    Needs CC/triton + torchcodec(ffmpeg7)+nvidia-npp+LD_LIBRARY_PATH; full recipe in the docstring:
-#    python -m uvicorn local_services.moss_server.app:app --host 0.0.0.0 --port 8003
+# 4. (optional, Thai only) JaiTTS-F5TTS server -- shared F5 venv, serves :8004 (TTS_PROVIDER=jaitts).
+#    python -m uvicorn local_services.jaitts_server.app:app --host 0.0.0.0 --port 8004
 
 # 5. (optional) Web config panel -- SYSTEM python (it restarts the pipeline), serves :7870.
 python -m local_services.config_panel.server               # edit .env + restart from the browser
@@ -351,11 +351,12 @@ python -m scripts.measure --offline-capture                        # full turn t
 #   measure.py ALSO reports a per-stage LATENCY WATERFALL to the user's EAR (not just server-side [TTFO]):
 #   it stitches the same-box probe arrival onto the log's t0 (t0.timestamp() == the probe's time.time()) so
 #   the last mile (transport + WebRTC encode + network, then browser jitter/playout) is measured, summing to a
-#   true end-to-end. Two last-mile sources: (1) HEADLESS always-on -- the audio pump records (epoch, rms) per
-#   frame, first sustained energetic frame after t0 = the answer reaching the client (the `probe` row); (2) REAL
-#   BROWSER opt-in `CLIENT_PLAYOUT_PROBE=1` (default OFF) -- a <head>-injected AnalyserNode taps the bot audio
-#   and beacons `[client-playout]` first-voice-onset to a new /client/playout endpoint; then:
-python -m scripts.measure --from-browser                           # parse-only: fills the `browser` playout row
+#   true end-to-end. Last mile = the HEADLESS always-on source: the audio pump records (epoch, rms) per frame,
+#   and the first sustained energetic frame after t0 is the answer reaching the client (the `probe` row); the
+#   browser-playout row is then an ESTIMATE (arrival + CLIENT_JITTER_BUFFER_MS).
+#   (The real-browser `--from-browser` / `CLIENT_PLAYOUT_PROBE` beacon was REMOVED 2026-07-14 with the /client
+#   <head> patches -- it only ever injected into the prebuilt page, which MUSETALK_SPLIT=1 makes unsupported,
+#   so it could never fire on /nimbus or /studio anyway.)
 #   Missing/pre-t0 anchors render `unknown` (never a fake/negative latency); a staleness guard blanks the client
 #   arrival if the last [TTFO] turn is older than duration+tail+15s. NOTE: synthetic-mic drives can VAD-split the
 #   wav's internal pause -> the LLM row shows `unknown`; a real human turn populates it. `pipeline/metrics.py`
@@ -481,13 +482,15 @@ the values equal — this closed the silent-failure mode, it did not make a mism
 - The `/client` UI is the **pipecat prebuilt bundle**, served as-is — don't add UI hacks back. The
   **one** sanctioned mechanism is the `<head>` script injection in `main.py`: env-gated patches
   register into the shared `_client_head_patches` list and ONE middleware serves the index with all
-  of them (two separate index-serving middlewares would shadow each other — last-added runs
-  outermost and wins). Current patches: the jitter buffer (`_install_client_jitter_buffer`,
-  `CLIENT_JITTER_BUFFER_MS`) and the phone speaker route (`_install_client_speaker_route`,
-  `CLIENT_FORCE_SPEAKER`, P24 — also handles the `POST /client/speaker-debug` beacon). The index is
-  served `Cache-Control: no-store` (a phone that cached the pre-patch page misses every fix). Keep
-  new client behavior to that same pattern (env-gated, bundle untouched) rather than forking the
-  prebuilt dist.
+  of them (two separate index-serving middlewares would shadow each other). **As of 2026-07-14 only
+  the TURN/ICE patch remains.** The other six installers (jitter buffer, phone-speaker route,
+  video-stall monitor, A/V-stats monitor, playout probe, measure button) were REMOVED: they patched
+  `/client` ONLY, and `MUSETALK_SPLIT=1` makes `/client` unsupported, so on the pages actually used
+  (`/nimbus`, `/studio`) they were inert -- `CLIENT_FORCE_SPEAKER=1` was loading nothing. The two that
+  are real features (**jitter buffer** + **phone loudspeaker**) now live IN the static clients, fed by
+  `GET /client/ice-config`, which also serves `jitterBufferMs` + `forceSpeaker` alongside `iceServers`.
+  The middleware itself STAYS -- it serves `/client/transcript`, `/say`, `/ice-config`,
+  `/avatar-overlay` for nimbus + studio. The index is served `Cache-Control: no-store`.
 - **Open the client at `/client/` WITH the trailing slash** — the prebuilt page references its
   assets relatively, so `/client` (no slash) 404s them → white screen.
 - **The custom "Nimbus AI" client lives at `/nimbus/`** (figma-to-code redesign, `docs/PROBLEMS-AND-FIXES.md`
