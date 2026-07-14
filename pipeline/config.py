@@ -84,12 +84,8 @@ class Config:
     # --- STT provider switch (deliberate fallback switch, like TTS_PROVIDER) ---
     # deepgram = cloud streaming (default, interim partials);
     # sherpa   = local OFFLINE STREAMING (sherpa-onnx zipformer bilingual zh-en, CPU/~0 VRAM,
-    #            drives turn-taking from its own ASR endpoint detector -- robust to a quiet mic);
-    # funasr   = local OFFLINE SEGMENTED (SenseVoice-Small server; needs the energy-VAD to fire).
+    #            drives turn-taking from its own ASR endpoint detector -- robust to a quiet mic).
     stt_provider: str = (_get("STT_PROVIDER", "deepgram") or "deepgram").lower()
-    funasr_url: str = _get("FUNASR_URL", "http://localhost:8004") or "http://localhost:8004"
-    funasr_model: str = _get("FUNASR_MODEL", "iic/SenseVoiceSmall") or "iic/SenseVoiceSmall"
-    funasr_device: str = _get("FUNASR_DEVICE", "cpu") or "cpu"
     # sherpa: local streaming model dir + whether to convert zh output to Traditional (zh-TW).
     sherpa_model_dir: str = _get(
         "SHERPA_MODEL_DIR",
@@ -139,40 +135,24 @@ class Config:
     memory_llm_gated: bool = (_get("MEMORY_LLM_GATED", "1") or "1").lower() in ("1", "true", "yes", "on")
 
     # --- TTS ---
-    # CosyVoice (local CosyVoice2-0.5B streaming server) is the default -- a female
-    # zero-shot voice, no per-token cloud cost. TTS_PROVIDER=elevenlabs falls back to
-    # ElevenLabs flash_v2_5 (multilingual cloud); TTS_PROVIDER=deepgram to Deepgram
-    # Aura (reuses DEEPGRAM_API_KEY, English-only); TTS_PROVIDER=moss to the local
-    # MOSS-TTS-Realtime server (professional cloned voice). These are deliberate
-    # fallback switches, not a return to multi-provider branching.
+    # cosyvoice (default) = the local CosyVoice streaming server, now IN THIS REPO at
+    # tts/cosyvoice-server/ (run on vLLM in WSL). Female zero-shot voice, no per-token cloud cost.
+    # jaitts = the local Thai server (CosyVoice cannot speak Thai).
+    # (Removed 2026-07-14: the moss / elevenlabs / deepgram branches. Never selected, and an
+    #  untried fallback is not a safety net -- it is code that rots. They are in git history.)
     tts_provider: str = (_get("TTS_PROVIDER", "cosyvoice") or "cosyvoice").lower()
-    # CosyVoice2 local streaming server (local_services/cosyvoice_tts.py client ->
-    # the in-repo CosyVoice server (tts/cosyvoice-server/)). Voice "weather" is its registered
-    # female Mandarin zero-shot reference; native rate 24 kHz (Pipecat resamples down).
+    # CosyVoice local streaming server (local_services/cosyvoice_tts.py client ->
+    # the in-repo server at tts/cosyvoice-server/). Native 24 kHz (Pipecat resamples down).
     cosyvoice_url: str = _get("COSYVOICE_URL", "http://localhost:8001")
     # (no cosyvoice_voice: the server ignores the per-request `voice` field -- it has ONE registered
     #  reference voice set by COSYVOICE_PROMPT_WAV/TEXT, swapped via the config panel's avatar presets.)
     cosyvoice_sample_rate: int = int(_get("COSYVOICE_SAMPLE_RATE", "24000") or "24000")
-    # MOSS-TTS-Realtime local streaming server (local_services/moss_server/app.py, runs
-    # in the moss-tts conda env). Same /tts/stream raw-PCM wire contract as CosyVoice, so
-    # TTS_PROVIDER=moss reuses the CosyVoice client pointed at MOSS_URL. The voice is a
-    # fixed reference clip pinned server-side (MOSS_REF); native rate 24 kHz.
-    moss_url: str = _get("MOSS_URL", "http://localhost:8003")
-    moss_sample_rate: int = int(_get("MOSS_SAMPLE_RATE", "24000") or "24000")
     # JaiTTS-F5TTS local Thai server (local_services/jaitts_server/app.py, runs in the
     # shared F5 venv E:/f5-spike/.venv-f5). THE Thai voice path -- CosyVoice cannot speak
     # Thai. Same /tts/stream raw-PCM contract, so TTS_PROVIDER=jaitts reuses the CosyVoice
     # client pointed at JAITTS_URL. Voice = a fixed reference clip (JAITTS_REF); 24 kHz.
     jaitts_url: str = _get("JAITTS_URL", "http://localhost:8004")
     jaitts_sample_rate: int = int(_get("JAITTS_SAMPLE_RATE", "24000") or "24000")
-    elevenlabs_api_key: str | None = _get("ELEVENLABS_API_KEY")
-    elevenlabs_voice_id: str | None = _get("ELEVENLABS_VOICE_ID")
-    # flash_v2_5 is low-latency and multilingual (covers zh-TW); override for a
-    # warmer (slower) voice via ELEVENLABS_MODEL=eleven_multilingual_v2.
-    elevenlabs_model: str = _get("ELEVENLABS_MODEL", "eleven_flash_v2_5")
-    # Deepgram Aura voice (used only when TTS_PROVIDER=deepgram). aura-2-* are the
-    # newer, more natural English voices.
-    deepgram_tts_voice: str = _get("DEEPGRAM_TTS_VOICE", "aura-2-helena-en") or "aura-2-helena-en"
 
     # --- Avatar (local MuseTalk talking-head server on port 8002) ---
     avatar_url: str = _get("AVATAR_URL", "http://localhost:8002")

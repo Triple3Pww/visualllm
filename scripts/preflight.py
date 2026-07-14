@@ -90,10 +90,8 @@ def main() -> int:
 
     print("\n== Stages (single stack) ==")
     print(_check(f"stt  ({config.stt_provider})", lambda: build_stt(config)))
-    # Cover the offline-STT import paths even when Deepgram is the active provider, so a
-    # Pipecat path move (Segmented/STTService, VAD frames, utils.time) is caught on the default stack.
-    print(_check("stt  (funasr wrapper import)",
-                 lambda: __import__("local_services.funasr_stt", fromlist=["FunasrSTTService"])))
+    # Cover the offline-STT import path even when Deepgram is the active provider, so a
+    # Pipecat path move (STTService, VAD frames, utils.time) is caught on the default stack.
     print(_check("stt  (sherpa wrapper import)",
                  lambda: __import__("local_services.sherpa_stt", fromlist=["SherpaStreamingSTTService"])))
     print(_check("llm  (OpenRouter)", lambda: build_llm(config)))

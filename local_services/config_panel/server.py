@@ -54,7 +54,7 @@ FIELDS = [
     {"key": "LLM_PROVIDER", "group": "curated", "label": "LLM provider", "type": "select",
      "options": ["openrouter", "weather_chain"], "help": "openrouter = general chat (local Ollama or cloud); weather_chain = NCU weather bot"},
     {"key": "STT_PROVIDER", "group": "curated", "label": "STT provider", "type": "select",
-     "options": ["deepgram", "sherpa", "funasr"], "help": "deepgram = cloud; sherpa = local offline streaming (~0 VRAM); funasr = local SenseVoice (:8004)"},
+     "options": ["deepgram", "sherpa"], "help": "deepgram = cloud (default); sherpa = local offline streaming (~0 VRAM)"},
     {"key": "OPENROUTER_MODEL", "group": "curated", "label": "Chat model", "type": "text",
      "options": ["meta-llama/llama-4-scout", "meta-llama/llama-3.3-70b-instruct", "google/gemini-2.5-flash-lite", "qwen2.5:7b"],
      "help": "Used when LLM provider = openrouter. Baseline = llama-4-scout (Groq, fast, clean zh)."},
@@ -63,7 +63,7 @@ FIELDS = [
     {"key": "WEATHER_CHAIN_MODEL", "group": "curated", "label": "Weather model", "type": "text",
      "options": ["qwen2.5:7b", "gemma3:27b"], "help": "Used when LLM provider = weather_chain (must be installed on NCU)"},
     {"key": "TTS_PROVIDER", "group": "curated", "label": "TTS provider", "type": "select",
-     "options": ["cosyvoice", "moss", "elevenlabs", "deepgram"], "help": "Voice engine"},
+     "options": ["cosyvoice", "jaitts"], "help": "cosyvoice = the local voice (default); jaitts = the local Thai voice"},
     # (No "CosyVoice voice" field: the server ACCEPTS a `voice` request field but IGNORES it -- the
     #  engine has one registered reference voice, chosen by COSYVOICE_PROMPT_WAV/TEXT. The real
     #  voice control is the "Avatar preset" card, which swaps those. A free-text speaker-id knob here
@@ -92,7 +92,6 @@ FIELDS = [
     {"key": "MEMORY_LLM_MODEL", "group": "advanced", "label": "Memory model", "type": "text"},
     {"key": "MEMORY_LLM_GATED", "group": "advanced", "label": "Memory gated", "type": "select", "options": ["1", "0"]},
     {"key": "COSYVOICE_URL", "group": "advanced", "label": "CosyVoice URL", "type": "text"},
-    {"key": "MOSS_URL", "group": "advanced", "label": "MOSS URL", "type": "text"},
     {"key": "AVATAR_REF", "group": "advanced", "label": "Avatar portrait", "type": "text"},
     {"key": "MUSETALK_SIZE", "group": "advanced", "label": "Frame px", "type": "text", "options": ["256", "512"]},
     {"key": "MUSETALK_FPS", "group": "advanced", "label": "FPS", "type": "text", "options": ["8", "10", "12", "14", "16", "20"]},
@@ -121,8 +120,9 @@ FIELDS = [
 _KNOWN = {f["key"] for f in FIELDS}
 
 # Servers to show health for: label -> port.
-PORTS = {"pipeline": 7860, "avatar": 8002, "cosyvoice": 8001, "moss": 8003,
-         "memory-sim": 7900, "ollama": 11434}
+# (Dropped 2026-07-14: "moss" (:8003, provider removed) and "memory-sim" (:7900) -- there has
+#  never been a service on 7900 anywhere in this repo, so that dot could only ever read red.)
+PORTS = {"pipeline": 7860, "avatar": 8002, "cosyvoice": 8001, "ollama": 11434}
 
 
 # --------------------------------------------------------------------------- env IO
