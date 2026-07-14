@@ -82,6 +82,32 @@ _LOCK = threading.Lock()  # serialize turns (single-client avatar; F5 pipe isn't
 BREAKS = ("ค่ะ", "คะ", "ครับ", "นะคะ", "นะฮะ", "นะ", "จ้ะ", "ค่า")
 
 
+def _hard_split_chunk(s: str, max_chars: int) -> list[str]:
+    """Character-window fallback for a chunk that has no spaces to split on.
+
+    Thai has no inter-word spaces, so a chunk that came in as (or accumulated
+    into) one long space-less run needs its own cut logic. Prefer cutting
+    right after the LATEST BREAKS particle found inside the window (a real
+    sentence-final boundary); fall back to a hard cut at the window edge if
+    none is present.
+    """
+    out = []
+    while len(s) > max_chars:
+        window = s[:max_chars]
+        cut = 0
+        for p in BREAKS:
+            idx = window.rfind(p)
+            if idx != -1:
+                cut = max(cut, idx + len(p))
+        if not cut:
+            cut = max_chars
+        out.append(s[:cut])
+        s = s[cut:]
+    if s:
+        out.append(s)
+    return out
+
+
 def chunk_thai(text: str, max_chars: int = MAX_CHARS) -> list[str]:
     """Split Thai text into SHORT chunks (the anti-'alien' rule). Mirrors
     visualllm-business/jaitts/synth_clean.py -- keep the two in sync."""
@@ -98,7 +124,21 @@ def chunk_thai(text: str, max_chars: int = MAX_CHARS) -> list[str]:
                 cur = ""
     if cur:
         chunks.append(cur)
-    return chunks or [text]
+    if not chunks:
+        return [text]
+    # Fallback for chunks .split() couldn't break up -- Thai has no inter-word spaces, so a
+    # space-less run collapses into ONE giant "word" above and sails straight through the
+    # length check untouched. That's the documented long-generation "alien warble" trigger
+    # (see the module docstring). Text WITH spaces never produces a chunk this long (the loop
+    # above splits every time a chunk crosses max_chars), so this is a no-op there --
+    # byte-identical output for spaced text.
+    out = []
+    for c in chunks:
+        if len(c) > max_chars * 2:
+            out.extend(_hard_split_chunk(c, max_chars))
+        else:
+            out.append(c)
+    return out
 
 
 def _load() -> None:

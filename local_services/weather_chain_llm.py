@@ -63,6 +63,13 @@ class WeatherChainLLMService(LLMService):
             timeout=httpx.Timeout(30.0, connect=5.0), verify=verify_tls
         )
 
+    async def stop(self, frame):  # close the httpx client on pipeline shutdown
+        # Mirrors CosyVoiceTTSService.stop() in local_services/cosyvoice_tts.py -- same
+        # leaked-connection shape (an AsyncClient/ClientSession created in __init__ but never
+        # closed), same fix (close it in the LLMService/AIService stop() hook).
+        await super().stop(frame)
+        await self._client.aclose()
+
     @staticmethod
     def _last_user_text(context) -> str:
         for msg in reversed(context.get_messages()):

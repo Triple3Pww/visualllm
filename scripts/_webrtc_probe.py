@@ -68,7 +68,14 @@ async def count_audio(track):
         AWALL.append(time.time())
 
 
-async def wait_ice(pc):
+async def wait_ice(pc, timeout: float = 5.0):
+    """Wait for ICE gathering to finish, but never hang forever on it.
+
+    Mirrors the browser clients' own fallback (studio_client/index.html
+    setTimeout(res, 3500)): a candidate that never completes gathering (a
+    flaky STUN/TURN host, no network) must not hang scripts.measure -- offer
+    whatever candidates gathered so far after the timeout instead of stalling.
+    """
     if pc.iceGatheringState == "complete":
         return
     done = asyncio.Event()
@@ -76,7 +83,10 @@ async def wait_ice(pc):
     def _():
         if pc.iceGatheringState == "complete":
             done.set()
-    await done.wait()
+    try:
+        await asyncio.wait_for(done.wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        pass
 
 
 # --------------------------------------------------------------- lip-offset from the mp4

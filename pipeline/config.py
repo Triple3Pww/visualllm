@@ -39,6 +39,28 @@ def _get_float(name: str, default: str) -> float:
     return float(default)
 
 
+def _get_int(name: str, default: str) -> int:
+    """Parse an integer env var, falling back to `default` on blank/garbage.
+
+    Mirrors _get_float above: these knobs (OPENROUTER_MAX_TOKENS,
+    COSYVOICE_SAMPLE_RATE, JAITTS_SAMPLE_RATE, MUSETALK_SIZE/SPLIT_SIZE) are
+    written by free-text config-panel fields, so a typo used to crash the
+    pipeline at import with a bare ValueError instead of a clear warning.
+    """
+    raw = _get(name)
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            import warnings
+
+            warnings.warn(
+                f"{name}={raw!r} is not an integer; using default {default}.",
+                stacklevel=2,
+            )
+    return int(default)
+
+
 @dataclass(frozen=True)
 class Config:
     # --- language + targets ---
@@ -109,7 +131,7 @@ class Config:
     # "hard reply cap" while NOTHING read it -- so replies were in fact uncapped, and a
     # rambling 35s answer looked like a mystery latency bug instead of a missing knob.
     # 0/empty = unset (no cap), which is what the old behaviour actually was.
-    openrouter_max_tokens: int = int(_get("OPENROUTER_MAX_TOKENS", "0") or "0")
+    openrouter_max_tokens: int = _get_int("OPENROUTER_MAX_TOKENS", "0")
 
     # --- LLM provider switch (deliberate fallback switch, like TTS_PROVIDER) ---
     # weather_chain = a dedicated Chinese weather bot backed by the NCU LangServe
@@ -146,13 +168,13 @@ class Config:
     cosyvoice_url: str = _get("COSYVOICE_URL", "http://localhost:8001")
     # (no cosyvoice_voice: the server ignores the per-request `voice` field -- it has ONE registered
     #  reference voice set by COSYVOICE_PROMPT_WAV/TEXT, swapped via the config panel's avatar presets.)
-    cosyvoice_sample_rate: int = int(_get("COSYVOICE_SAMPLE_RATE", "24000") or "24000")
+    cosyvoice_sample_rate: int = _get_int("COSYVOICE_SAMPLE_RATE", "24000")
     # JaiTTS-F5TTS local Thai server (local_services/jaitts_server/app.py, runs in the
     # shared F5 venv E:/f5-spike/.venv-f5). THE Thai voice path -- CosyVoice cannot speak
     # Thai. Same /tts/stream raw-PCM contract, so TTS_PROVIDER=jaitts reuses the CosyVoice
     # client pointed at JAITTS_URL. Voice = a fixed reference clip (JAITTS_REF); 24 kHz.
     jaitts_url: str = _get("JAITTS_URL", "http://localhost:8004")
-    jaitts_sample_rate: int = int(_get("JAITTS_SAMPLE_RATE", "24000") or "24000")
+    jaitts_sample_rate: int = _get_int("JAITTS_SAMPLE_RATE", "24000")
 
     # --- Avatar (local MuseTalk talking-head server on port 8002) ---
     avatar_url: str = _get("AVATAR_URL", "http://localhost:8002")
@@ -171,7 +193,7 @@ class Config:
         server's size AND the transport's video_out_width/height in main.py -- a
         mismatch hands aiortc the wrong dims. Smaller = far less WAN bandwidth (the
         dominant lever vs jitter), at the cost of a softer face."""
-        return int(_get("MUSETALK_SIZE", "512") or "512")
+        return _get_int("MUSETALK_SIZE", "512")
 
     @property
     def avatar_split(self) -> bool:
@@ -183,7 +205,7 @@ class Config:
     def avatar_split_size(self) -> int:
         """Fixed square px of the streamed mouth crop in split mode (MUSETALK_SPLIT_SIZE).
         MUST equal the avatar server's value; the WebRTC track is sized to it."""
-        return int(_get("MUSETALK_SPLIT_SIZE", "256") or "256")
+        return _get_int("MUSETALK_SPLIT_SIZE", "256")
 
     @property
     def avatar_fps(self) -> float:

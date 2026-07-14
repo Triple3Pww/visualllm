@@ -744,6 +744,7 @@
     }
 
     let pc = null, micStream = null, connected = false, connecting = false, muted = false;
+    let disconnectTimer = null;  // grace period before a 'disconnected' blip tears the call down
 
     // Toggle the mic on/off by enabling/disabling the outgoing audio track (stays connected;
     // Disconnect is the separate button). A disabled track sends silence, so STT hears nothing.
@@ -942,6 +943,7 @@
         pc.onconnectionstatechange = () => {
           const s = pc.connectionState;
           if (s === 'connected') {
+            if (disconnectTimer) { clearTimeout(disconnectTimer); disconnectTimer = null; }
             connected = true; connecting = false;
             micBtn.classList.remove('connecting'); micBtn.classList.add('active');
             setState('live', 'Listening');
@@ -949,7 +951,18 @@
             addSystem('Connected — speak or type to Leo');
             startPolling();
             if (pendingText) { const t = pendingText; pendingText = null; postSay(t); }
-          } else if (s === 'disconnected' || s === 'failed' || s === 'closed') {
+          } else if (s === 'disconnected') {
+            // 'disconnected' is often a transient network blip (ICE renegotiating), not a dead
+            // call -- tearing down on it immediately killed the session on a brief Wi-Fi hiccup.
+            // Give it 5s to self-heal back to 'connected'; only tear down if it hasn't.
+            if (!disconnectTimer) {
+              disconnectTimer = setTimeout(() => {
+                disconnectTimer = null;
+                if (pc && pc.connectionState !== 'connected') teardown();
+              }, 5000);
+            }
+          } else if (s === 'failed' || s === 'closed') {
+            if (disconnectTimer) { clearTimeout(disconnectTimer); disconnectTimer = null; }
             teardown();
           }
         };
@@ -974,6 +987,7 @@
     }
 
     function teardown() {
+      if (disconnectTimer) { clearTimeout(disconnectTimer); disconnectTimer = null; }
       connected = false; connecting = false; speaking = false;
       micBtn.classList.remove('active', 'connecting');
       setState('', 'Offline');
