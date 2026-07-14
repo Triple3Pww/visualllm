@@ -116,6 +116,10 @@ if ($ttsProvider -eq "cosyvoice" -and $cosyUrl) {
         } else {
             $inner = "$src bash $CosyRunScript"
         }
+        # tee the server output to a durable log: the WSL window closes when the server
+        # crashes, and without this the crash reason vanishes with it (2026-07-14: a stale
+        # .preset_voice.env path crashed startup ~40s in and left NOTHING to diagnose from).
+        $inner = "$inner 2>&1 | tee -a /mnt/e/Claude/VisualLLm/logs/cosyvoice_wsl.log"
         $cmd = ('-d {0} -e bash -c "{1}"' -f $WslDistro, $inner)
         $startedWsl = Start-Process -FilePath "wsl.exe" -ArgumentList $cmd -PassThru
         Write-Host "  loading the TTS model (this takes ~1-3 min on first start)..."
@@ -184,16 +188,22 @@ try {
 Write-Host ""
 
 # ---------------------------------------------------------------------------
-# 5) Open the client.
+# 5) Open the client. The page follows the live avatar preset (leo -> /studio/,
+#    else /nimbus/), same rule as tunnel.ps1 -- NEVER the prebuilt /client/:
+#    under MUSETALK_SPLIT=1 (the live baseline) /client can't composite the
+#    mouth crop and shows a floating 256px square, so opening it here handed
+#    the user a broken page on every one-click launch.
 # ---------------------------------------------------------------------------
-Write-Host "[5/5] Opening the client in your browser..." -ForegroundColor Cyan
-Start-Process "http://localhost:7860/client/"
+$preset = Get-EnvVal "AVATAR_PRESET"
+$clientPath = if ($preset -eq "leo") { "/studio/" } else { "/nimbus/" }
+Write-Host "[5/5] Opening the client in your browser ($clientPath)..." -ForegroundColor Cyan
+Start-Process ("http://localhost:7860{0}" -f $clientPath)
 Write-Host ""
 
 Write-Host "===============================================" -ForegroundColor Green
 Write-Host "   VisualLLm is RUNNING"                          -ForegroundColor Green
 Write-Host "===============================================" -ForegroundColor Green
-Write-Host "  Client      : http://localhost:7860/client/"
+Write-Host ("  Client      : http://localhost:7860{0}" -f $clientPath)
 Write-Host "  Config panel: http://localhost:7870"
 # Tailnet URL for the config panel (tailscale serve :8444 -> 7870). Tailnet-only by design: the
 # panel is UNAUTHENTICATED and can rewrite .env + restart/run processes, so it is deliberately NOT
