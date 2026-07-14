@@ -22,14 +22,14 @@
 param(
     [string]$MusetalkPython = "E:\miniconda3\envs\musetalk\python.exe",
     [string]$WslDistro      = "Ubuntu",
-    [string]$CosyRunScript  = "/mnt/e/Claude/cosyvoice-local-tts/run_vllm_server.sh",
+    [string]$CosyRunScript  = "/mnt/e/Claude/VisualLLm/tts/cosyvoice-server/run_vllm_server.sh",
     # The avatar-preset voice file the config panel writes (COSYVOICE_PROMPT_WAV/TEXT for the
     # active preset). We SOURCE it before launching CosyVoice so a plain launch uses the preset's
     # cloned voice -- without this, launch.ps1 started the engine with NO prompt env, so it fell
     # back to the default pro_ref.wav (= the Nimbus voice) even when the Leo preset was active:
     # "Leo face, Nimbus voice". The config panel's restart_cosyvoice already sources this; the
     # launcher did not. WSL path.
-    [string]$CosyVoiceEnv   = "/mnt/e/Claude/cosyvoice-local-tts/.preset_voice.env"
+    [string]$CosyVoiceEnv   = "/mnt/e/Claude/VisualLLm/tts/cosyvoice-server/.preset_voice.env"
 )
 
 $ErrorActionPreference = "Stop"

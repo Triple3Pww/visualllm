@@ -109,6 +109,11 @@ class Config:
     # ~1.1-1.6s (tail to 3.6s) -> ~0.7s tight, the dominant TTFO cost + all its variance.
     # Comma-list allowed. Empty = unpinned (today's behavior). See OPENROUTER_MODEL.
     openrouter_provider_only: str = _get("OPENROUTER_PROVIDER_ONLY", "") or ""
+    # Hard cap on the reply length. This key sat in .env for weeks describing itself as a
+    # "hard reply cap" while NOTHING read it -- so replies were in fact uncapped, and a
+    # rambling 35s answer looked like a mystery latency bug instead of a missing knob.
+    # 0/empty = unset (no cap), which is what the old behaviour actually was.
+    openrouter_max_tokens: int = int(_get("OPENROUTER_MAX_TOKENS", "0") or "0")
 
     # --- LLM provider switch (deliberate fallback switch, like TTS_PROVIDER) ---
     # weather_chain = a dedicated Chinese weather bot backed by the NCU LangServe
@@ -142,7 +147,7 @@ class Config:
     # fallback switches, not a return to multi-provider branching.
     tts_provider: str = (_get("TTS_PROVIDER", "cosyvoice") or "cosyvoice").lower()
     # CosyVoice2 local streaming server (local_services/cosyvoice_tts.py client ->
-    # the user's cosyvoice-local-tts FastAPI server). Voice "weather" is its registered
+    # the in-repo CosyVoice server (tts/cosyvoice-server/)). Voice "weather" is its registered
     # female Mandarin zero-shot reference; native rate 24 kHz (Pipecat resamples down).
     cosyvoice_url: str = _get("COSYVOICE_URL", "http://localhost:8001")
     # (no cosyvoice_voice: the server ignores the per-request `voice` field -- it has ONE registered

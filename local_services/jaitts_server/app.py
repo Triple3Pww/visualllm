@@ -1,4 +1,4 @@
-"""JaiTTS-F5TTS Thai STREAMING TTS server -- same wire contract as cosyvoice-local-tts
+"""JaiTTS-F5TTS Thai STREAMING TTS server -- same wire contract as tts/cosyvoice-server
 and the MOSS server (POST /tts/stream {text, voice, sample_rate} -> raw 16-bit PCM mono
 stream), so the pipeline reaches it through the existing CosyVoice client just by
 repointing the URL. Set TTS_PROVIDER=jaitts (see pipeline/stages/tts.py).

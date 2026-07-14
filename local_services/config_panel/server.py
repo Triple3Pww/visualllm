@@ -34,15 +34,15 @@ _MUSETALK_PY = Path(r"E:\miniconda3\envs\musetalk\python.exe")
 # the pipeline Restart does NOT touch the WSL vLLM server. The panel toggles graphs by rewriting
 # that script's default and relaunching the WSL server. Graphs ON == EAGER default 0 (2026-07-05
 # re-investigation: graphs are faster + lower-variance in TTS TTFB; docs P32). Windows + WSL paths:
-_COSY_SCRIPT = Path(r"E:\Claude\cosyvoice-local-tts\run_vllm_server.sh")
-_COSY_SCRIPT_WSL = "/mnt/e/Claude/cosyvoice-local-tts/run_vllm_server.sh"
+_COSY_SCRIPT = REPO / "tts" / "cosyvoice-server" / "run_vllm_server.sh"
+_COSY_SCRIPT_WSL = "/mnt/e/Claude/VisualLLm/tts/cosyvoice-server/run_vllm_server.sh"
 _WSL_DISTRO = "Ubuntu"
 
 # Avatar-preset voice file: restart_cosyvoice `source`s this so a preset's cloned voice
 # (COSYVOICE_PROMPT_WAV/TEXT) reaches the WSL engine WITHOUT the CJK transcript ever touching
 # the command line (WSL/git-bash mangle CJK argv -- the P40/metrology trap). Written UTF-8, LF.
-_VOICE_ENV = Path(r"E:\Claude\cosyvoice-local-tts\.preset_voice.env")
-_VOICE_ENV_WSL = "/mnt/e/Claude/cosyvoice-local-tts/.preset_voice.env"
+_VOICE_ENV = REPO / "tts" / "cosyvoice-server" / ".preset_voice.env"
+_VOICE_ENV_WSL = "/mnt/e/Claude/VisualLLm/tts/cosyvoice-server/.preset_voice.env"
 _EAGER_RE = re.compile(r"(COSYVOICE_VLLM_EAGER=\$\{COSYVOICE_VLLM_EAGER:-)([01])(\})")
 
 # Fields the panel exposes. group: curated | advanced. type: select -> options; text -> free.
@@ -389,7 +389,7 @@ PRESETS = {
         "page": "/nimbus/",
         "env": {"AVATAR_REF": "assets/avatar_studio_match.png", "LANGUAGE": "en",
                 "LLM_PROVIDER": "openrouter"},
-        "voice_wav": "/mnt/e/Claude/cosyvoice-local-tts/CosyVoice/asset/pro_ref.wav",
+        "voice_wav": "/mnt/e/Claude/VisualLLm/tts/cosyvoice-server/CosyVoice/asset/pro_ref.wav",
         "voice_text": "你好，我是你的AI虚拟助手，很高兴见到你。今天天气不错，有什么我可以帮你的",
     },
     "leo": {
@@ -397,7 +397,7 @@ PRESETS = {
         "page": "/studio/",
         "env": {"AVATAR_REF": "assets/avatar_leo.png", "LANGUAGE": "zh",
                 "LLM_PROVIDER": "openrouter"},
-        "voice_wav": "/mnt/e/Claude/cosyvoice-local-tts/CosyVoice/asset/leo_ref.wav",
+        "voice_wav": "/mnt/e/Claude/VisualLLm/tts/cosyvoice-server/CosyVoice/asset/leo_ref.wav",
         "voice_text": "我是国家灾害防救科技中心副主任张国浩，目前也是国立清华大学工业工程与工程管理学系的特聘教授。",
     },
 }

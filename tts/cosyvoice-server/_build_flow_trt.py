@@ -26,5 +26,5 @@ for name, txt in [("en", "Today's weather in Taipei is sunny and mild, with a ge
     peak = wav.abs().max().item()
     print(f"[synth] {name}: gen {g:.2f}s  audio {dur:.2f}s  rtf {g/dur:.2f}  peak {peak:.3f}"
           f"  {'OK' if 0.05 < peak <= 1.01 else 'SUSPECT (silent/clipped/NaN)'}")
-    torchaudio.save(f"/mnt/e/Claude/cosyvoice-local-tts/outputs/_flowtrt_{name}.wav", wav, sr)
+    torchaudio.save(f"/mnt/e/Claude/VisualLLm/tts/cosyvoice-server/outputs/_flowtrt_{name}.wav", wav, sr)
 print("[build] done")

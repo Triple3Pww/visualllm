@@ -6,7 +6,7 @@
 set -u
 ARM="$1"; CYCLE="$2"
 VIS=/e/Claude/visualllm
-COSY=/e/Claude/cosyvoice-local-tts
+COSY=/e/Claude/VisualLLm/tts/cosyvoice-server
 WSL_IP=172.24.44.238
 MUSETALK_PY='E:\miniconda3\envs\musetalk\python.exe'
 
@@ -33,11 +33,11 @@ sleep 4
 echo "=== [$ARM] starting CosyVoice on a near-empty card (P15) ==="
 if [ "$ARM" = "v3" ]; then
   wsl -d Ubuntu -e bash -c '
-    export COSYVOICE_MODEL_DIR=/mnt/e/Claude/cosyvoice-local-tts/CosyVoice/pretrained_models/Fun-CosyVoice3-0.5B-2512
+    export COSYVOICE_MODEL_DIR=/mnt/e/Claude/VisualLLm/tts/cosyvoice-server/CosyVoice/pretrained_models/Fun-CosyVoice3-0.5B-2512
     export COSYVOICE_PROMPT_TEXT="You are a helpful assistant.<|endofprompt|>你好，我是你的AI虚拟助手，很高兴见到你。今天天气不错，有什么我可以帮你的"
-    bash /mnt/e/Claude/cosyvoice-local-tts/run_vllm_server.sh' > "$COSY/logs/ab_${ARM}_c${CYCLE}.log" 2>&1 &
+    bash /mnt/e/Claude/VisualLLm/tts/cosyvoice-server/run_vllm_server.sh' > "$COSY/logs/ab_${ARM}_c${CYCLE}.log" 2>&1 &
 else
-  wsl -d Ubuntu -e bash -c 'bash /mnt/e/Claude/cosyvoice-local-tts/run_vllm_server.sh' \
+  wsl -d Ubuntu -e bash -c 'bash /mnt/e/Claude/VisualLLm/tts/cosyvoice-server/run_vllm_server.sh' \
     > "$COSY/logs/ab_${ARM}_c${CYCLE}.log" 2>&1 &
 fi
 for i in $(seq 1 72); do

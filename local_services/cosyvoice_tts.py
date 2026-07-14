@@ -1,7 +1,7 @@
 """CosyVoice2 streaming TTS as a Pipecat service.
 
 This is a thin HTTP client: it streams text to a local CosyVoice2 server (the
-user's cosyvoice-local-tts FastAPI server, /tts/stream endpoint) and yields audio
+in-repo CosyVoice server (tts/cosyvoice-server/), /tts/stream endpoint) and yields audio
 chunks as soon as they arrive, so the avatar can start lip-syncing on the first
 chunk -- the streaming path that keeps the <3s time-to-first-output budget.
 

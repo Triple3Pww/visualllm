@@ -32,8 +32,15 @@ def build_llm(cfg: Config, memory=None):
         extra = {"extra_body": {"provider": {"only": providers}}}
 
     # `model=` is deprecated; the model now lives in the `settings=` object.
+    # OPENROUTER_MAX_TOKENS caps the reply. Pass it only when set: `settings` is applied as a
+    # DELTA (apply_update), so an omitted field keeps pipecat's NOT_GIVEN default (= no cap),
+    # whereas passing 0 would cap every reply at zero tokens.
+    settings_kwargs = {"model": cfg.openrouter_model, "extra": extra}
+    if cfg.openrouter_max_tokens > 0:
+        settings_kwargs["max_tokens"] = cfg.openrouter_max_tokens
+
     return OpenAILLMService(
         api_key=cfg.openrouter_api_key,
         base_url=cfg.openrouter_base_url,
-        settings=OpenAILLMService.Settings(model=cfg.openrouter_model, extra=extra),
+        settings=OpenAILLMService.Settings(**settings_kwargs),
     )

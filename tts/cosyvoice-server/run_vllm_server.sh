@@ -28,7 +28,7 @@ export VLLM_USE_FLASHINFER_SAMPLER=0
 # only the pipeline (:7860), never the WSL TTS server.
 COSYVOICE_MODEL=${COSYVOICE_MODEL:-v2}
 if [ "$COSYVOICE_MODEL" = "v3" ]; then
-  export COSYVOICE_MODEL_DIR=${COSYVOICE_MODEL_DIR:-/mnt/e/Claude/cosyvoice-local-tts/CosyVoice/pretrained_models/Fun-CosyVoice3-0.5B-2512}
+  export COSYVOICE_MODEL_DIR=${COSYVOICE_MODEL_DIR:-/mnt/e/Claude/VisualLLm/tts/cosyvoice-server/CosyVoice/pretrained_models/Fun-CosyVoice3-0.5B-2512}
   export COSYVOICE_PROMPT_TEXT=${COSYVOICE_PROMPT_TEXT:-"You are a helpful assistant.<|endofprompt|>你好，我是你的AI虚拟助手，很高兴见到你。今天天气不错，有什么我可以帮你的"}
   # Flow-decoder TensorRT for v3's 300M DiT. Verified 2026-07-10: the fp32 ONNX->TRT engine builds
   # in ~30s on first load (cached to flow.decoder.estimator.fp32.mygpu.plan), audio stays correct,
@@ -66,5 +66,5 @@ export COSYVOICE_FIRST_HOP_ZH=${COSYVOICE_FIRST_HOP_ZH:-0}
 # the MuseTalk load-order (less "No available memory for the cache blocks"). Override either.
 export COSYVOICE_VLLM_MAX_LEN=${COSYVOICE_VLLM_MAX_LEN:-2048}
 export COSYVOICE_VLLM_GPU_UTIL=${COSYVOICE_VLLM_GPU_UTIL:-0.16}
-cd /mnt/e/Claude/cosyvoice-local-tts
+cd /mnt/e/Claude/VisualLLm/tts/cosyvoice-server
 exec $ENV/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8001

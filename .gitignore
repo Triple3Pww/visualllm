@@ -34,3 +34,4 @@ tts/cosyvoice-server/*.log
 # Scratch logs at repo root
 scratchpad_*.log
 _*.log
+tts/cosyvoice-server/.preset_voice.env

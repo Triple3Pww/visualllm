@@ -1,4 +1,4 @@
-"""MOSS-TTS-Realtime STREAMING TTS server -- same wire contract as cosyvoice-local-tts
+"""MOSS-TTS-Realtime STREAMING TTS server -- same wire contract as tts/cosyvoice-server
 (POST /tts/stream {text, voice, sample_rate} -> raw 16-bit PCM mono stream), so the
 pipeline reaches it through the existing CosyVoice client just by repointing the URL.
 

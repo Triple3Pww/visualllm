@@ -1,6 +1,6 @@
 import sys
 from pathlib import Path
-H = Path("/mnt/e/Claude/cosyvoice-local-tts/CosyVoice")
+H = Path("/mnt/e/Claude/VisualLLm/tts/cosyvoice-server/CosyVoice")
 for p in (str(H), str(H / "third_party" / "Matcha-TTS")):
     sys.path.insert(0, p)
 import vllm
