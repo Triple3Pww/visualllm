@@ -109,8 +109,18 @@ scales with the INPUT sentence length (it prefills the whole sentence before the
   split-fired audio gaps 59–65ms (no pause); comma-less zh + en byte-identical.
   (`local_services/first_piece_aggregator.py`; knobs read via `os.getenv` inside the aggregator.)
 
-**zh turn-start "breathing sound" — KNOWN/ACCEPTED, no fix in baseline (2026-07-05, `docs/PROBLEMS-AND-FIXES.md`
-P34).** CosyVoice's zero-shot synth prepends a low-level breath (25–610ms, −34..−68 dB) before the first word on
+**zh turn-start "breathing sound" — FIXED 2026-07-14 (`docs/PROBLEMS-AND-FIXES.md` P34).** The breath is now trimmed
+**server-side inside CosyVoice** (`tts_engine.py::_trim_lead_in`, cosyvoice `290d17e`; `COSYVOICE_TRIM_LEAD=1` default,
+`=0` reverts) — lead-in before the first audible word **0.23s median → a deterministic 0.03s**. Detection is **frame
+RMS, not per-sample abs** (a breath spikes above any sample threshold while staying inaudible). The CLIENT-side trim
+described below stays REJECTED — whole tensors server-side is the only safe place. Paired with the LLM Groq pin
+(`OPENROUTER_PROVIDER_ONLY=Groq`, LLM TTFB 1.26→0.94s and its variance gone), a real-browser turn reaches the ear in
+**2.74–3.09s on a fresh session** (was 3.69s). **CAVEAT — the session-degradation bug is now the dominant TTFO cost:**
+after ~3 long turns the avatar's turn-start silently gains ~1.0s (`lips start +0.48s → +1.47s`) and never recovers, so
+turn 6 lands at 4.37s. Suspected backlog from very long replies (the bot emits 35–38s of audio for a "one short
+sentence" question). UNRESOLVED — measure a fresh session, not a long one, or you will mis-attribute.
+
+**Historical (2026-07-05) — the original no-trim writeup:** CosyVoice's zero-shot synth prepends a low-level breath (25–610ms, −34..−68 dB) before the first word on
 ~every zh piece; the avatar lip-syncs off a Whisper of the waveform so the mouth moves over it ~0.3–0.6s before the
 answer. A start-of-turn byte-stream trim was tried and **REJECTED** (crashed the first piece on aiohttp's odd-sized
 chunks → "only speaks one sentence per turn"; user judged no-trim better). The breath is accepted as baseline; any
@@ -137,7 +147,10 @@ are **deliberate fallback switches, not multi-provider branching**:
   real prize is the killed 7–8s LLM-tail. **Model baseline = `meta-llama/llama-4-scout`** (Groq, non-reasoning):
   same speed as `llama-3.3-70b`, clean *substantive* Traditional zh, and ~5× cheaper ($0.11/$0.34 vs the 70b's
   real Groq price $0.59/$0.79). Rejected: `llama-3.1-8b` (zh errors), all mid-cost models (reasoning → slower).
-  Judge model quality with an ISOLATED probe — `pipeline.log` never logs a turn's reply text. `docs/PROBLEMS-AND-FIXES.md` P21.
+  Judge model quality with an ISOLATED probe. (**Correction, P45:** `pipeline.log` DOES log each turn's committed reply
+  text — the `[commit-dbg]` line in `_TranscriptStore.add`. The old "it never logs the reply text" claim here was false,
+  and believing it is what hid P45's transcript corruption for weeks. **Keep that log line.** But note the text it
+  logged BEFORE P45 was damaged, so don't judge past model quality from old log lines either.) `docs/PROBLEMS-AND-FIXES.md` P21.
 
 **The web config panel (`local_services/config_panel/`, `:7870`) is the easy way to change all of this**
 — it edits `.env` in place (preserving comments) and restarts the pipeline. Run it with the system
@@ -396,7 +409,11 @@ when `video_out_is_live=False`; with `is_live=True` the tagged frames are silent
 free-runs. So `video_out_is_live = not config.avatar_sync_with_audio` — never set `is_live`
 independently. **One fps everywhere is load-bearing:** the server frame-drop stride, the client
 release clock, and `main.py video_out_framerate` must all equal `config.avatar_fps` (MUSETALK_FPS) or
-audio/video drift.
+audio/video drift. (**P47.3:** the server's pump used to compute its frame interval ONCE, from its own env fps, *before* the
+client's `{"type":"config","fps":N}` arrived — so it RENDERED at the client's fps and EMITTED at its own, drifting silently
+whenever the two disagreed (e.g. the config panel writes `MUSETALK_FPS` to `.env` and restarts only the pipeline, leaving
+`:8002` on the old value). It now recomputes `1/engine.fps` every tick, so the `config` message is fully honored. Still keep
+the values equal — this closed the silent-failure mode, it did not make a mismatch *correct*.)
 
 ## Environment constraints / gotchas (READ before debugging the avatar)
 
@@ -428,6 +445,15 @@ audio/video drift.
   laggy/desynced avatar). Keep that.
 - **`conda run` buffers stdout** — a running server's log looks empty; use the `-u` env-python
   invocation above for live logs.
+- **NEVER do blocking I/O on the pipeline's event loop** (`docs/PROBLEMS-AND-FIXES.md` **P47.2**). One asyncio loop carries
+  uvicorn's handlers, aiortc's RTP send/receive, the pipecat pipeline AND the MuseTalk websocket pump. A synchronous
+  `urllib`/`requests` call inside an `async def` handler (or inside anything an async handler constructs) does not just stall
+  that request — it **stops the loop**: no packets out, no audio pumped, the live call's voice and avatar freeze for the whole
+  timeout. This is exactly what `_cloudflare_turn`'s `urlopen(timeout=8)` did from the `/client/ice-config` handler. Use
+  `aiohttp` (already a dep) or `run_in_executor`, and cache failures so a dead endpoint can't be re-probed per request.
+- **loguru is BRACE-style, not `%`-style** (**P47.4**). `logger.warning("x=%s", v)` formats via `str.format()`, so it prints the
+  literal `%s` and silently DISCARDS `v`. A diagnostic written that way is worse than none — it looks like it fired and tells
+  you nothing. Use f-strings (the house style everywhere else here).
 - **The avatar server is single-client.** Fully close the browser tab between tries; a watchdog
   logs throughput and surfaces silent worker-thread crashes.
 - **Windows console is cp1252** — `main.py` reconfigures stdout to UTF-8 so the Pipecat banner
@@ -463,6 +489,22 @@ audio/video drift.
   path leaves it False → gating on it dropped every user bubble). The mic button **mutes** (toggles the audio track,
   not disconnect) once connected. **Single-connection:** a new `/api/offer` disconnects the previous session
   (`_active_connection`) so two clients never fight the single-client avatar server.
+  **Two rules the transcript path has now paid for in blood — do not undo either:**
+  - **Dedupe frames on `frame.id`, NEVER `id(frame)`** (`docs/PROBLEMS-AND-FIXES.md` **P45**). The observer must dedupe
+    (one frame OBJECT is pushed by several processors, so it is seen more than once), but `id(frame)` is the MEMORY
+    ADDRESS — CPython recycles a freed frame's address into the next frame, so new tokens hit the "already seen" set and
+    were **silently deleted from the bubble** (`自然語言處理` → `自言處理`). Pipecat stamps every frame with a monotonic
+    unique `frame.id`; use it. Reset `_seen` at `LLMFullResponseEndFrame` (ids are monotonic, so it can only grow).
+    **The voice is unaffected by this class of bug** (TTS reads the frames itself) — a corrupt bubble looks like a bad LLM,
+    which is exactly why it hid.
+  - **The transcript poll must be re-entrant-safe AND idempotent** (**P46**). `setInterval(poll, 200)` fires whether or not
+    the last poll returned, and `transcriptSeq` only advances once a response lands — so one >200 ms browser main-thread
+    hitch sends the next poll out with the STALE `since`, the server returns the same rows to both, and both render them
+    (**identical duplicate bubbles**). Keep the `polling` in-flight flag AND the `it.seq > transcriptSeq` skip.
+  **Not a bug, but it looks like one:** on SPEAKERS the live mic transcribes the avatar's own voice (`ECHO_GUARD=0`,
+  P11-broken under steady) → junk "user" turns (`奶奶有皮革戀愛`) → a junk query bubble + a real extra reply, and under
+  `ALLOW_INTERRUPTIONS=1` it truncates the bot mid-sentence. Use headphones. Duplicate bubbles with IDENTICAL text = the
+  poll race (P46); a gibberish second query bubble = mic echo.
 - **The `/studio/` client + AVATAR PRESETS (2026-07-11).** `/studio/` (`local_services/studio_client/`, mounted by
   `_install_studio_client` next to nimbus) is a **sibling** custom client for the **"Leo"** avatar — a man's face + his
   cloned voice, built from a source clip. It is a WHITE-theme copy of nimbus reusing the SAME signaling + split-compositor

@@ -1249,7 +1249,30 @@ and the avatar is the product. This **reconciles with P31's original revert** �
 (P32) structurally cannot see the zh-audio cost. Set `=0` only for an en-only / TTS-throughput setup. The config
 panel's CUDA-graphs toggle flips + persists this. (Recurring lesson, now 3×: the probe passes what the eye rejects.)
 
-## P34 — zh turn-start "breathing sound" = CosyVoice's leading breath; the trim was REJECTED, no-trim is baseline (2026-07-05, 8th session)
+## P34 — zh turn-start "breathing sound" = CosyVoice's leading breath. FIXED 2026-07-14 by a SERVER-SIDE trim (the old client-side trim stays rejected)
+
+> **STATUS UPDATE (2026-07-14, 18th session): FIXED.** The breath is now trimmed **inside CosyVoice**
+> (`tts_engine.py::_trim_lead_in`, cosyvoice repo `290d17e`, `COSYVOICE_TRIM_LEAD=1` default) — exactly the
+> "re-attempt server-side, on whole buffers" that the original writeup below prescribed. Re-measured against
+> the CosyVoice server directly: lead-in before the first audible word **0.23 s median (max 0.60) → a
+> deterministic 0.03 s** (= the configured 30 ms pre-roll) on every piece. End-to-end, in a real browser, that
+> plus the OpenRouter Groq pin took time-to-ear **3.69 s → 3.09 s median**.
+>
+> Two details that are load-bearing if you ever touch it:
+> - **Detect on frame RMS (10 ms), NOT per-sample `abs`.** A breath carries occasional samples above any
+>   sample-level threshold while staying inaudible — a per-sample test left 0.35–0.46 s of breath in **3 of 8**
+>   pieces. RMS is what the ear (and the playout beacon) actually responds to.
+> - **The client-side trim REMAINS rejected** — the reason it crashed (aiohttp's odd-sized chunks) is unchanged.
+>   Whole tensors, server-side, is the only safe place. Bounded by `COSYVOICE_TRIM_LEAD_MAX_S` (1.5 s) so a
+>   mis-set threshold cannot swallow speech; a 30 ms pre-roll keeps the first phoneme's attack (verified by
+>   transcribe-back: the head character survives — note Deepgram *itself* drops a head char on a short clip with
+>   no lead-in silence, which looks exactly like a clipped onset and is not one).
+>
+> **Not yet judged by eye:** MuseTalk lip-syncs off a Whisper of the waveform, so the trim changes what Whisper
+> sees at turn start. The first viseme's quality is a P40-class question the probes cannot answer — check it
+> live. `COSYVOICE_TRIM_LEAD=0` reverts.
+
+### Original writeup (2026-07-05, 8th session) — why the CLIENT-side trim was rejected
 
 **Symptom (user's ear + eye).** On ~every zh turn a soft **breath/aspiration sounds before the answer**, and the
 avatar's **mouth moves along with it** ~0.3–0.6s before the first word. NOT the filler (`FILLER_WORDS=0`, verified
@@ -1803,3 +1826,175 @@ confirmed by the user in `/nimbus/` (the avatar + voice now cut immediately and 
 **Metrology note.** The *first* fix attempt (cause #1 only) looked right in code but did nothing live — because the user
 types, and cause #2 meant the `InterruptionFrame` it hooked was never emitted. The "can't use voice, I type" detail was the
 whole diagnosis; the fix that matters most for a keyboard user is the `/client/say` interrupt, not the flush.
+
+---
+
+## P45 — the chat transcript SILENTLY DELETED characters: the observer deduped on `id(frame)`, a recycled memory address ✅ SHIPPED (2026-07-11, 21st session — line-by-line audit)
+
+**Symptom (nobody was looking for it).** The `/nimbus` + `/studio` chat bubbles quietly dropped characters out of the bot's
+reply — `自然語言處理` committed as `自言處理`, `醫療保健` as `療保健`, `AI正在` as `A在`, `學習和做出決定` as `習和做出決定`. The
+**voice was always perfect**, so this read as a mediocre LLM, not a bug: a zh sentence missing one character is still fluent
+enough to shrug at. Found by *reading* the code, not by anyone reporting it.
+
+**Root cause.** `main.py::_make_transcript_observer` deduped frames with **`id(frame)`**:
+
+```python
+fid = id(frame)                 # <-- the object's MEMORY ADDRESS
+if fid in self._seen: return
+```
+
+The dedupe itself is necessary — one frame OBJECT is pushed by several processors in turn, so a read-only observer sees it more
+than once and would append its text twice. But `id()` is only unique **among objects alive at the same time**. Frames are the
+shortest-lived objects in the system (one `LLMTextFrame` per token: created → pushed → consumed → freed), and CPython's pymalloc
+hands a freed block's address **straight back to the next same-size allocation**. So a brand-new token lands on a dead frame's
+address, hits `self._seen`, and is **silently dropped from `_buf`**.
+
+**Evidence.** Driving the real `_make_transcript_observer` with a streamed reply, varying how long frames stay referenced:
+
+| frames held alive | chars lost |
+|---|---|
+| 0 / 5 / 20 | **53 of 53** (the bubble comes out EMPTY) |
+| 200 (all held) | 1 of 53 — the **first** char, eaten by the recycled `LLMFullResponseStartFrame` address |
+
+That last row is the giveaway and it matches the log exactly: leading/mid-word single-char deletions. Cross-TYPE collisions
+happen too — the set does not care what kind of frame owned the address.
+
+**Fix.** Pipecat stamps every frame with its own monotonic **`frame.id`** (verified: `LLMTextFrame#0`, `#1`, …). Key on that:
+
+```python
+fid = frame.id                  # unique for the process lifetime; never recycled
+```
+
+Plus: `self._seen` was **never cleared** (one int per frame, forever). It is now reset to `{end_fid}` at
+`LLMFullResponseEndFrame` — ids are monotonic, so a finished turn's ids can never collide with a future frame.
+
+**Verified.** Same harness: **0 chars lost at every in-flight window**, dedupe still holds (a double-push produces no doubling),
+`_seen` bounded to 1 entry after a turn.
+
+**Lesson (metrology).** The `[commit-dbg]` line in `_TranscriptStore.add` is the ONLY reason this was provable — it logs the
+committed bubble text. `CLAUDE.md` used to claim "pipeline.log never logs a turn's reply text"; that was false, and the false
+belief is what kept the corruption invisible. **Keep that log line.**
+
+---
+
+## P46 — DUPLICATE chat bubbles: a `setInterval` poll race (client) + the mic transcribing the avatar (environment) ✅ SHIPPED (client half) (2026-07-11, 21st session)
+
+**Symptom.** "Sometimes I type a query and the system shows multiple bubbles in both the query and the response."
+
+**Two INDEPENDENT causes.** The server was innocent of the first — `pipeline.log` shows it commits **exactly one** transcript
+row per reply, yet the UI rendered several. So that duplication had to be client-side.
+
+**Cause A — the poll loop had no re-entrancy guard and no idempotence** (`nimbus_client`/`studio_client/index.html`):
+
+```js
+setInterval(pollTranscript, 200);                                      // fires whether or not the last one returned
+const r = await fetch('/client/transcript?since=' + transcriptSeq);    // seq read when the fetch is ISSUED
+for (const it of data.items) { transcriptSeq = it.seq; addBotMessage(it.text); }   // advanced only AFTER it lands
+```
+
+If a poll does not resolve within 200 ms, the **next poll goes out carrying the stale `since`**; the server correctly returns
+the same rows to both; **both render them** → the identical bubble, twice. The endpoint answers in **0.9 ms**, so the stall is
+not the server — it is the **browser main thread** (full-screen video decode + the rAF RMS analyser + DOM writes). A 200 ms
+hitch there is routine, which is exactly why it was intermittent. Confirmed in the log: one reply, committed once, rendered as
+two **byte-identical** bubbles.
+
+**Fix (both clients).** Two guards, either sufficient, together airtight:
+1. a `polling` flag — never two polls in flight (the race cannot start);
+2. `if (it.seq <= transcriptSeq) continue` — render only rows not yet rendered, so a duplicate response is a **no-op** (the
+   render is idempotent regardless of latency).
+
+**Verified** by replaying the race against the live endpoint: OLD → `[(1,'bot'), (1,'bot')]` DUPLICATE; FIXED → `[(1,'bot')]`.
+Static files served `no-store`, so a **page reload** picks it up — no restart.
+
+**Cause B — the live mic is transcribing the avatar's own voice (NOT a bug; the standing `ECHO_GUARD=0` tradeoff).** Every
+"user" turn the server committed while on speakers is junk: `丟丟丟丟丟丟`, `奶奶有皮革戀愛`, `這朵朵朵`, `Payment pin pop.`,
+`Winner core.` Each is a **genuine extra turn** → a junk query bubble AND a real reply to it; and with `ALLOW_INTERRUPTIONS=1`
+(P44) it also **barges in and truncates the bot mid-sentence** (145 interruption events in the log). Not a rendering artifact;
+no code change was made. Remedies, cheapest first: **headphones** (the documented answer — the half-duplex mute is P11-broken
+under `steady`), press the existing **mic Mute** button while typing, or **auto-mute client-side while the bot speaks** (the
+nimbus client already detects bot speech via its analyser — ~5 lines, sidesteps P11 entirely, but kills barge-in).
+
+**Diagnostic rule of thumb:** duplicate bubbles with **identical** text = cause A. A second query bubble containing
+**gibberish** = cause B.
+
+---
+
+## P47 — audit sweep: five more defects found by reading every line ✅ SHIPPED (2026-07-11, 21st session)
+
+Found in the same line-by-line audit as P45/P46. None had been reported; each was held back only by an accident of timing or
+config, which is why they are worth recording.
+
+1. **`main.py::_on_disconnected` — `_active_task = None` had no ownership guard.** The line immediately below it guards
+   `_active_connection` with `if _active_connection is conn`, and its comment states the exact hazard ("a newer client may have
+   already claimed it"). The task global had the same hazard and no guard: a **zombie session whose disconnect lands late** (an
+   ICE timeout from a tab closed without a clean teardown) wipes the task of the LIVE session that replaced it →
+   `/client/say` + `/client/measure-turn` answer **409 "no active session"** while the avatar is visibly working. Fix:
+   `if _active_task is task`. (Not currently firing — on the clean-kick path the old handler runs inside
+   `await old.disconnect()`, ~3 s before the new session claims the slot.)
+
+2. **`main.py::_cloudflare_turn` — a blocking `urlopen(timeout=8)` ON THE MEDIA EVENT LOOP.** It was called from the
+   `GET /client/ice-config` middleware and from the patched `SmallWebRTCConnection.__init__` — **both run on the same asyncio
+   loop that carries aiortc's RTP and the pipecat pipeline**. A slow/hung fetch stalls the whole loop: no packets out, no audio
+   pumped → a live call's voice and avatar freeze for up to 8 s. Worse, a **failed** fetch cached nothing, so a dead endpoint was
+   re-probed (and re-blocked) on **every** request. Fix: split into `_cf_fetch()` (the blocking primitive) and
+   `_cloudflare_turn()` (cache-first, **never** fetches on the loop — it refreshes in a thread; Cloudflare's creds outlive the
+   5-min cache so a stale entry is still a working relay; failures are negative-cached 30 s; a cold cache costs that ONE
+   connection its relay and self-heals). Startup still primes inline — no loop is running yet, so blocking there is free.
+   Verified: a simulated 3 s hung fetch now stalls the loop **0.0006 s** (was up to 8 s) and the loop keeps ticking.
+
+3. **`musetalk_server/app.py::pump` — the client's `config` fps was HALF-applied.** `interval = 1.0/max(1, fps)` was captured
+   when the pump task started — **before** the client's `{"type":"config","fps":N}` was read. The config handler updated
+   `engine.fps` + `seg_samples` (render sizing) but the pump's pacing kept the **server env's** fps forever. So the server
+   **rendered** at the client's fps and **emitted** at its own: silent A/V drift, and the "one fps everywhere is load-bearing"
+   invariant broken. **Reachable today** via the config panel, which writes `MUSETALK_FPS` to `.env` and restarts only the
+   pipeline — leaving `:8002` on its old env fps while the reconnecting client configures a new one. Fix: recompute
+   `interval = 1.0/max(1, engine.fps)` **every tick**.
+
+4. **`musetalk_server/app.py::_init_gpu_composite` — loguru does not do `%`-style formatting.** `logger.warning("… %s … %dx%d",
+   cb, W, H)` prints its placeholders **literally** and discards the values (loguru formats with `str.format()`). This is the
+   ONLY line that tells you why `MUSETALK_GPU_COMPOSITE=1` fell back to the ~6x slower CPU composite — so the fallback was
+   effectively silent. Fix: f-string. **Worth checking after any portrait swap** — the fallback triggers on an off-frame
+   `crop_box`, which is a property of the portrait.
+
+5. **`config_panel/server.py::write_env` — could weld two keys together.** `splitlines(keepends=True)` leaves the last line
+   **without** a newline when the file has none, so `"".join` concatenated an appended key onto it →
+   `MUSETALK_DUMP_DELIVERED=0AVATAR_PRESET=leo` (corrupting the old value AND losing the new key). Only bites when writing a key
+   **not already in `.env`** — precisely what the preset / cosy-model / avatar-split buttons do. Fix: ensure a trailing newline
+   before appending.
+
+**Also swept (dead code / stale comments — the kind that misleads the next debugging session):** `musetalk_video.py`'s
+`_tts_sr`/`_tts_ch` were written on every audio frame "for the close crossfade's silence pad" and read by nobody (the crossfade
+free-runs untagged); its class docstring still described that replaced silence-paired design; `.env` pointed at
+`musetalk_video._inject_close_fade`, renamed to `_play_close_fade` long ago; `musetalk_server`'s `MUSETALK_IDLE_FPS` was read
+but never used (an inert knob that looked live). All removed or corrected.
+
+
+---
+
+## P48 — "Leo face, Nimbus voice": the launcher never sourced the preset voice; `COSYVOICE_VOICE` was dead config ✅ SHIPPED (2026-07-12, 22nd session)
+
+**Symptom.** With the **Leo** avatar preset active, the avatar showed **Leo's face but spoke in the Nimbus (female "pro")
+voice**.
+
+**Root cause (traced through every boundary, not guessed).**
+- The face comes from `AVATAR_REF`, which `run.ps1` reads from `.env` -> `avatar_leo.png`. Correct.
+- The voice comes from the WSL CosyVoice engine's `COSYVOICE_PROMPT_WAV`/`_TEXT` env. The config panel's `apply_preset`
+  writes those to `.preset_voice.env`, and **only** `restart_cosyvoice` (the panel path) `source`s that file.
+- **`launch.ps1` started CosyVoice with a bare `bash run_vllm_server.sh` and never sourced `.preset_voice.env`.** So on a
+  normal launch (Run VisualLLm.exe), the engine got NO prompt env and fell back to its default `COSYVOICE_PROMPT_WAV=pro_ref.wav`
+  -- which is **exactly the Nimbus preset's voice**. Evidence: `logs/cosyvoice_wsl.log` was 0 lines (the panel restart path,
+  which logs there, never ran this session), confirming the launcher path.
+- Red herring ruled out: **`COSYVOICE_VOICE` had nothing to do with it.** The server ACCEPTS a `voice` request field but
+  **ignores it** (`app.py`: "engine uses its registered reference"; `synthesize_stream(req.text, speed=...)` never passes
+  `voice`). The engine has ONE reference voice, chosen solely by `COSYVOICE_PROMPT_WAV/TEXT`.
+
+**Fix.**
+- **Real fix:** `launch.ps1` now `source`s `.preset_voice.env` before launching CosyVoice (`set -a; [ -f $f ] && . $f; set +a;`),
+  mirroring `restart_cosyvoice`, so a plain launch honors the active preset's voice.
+- **Cleanup (removed the dead knob so it can't mislead again -- the P47 anti-pattern):** deleted `COSYVOICE_VOICE` end to end
+  -- the config-panel "CosyVoice voice" field, the `.env` line, `config.cosyvoice_voice`, the `voice=` args in `stages/tts.py`
+  (cosyvoice + moss), and the `voice` param + payload field in `cosyvoice_tts.py`. The server's request field defaults, so
+  omitting it is safe. The real voice control is the config panel's **Avatar preset** card (`COSYVOICE_PROMPT_WAV/TEXT`).
+
+**To fix a server that is already running the wrong voice** (the launcher change only applies on next launch): re-apply the
+preset in the config panel's Avatar-preset card (runs `restart_cosyvoice`, which sources the voice file), or relaunch the stack.
