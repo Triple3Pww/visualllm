@@ -184,6 +184,54 @@ class TTSEngine:
             raise RuntimeError("CosyVoice produced no audio")
         return torch.concat(chunks, dim=1), self.sample_rate
 
+    def _trim_lead_in(self, chunks):
+        """Drop the inaudible lead-in the zero-shot synth prepends before the first word.
+
+        Every zh piece opens with a low-level breath (~0.2-0.6s, far below speech level). It is
+        inaudible, but it IS audio: the listener waits through it before hearing a word, and the
+        avatar -- which lip-syncs off a Whisper of the waveform -- moves the mouth over it. It is
+        pure TTFO dead time (measured median 0.23s, up to 0.60s).
+
+        Trimming it HERE, on whole tensors, is the only safe place: the same trim attempted on the
+        pipecat client's byte stream crashed on aiohttp's odd-sized chunks (PROBLEMS-AND-FIXES P34).
+        Bounded by _MAX_S so a mis-set threshold can never swallow real speech, and it keeps a short
+        pre-roll so the first phoneme's attack is not clipped. COSYVOICE_TRIM_LEAD=0 disables.
+        """
+        import numpy as np
+        thr = float(os.getenv("COSYVOICE_TRIM_LEAD_THRESH", "0.02"))
+        max_s = float(os.getenv("COSYVOICE_TRIM_LEAD_MAX_S", "1.5"))
+        pre_s = float(os.getenv("COSYVOICE_TRIM_LEAD_PREROLL_S", "0.03"))
+        dropped = 0                                   # samples discarded so far (this utterance)
+        started = False
+        for wav, sr_ in chunks:
+            if started:
+                yield wav, sr_
+                continue
+            # Frame RMS, not per-sample abs: a breath carries occasional spikes above any
+            # sample threshold while staying inaudible, so a per-sample test leaves it in
+            # (measured: 3 of 8 pieces kept 0.35-0.46s of it). RMS over 10ms is the same
+            # measure the ear -- and the playout beacon -- actually responds to.
+            x = wav.reshape(-1).detach().cpu().numpy().astype(np.float32)
+            fr = max(1, int(sr_ * 0.01))
+            nf = len(x) // fr
+            voiced = -1
+            for i in range(nf):
+                f = x[i * fr:(i + 1) * fr]
+                if float(np.sqrt(np.mean(f * f))) > thr:
+                    voiced = i * fr
+                    break
+            if voiced < 0:                            # whole chunk inaudible
+                dropped += len(x)
+                if dropped / sr_ >= max_s:            # cap reached -> stop trimming, pass it through
+                    started = True
+                    yield wav, sr_
+                continue                              # ... otherwise drop it entirely
+            first = max(0, voiced - int(pre_s * sr_))
+            if (dropped + first) / sr_ > max_s:
+                first = 0                             # cap reached mid-chunk -> keep it intact
+            started = True
+            yield wav[..., first:], sr_
+
     def _squeeze_silence(self, chunks):
         """Streaming pause-compressor: cap over-long internal silences. OFF by default now.
 
@@ -256,7 +304,11 @@ class TTSEngine:
 
         raw = ((out["tts_speech"], self.sample_rate) for out in gen)
         squeeze = cjk and float(os.getenv("COSYVOICE_SILENCE_CAP_S", "0")) > 0
-        yield from (self._squeeze_silence(raw) if squeeze else raw)
+        out_stream = self._squeeze_silence(raw) if squeeze else raw
+        # Strip the leading breath before the first word (TTFO dead time; see _trim_lead_in).
+        if (os.getenv("COSYVOICE_TRIM_LEAD", "1") or "1") not in ("0", "false", "False"):
+            out_stream = self._trim_lead_in(out_stream)
+        yield from out_stream
 
 
 # Module-level singleton so importing scripts share one loaded model.
