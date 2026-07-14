@@ -124,7 +124,7 @@ async def run_bot(transport: BaseTransport, conn=None) -> None:
 
     _relax_bot_vad_stop_timeout()   # steady-mode screech fix (see the function's docstring)
 
-    # Read-only transcript tap for the /nimbus/ chat bubbles (no pipeline structural change).
+    # Read-only transcript tap for the /studio/ chat bubbles (no pipeline structural change).
     _transcript = _TranscriptStore()
     task = PipelineTask(
         pipeline,
@@ -355,14 +355,14 @@ def _configure_webrtc_video_bitrate() -> None:
 # serve-point keeps every env-gated patch additive and the prebuilt bundle untouched.
 _client_head_patches: list[str] = []
 _client_patch_middleware_installed = False
-# Public-WebRTC ICE servers (STUN + TURN) served to the custom /nimbus/ client via
+# Public-WebRTC ICE servers (STUN + TURN) served to the custom /studio/ client via
 # GET /client/ice-config. Empty = no TURN configured -> public WebRTC off, tailnet behavior
 # unchanged. Populated by _install_turn_ice_servers() from TURN_URLS/TURN_USERNAME/TURN_CREDENTIAL.
 _ice_config_js: list[dict] = []
 # When True, a fresh Cloudflare zero-signup TURN relay is appended per connection/request
 # (see _cloudflare_turn). Set by _install_turn_ice_servers when TURN_CLOUDFLARE is enabled.
 _cf_turn_enabled = False
-# Set by run_bot so the /client/say endpoint (the /nimbus + /studio keyboard path) can inject a
+# Set by run_bot so the /client/say endpoint (the /studio keyboard path) can inject a
 # typed turn into the live pipeline. None between sessions.
 _active_task = None
 
@@ -371,7 +371,7 @@ _active_task = None
 # previous one -- bot() disconnects this when a fresh offer arrives. None between sessions.
 _active_connection = None
 
-# Live conversation transcript for the custom /nimbus/ chat bubbles. The pipeline has no RTVI
+# Live conversation transcript for the custom /studio/ chat bubbles. The pipeline has no RTVI
 # processor in this build, so instead of a data channel we tap frames with a READ-ONLY observer
 # (no pipeline structural change) into a small ring buffer the client polls via /client/transcript.
 # Set per session by run_bot; None between sessions.
@@ -528,7 +528,7 @@ def _ensure_client_patch_middleware() -> bool:
 
     @app.middleware("http")
     async def _inject_client_patches(request, call_next):
-        # Nimbus transcript poll: the /nimbus/ chat polls this for new conversation lines (the bot's
+        # Studio transcript poll: the /studio/ chat polls this for new conversation lines (the bot's
         # spoken reply text + finalized user speech), captured by the read-only transcript observer.
         # ?since=<seq> returns only newer entries, plus "partial" = the in-progress user
         # utterance (STT interim, {"text","updatedAt"} | null) rendered as one live bubble.
@@ -545,8 +545,8 @@ def _ensure_client_patch_middleware() -> bool:
                 _json.dumps({"items": items, "partial": partial}),
                 media_type="application/json",
             )
-        # Nimbus split-mode overlay: proxy the avatar server's one-time compositing assets
-        # (pristine background PNG + bbox) so /nimbus can paint the crisp background and
+        # Studio split-mode overlay: proxy the avatar server's one-time compositing assets
+        # (pristine background PNG + bbox) so /studio can paint the crisp background and
         # composite the streamed mouth crop over it. 404 when MUSETALK_SPLIT is off.
         if request.method == "GET" and request.url.path == "/client/avatar-overlay":
             import aiohttp
@@ -562,7 +562,7 @@ def _ensure_client_patch_middleware() -> bool:
                 logger.warning(f"[avatar-overlay] proxy failed: {e!r}")
                 return HTMLResponse('{"split": false}', status_code=502,
                                     media_type="application/json")
-        # Nimbus text send: inject a TYPED user turn (from the /nimbus/ chat box) into the live
+        # Studio text send: inject a TYPED user turn (from the /studio/ chat box) into the live
         # pipeline as a real user message -> LLM -> TTS -> avatar speaks it. Voice-first stays the
         # primary path; this is the keyboard alternative and reuses the same _active_task inject as
         # the measure button. Body: {"text": "..."}.
@@ -600,16 +600,16 @@ def _ensure_client_patch_middleware() -> bool:
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"[say] failed: {e!r}")
                 return HTMLResponse("error", status_code=500)
-        # Client bootstrap config for the STATIC custom clients (/nimbus, /studio). They are
-        # served as plain files, so they can't get a <head> RTCPeerConnection wrapper the way the
-        # prebuilt /client page can -- they fetch this instead, before building the peer connection.
+        # Client bootstrap config for the STATIC custom client (/studio). It is served as a
+        # plain file, so it can't get a <head> RTCPeerConnection wrapper the way the prebuilt
+        # /client page can -- it fetches this instead, before building the peer connection.
         # Carries:
         #   iceServers    -- STUN + TURN (empty over the tailnet path -> a default RTCPeerConnection).
         #   jitterBufferMs-- receive-side buffer target (CLIENT_JITTER_BUFFER_MS); absorbs WAN jitter.
         #   forceSpeaker  -- route the bot's voice to a phone's LOUDSPEAKER (CLIENT_FORCE_SPEAKER).
         # The last two used to exist ONLY as <head> injections into /client -- which MUSETALK_SPLIT=1
-        # makes unsupported, so on the pages actually used they silently did nothing. Serving them
-        # here is what makes those knobs real again for /nimbus + /studio.
+        # makes unsupported, so on the page actually used they silently did nothing. Serving them
+        # here is what makes those knobs real again for /studio.
         if request.method == "GET" and request.url.path == "/client/ice-config":
             import json as _json
             servers = list(_ice_config_js)
@@ -837,7 +837,7 @@ def _install_turn_ice_servers() -> None:
         it gathers srflx (public) + relay candidates the browser can reach.
       * client (prebuilt /client): the same <head> RTCPeerConnection wrapper pattern as the
         jitter buffer, injecting iceServers into every peer connection.
-      * client (/nimbus): served statically, so it fetches GET /client/ice-config instead
+      * client (/studio): served statically, so it fetches GET /client/ice-config instead
         (see the middleware) -- fed by the _ice_config_js this function populates.
 
     GATE: active when TURN_URLS is set OR WEBRTC_PUBLIC=1. Off by default => no-op, the tailnet
@@ -914,8 +914,8 @@ def _install_turn_ice_servers() -> None:
     # synchronous <head> pattern as the jitter buffer, so it runs before the ES-module bundle.
     _ice_config_js = js  # base; the /client/ice-config endpoint appends a FRESH Cloudflare relay
     # The prebuilt /client page embeds ICE statically (can't fetch async before the bundle builds
-    # its peer connection), so bake a startup Cloudflare snapshot into it (best-effort; /studio +
-    # /nimbus re-fetch fresh via /client/ice-config, so they never go stale).
+    # its peer connection), so bake a startup Cloudflare snapshot into it (best-effort; /studio
+    # re-fetches fresh via /client/ice-config, so it never goes stale).
     js_head = list(js)
     if cf_turn:
         _cf_js, _ = _cloudflare_turn()
@@ -944,27 +944,32 @@ def _install_turn_ice_servers() -> None:
     )
 
 
-def _install_nimbus_client() -> None:
-    """Serve the custom 'Nimbus AI' UI at /nimbus/ (the figma-to-code redesign).
+def _install_studio_client() -> None:
+    """Serve the custom '/studio/' UI (the figma-to-code redesign; originally built as
+    '/nimbus/' for the female weather preset, then generalized to a white-theme copy for
+    the 'Leo' preset). The two pages were ~740-line verbatim JS copies differing only in
+    theme -- /nimbus/ was removed 2026-07-14 to kill that divergence risk, so /studio/ is
+    now the SINGLE custom client for every avatar preset (nimbus AND leo both point here).
 
-    A self-contained vanilla-JS client (no build step) that speaks the SAME
-    SmallWebRTC signaling as the prebuilt bundle -- POST /api/offer, then the
-    avatar video + bot audio arrive as WebRTC tracks and the mic goes up the same
-    connection. This is ADDITIVE: the prebuilt bundle at /client is untouched and
-    stays the fallback. Mounted as StaticFiles so index.html + presenter.png serve
-    from one dir; served no-store so a phone never caches a stale build.
+    A self-contained vanilla-JS client (no build step) that speaks the SAME SmallWebRTC
+    signaling as the prebuilt bundle -- POST /api/offer, then the avatar video + bot audio
+    arrive as WebRTC tracks and the mic goes up the same connection. This is ADDITIVE: the
+    prebuilt bundle at /client is untouched and stays the fallback (though unsupported
+    under MUSETALK_SPLIT=1 -- see the module-level split-mode notes). Mounted as
+    StaticFiles so index.html + assets serve from one dir; served no-store so a phone
+    never caches a stale build.
     """
     from pathlib import Path as _Path
 
-    client_dir = _Path(__file__).resolve().parent.parent / "local_services" / "nimbus_client"
+    client_dir = _Path(__file__).resolve().parent.parent / "local_services" / "studio_client"
     if not (client_dir / "index.html").is_file():
-        logger.warning(f"Nimbus client not mounted (no index.html at {client_dir}).")
+        logger.warning(f"Studio client not mounted (no index.html at {client_dir}).")
         return
     try:
         from starlette.staticfiles import StaticFiles
         from pipecat.runner.run import app
     except Exception as e:  # pragma: no cover - only when runner app isn't importable
-        logger.warning(f"Nimbus client mount skipped ({e!r}).")
+        logger.warning(f"Studio client mount skipped ({e!r}).")
         return
 
     class _NoStoreStatic(StaticFiles):
@@ -976,16 +981,8 @@ def _install_nimbus_client() -> None:
             resp.headers["Cache-Control"] = "no-store"
             return resp
 
-    app.mount("/nimbus", _NoStoreStatic(directory=str(client_dir), html=True), name="nimbus")
-    logger.info("Nimbus UI mounted at /nimbus/ (custom client; /client prebuilt untouched).")
-
-    # Sibling custom client for the "Leo" avatar preset (his face + cloned voice). Same
-    # SmallWebRTC signaling + split-compositor; only the theme/branding differ. Additive --
-    # whichever avatar preset is live streams to whichever page is open (one GPU, one avatar).
-    studio_dir = _Path(__file__).resolve().parent.parent / "local_services" / "studio_client"
-    if (studio_dir / "index.html").is_file():
-        app.mount("/studio", _NoStoreStatic(directory=str(studio_dir), html=True), name="studio")
-        logger.info("Studio UI mounted at /studio/ (Leo preset; /client + /nimbus untouched).")
+    app.mount("/studio", _NoStoreStatic(directory=str(client_dir), html=True), name="studio")
+    logger.info("Studio UI mounted at /studio/ (custom client; /client prebuilt untouched).")
 
 
 if __name__ == "__main__":
@@ -1010,16 +1007,18 @@ if __name__ == "__main__":
     #
     # (Removed 2026-07-14: six <head>-injection installers -- jitter buffer, phone-speaker route,
     # video-stall monitor, A/V-stats monitor, playout probe, measure button. They patched the
-    # prebuilt /client page ONLY, and MUSETALK_SPLIT=1 makes /client unsupported, so on the pages
-    # actually used (/nimbus, /studio) they were inert -- CLIENT_FORCE_SPEAKER=1 in .env was
-    # loading nothing. The two that are real FEATURES (jitter buffer + speaker route) now live in
-    # the static clients, fed by GET /client/ice-config; the other four were one-off diagnostics.)
+    # prebuilt /client page ONLY, and MUSETALK_SPLIT=1 makes /client unsupported, so on the page
+    # actually used (/studio) they were inert -- CLIENT_FORCE_SPEAKER=1 in .env was loading
+    # nothing. The two that are real FEATURES (jitter buffer + speaker route) now live in the
+    # static client, fed by GET /client/ice-config; the other four were one-off diagnostics.)
     _configure_webrtc_video_bitrate()
-    # Serve the custom 'Nimbus AI' redesign at /nimbus/ (additive; /client stays the fallback).
-    _install_nimbus_client()
+    # Serve the custom studio client at /studio/ (additive; /client stays the fallback).
+    # /nimbus/ was a second, ~740-line verbatim JS copy of this page (theme-only diff) and was
+    # removed 2026-07-14 -- /studio/ is now the single custom client for every avatar preset.
+    _install_studio_client()
     # The /client/* API middleware (transcript, say, ice-config, avatar-overlay) is what makes
-    # the nimbus/studio clients work -- it must NOT depend on the public-WebRTC gate. It used to
-    # be installed only from inside _install_turn_ice_servers(), which returns early when
+    # the studio client work -- it must NOT depend on the public-WebRTC gate. It used to be
+    # installed only from inside _install_turn_ice_servers(), which returns early when
     # WEBRTC_PUBLIC=0 and no TURN_URLS -- so going tailnet-only silently 404'd the chat bubbles,
     # typed turns, AND the split-mode overlay (the avatar showed a raw mouth crop full-frame).
     # Idempotent: the TURN installer's own call becomes a no-op.

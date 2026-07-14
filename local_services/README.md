@@ -35,14 +35,16 @@ falls back to PyTorch silently.
 
 ## Browser clients
 
-`nimbus_client/` (`/nimbus/`) and `studio_client/` (`/studio/`) — self-contained vanilla-JS pages, no build
-step, mounted by `pipeline/main.py`. They speak the same `POST /api/offer` SmallWebRTC signaling as the
-prebuilt `/client` bundle, and additionally do the split-mode mouth-crop compositing, the chat transcript,
-and (since 2026-07-14) the receive-side jitter buffer + the phone-loudspeaker route — all fed by
-`GET /client/ice-config`.
+`studio_client/` (`/studio/`) — a self-contained vanilla-JS page, no build step, mounted by
+`pipeline/main.py`. It speaks the same `POST /api/offer` SmallWebRTC signaling as the prebuilt `/client`
+bundle, and additionally does the split-mode mouth-crop compositing, the chat transcript, and (since
+2026-07-14) the receive-side jitter buffer + the phone-loudspeaker route — all fed by
+`GET /client/ice-config`. (`nimbus_client/` was a second, ~740-line verbatim JS copy of this page
+differing only in theme; removed 2026-07-14 — `/studio/` is now the single custom client for every
+avatar preset, including "nimbus".)
 
 **`/client` (the pipecat prebuilt bundle) is unsupported while `MUSETALK_SPLIT=1`** — it cannot composite,
-so it would show a floating mouth crop. Use `/nimbus/` or `/studio/`.
+so it would show a floating mouth crop. Use `/studio/`.
 
 ## Removed 2026-07-14
 

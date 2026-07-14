@@ -215,16 +215,16 @@ lag-free ceiling on this shared GPU: 768/1024 profiled with render headroom in I
 live CosyVoice GPU contention → steady-mode voice lag** (`docs/PROBLEMS-AND-FIXES.md` P36); higher res needs a
 dedicated avatar GPU. Also pair with `MUSETALK_BASE_MAX` (source-portrait res cap, **768**; higher = sharper
 background but heavier composite) and keep `MUSETALK_FPS` identical across server+pipeline or you get drift),
-`MUSETALK_SPLIT` (**0 = default, full-frame**; `1` = stream ONLY a fixed-size mouth crop and let `/nimbus`
+`MUSETALK_SPLIT` (**0 = default, full-frame**; `1` = stream ONLY a fixed-size mouth crop and let `/studio`
 composite it over a pristine, never-video-compressed background still → crisp picture, VP8 budget concentrated
-on the mouth. **`/nimbus` ONLY** — the prebuilt `/client` can't composite and is unsupported while on (it would
+on the mouth [`/nimbus` removed 2026-07-14; `/studio` is the surviving custom client]. **`/studio` ONLY** — the prebuilt `/client` can't composite and is unsupported while on (it would
 show a floating crop); `/client` stays the untouched full-frame fallback at `=0`. **The BACKGROUND gets genuinely
 sharp; the animated mouth stays MuseTalk's 256px** (a model limit, not transport — removing VP8 blur helps but it
 never goes photo-crisp). A/V sync is REUSED verbatim (the sync path is frame-content-agnostic — it just pins frame
 N to audio N/fps, so a small crop changes nothing). Targets `MUSETALK_IDLE_MOTION=0` / a STATIC portrait (a moving
 bbox would break the fixed-crop mapping; split mode force-disables the idle loop). Automatic for any `AVATAR_REF` —
 the server derives the bbox+background from its existing one-time preparation. Server: `GET /overlay-assets`
-(background PNG + bbox); pipeline proxy: `GET /client/avatar-overlay`; `/nimbus` canvas-composites. **Toggle it in
+(background PNG + bbox); pipeline proxy: `GET /client/avatar-overlay`; `/studio` canvas-composites. **Toggle it in
 the config panel's "Avatar output" card** (`:7870`/`:8444`) — unlike a plain `.env` edit, that card relaunches the
 **avatar server AND the pipeline** (`restart_avatar()`), because a plain edit + the panel's pipeline-only Restart would
 resize the track to 256 while the server still streams 512 → a broken mismatch. Verified
@@ -304,7 +304,7 @@ connection from Cloudflare's speed-test endpoint (`speed.cloudflare.com/turn-cre
 (firewall-proof). `TURN_URLS`/`TURN_USERNAME`/`TURN_CREDENTIAL` (a static relay — e.g. an official free
 Cloudflare Realtime TURN key, same `turn.cloudflare.com` servers) override the Cloudflare-fetch path.
 All gate `_install_turn_ice_servers` (server-side ICE-server injection + `/client` head-patch +
-`/client/ice-config` for `/nimbus` + `/studio`). Still single-client + unauth. `docs/PROBLEMS-AND-FIXES.md`
+`/client/ice-config` for `/studio`). Still single-client + unauth. `docs/PROBLEMS-AND-FIXES.md`
 P38. **Full reference: `WORKFLOW.md` §8.**
 
 ## Commands
@@ -333,8 +333,8 @@ wsl -d Ubuntu -e bash -c "bash /mnt/e/Claude/VisualLLm/tts/cosyvoice-server/run_
 E:\miniconda3\envs\musetalk\python.exe -u -m local_services.musetalk_server.app
 #    (reads AVATAR_REF / MUSETALK_SIZE / MUSETALK_FPS from the OS env ONLY — no python-dotenv)
 
-# 3. Pipeline — project main env (SYSTEM Python 3.11, has pipecat — NOT a conda env); serves /client + /nimbus
-python -m pipeline.main            # prebuilt: localhost:7860/client/  |  custom Nimbus UI: localhost:7860/nimbus/
+# 3. Pipeline — project main env (SYSTEM Python 3.11, has pipecat — NOT a conda env); serves /client + /studio
+python -m pipeline.main            # prebuilt: localhost:7860/client/  |  custom Studio UI: localhost:7860/studio/
 
 # --- or start the avatar server + pipeline together ---
 .\scripts\run.ps1
@@ -489,23 +489,28 @@ the values equal — this closed the silent-failure mode, it did not make a mism
   of them (two separate index-serving middlewares would shadow each other). **As of 2026-07-14 only
   the TURN/ICE patch remains.** The other six installers (jitter buffer, phone-speaker route,
   video-stall monitor, A/V-stats monitor, playout probe, measure button) were REMOVED: they patched
-  `/client` ONLY, and `MUSETALK_SPLIT=1` makes `/client` unsupported, so on the pages actually used
-  (`/nimbus`, `/studio`) they were inert -- `CLIENT_FORCE_SPEAKER=1` was loading nothing. The two that
-  are real features (**jitter buffer** + **phone loudspeaker**) now live IN the static clients, fed by
+  `/client` ONLY, and `MUSETALK_SPLIT=1` makes `/client` unsupported, so on the page actually used
+  (`/studio`) they were inert -- `CLIENT_FORCE_SPEAKER=1` was loading nothing. The two that
+  are real features (**jitter buffer** + **phone loudspeaker**) now live IN the static client, fed by
   `GET /client/ice-config`, which also serves `jitterBufferMs` + `forceSpeaker` alongside `iceServers`.
   The middleware itself STAYS -- it serves `/client/transcript`, `/say`, `/ice-config`,
-  `/avatar-overlay` for nimbus + studio. The index is served `Cache-Control: no-store`.
+  `/avatar-overlay` for studio. The index is served `Cache-Control: no-store`.
 - **Open the client at `/client/` WITH the trailing slash** — the prebuilt page references its
   assets relatively, so `/client` (no slash) 404s them → white screen.
-- **The custom "Nimbus AI" client lives at `/nimbus/`** (figma-to-code redesign, `docs/PROBLEMS-AND-FIXES.md`
-  P36/**P37**) — a self-contained vanilla-JS page in `local_services/nimbus_client/` (full-screen weather-anchor avatar +
-  glass chat panel), served by `_install_nimbus_client` (StaticFiles, `no-store`). It speaks the SAME SmallWebRTC
-  signaling (`POST /api/offer`) as the prebuilt bundle — no build step — so it is **additive**: `/client/` prebuilt
-  is untouched and stays the fallback. Its extras are two thin server endpoints (same `_inject_client_patches`
-  middleware pattern): **`POST /client/say {text}`** injects a typed turn via `LLMMessagesAppendFrame` into
-  `_active_task`, and **`GET /client/transcript?since=N`** serves the conversation for the chat bubbles, fed by a
-  READ-ONLY `BaseObserver` on the `PipelineTask` (`_TranscriptStore`; taps bot `LLMTextFrame`s + user
-  `TranscriptionFrame`s — no pipeline structural change). Open it WITH the trailing slash, same as `/client/`.
+- **The custom client + AVATAR PRESETS live at `/studio/`** (`local_services/studio_client/`, mounted by
+  `_install_studio_client`). Originally built as `/nimbus/` (figma-to-code redesign, `docs/PROBLEMS-AND-FIXES.md`
+  P36/**P37**) for the female weather preset, then generalized 2026-07-11 to a white-theme copy for the
+  **"Leo"** avatar (a man's face + cloned voice, built from a source clip). The two pages were ~740-line
+  verbatim JS copies differing only in theme/branding, which is why `/nimbus/` was **removed 2026-07-14**
+  — `/studio/` is now the single custom client for every avatar preset. It's a self-contained vanilla-JS
+  page (no build step) that speaks the SAME SmallWebRTC signaling (`POST /api/offer`) as the prebuilt
+  bundle, so it stays **additive**: `/client/` prebuilt is untouched and stays the fallback (though
+  unsupported under `MUSETALK_SPLIT=1`, see above). Its extras are two thin server endpoints (same
+  `_inject_client_patches` middleware pattern): **`POST /client/say {text}`** injects a typed turn via
+  `LLMMessagesAppendFrame` into `_active_task`, and **`GET /client/transcript?since=N`** serves the
+  conversation for the chat bubbles, fed by a READ-ONLY `BaseObserver` on the `PipelineTask`
+  (`_TranscriptStore`; taps bot `LLMTextFrame`s + user `TranscriptionFrame`s — no pipeline structural
+  change). Open it WITH the trailing slash, same as `/client/`.
   **Chat behavior (P37):** the user's speech streams into a LIVE bubble word-by-word (STT interims → the store's
   `_partial` slot → `/client/transcript` returns `"partial"` → the client polls at 200ms), then commits as **ONE**
   bubble per turn (segments accumulate, commit at `LLMFullResponseStart`; committing per `TranscriptionFrame` gives a
@@ -529,19 +534,17 @@ the values equal — this closed the silent-failure mode, it did not make a mism
   P11-broken under steady) → junk "user" turns (`奶奶有皮革戀愛`) → a junk query bubble + a real extra reply, and under
   `ALLOW_INTERRUPTIONS=1` it truncates the bot mid-sentence. Use headphones. Duplicate bubbles with IDENTICAL text = the
   poll race (P46); a gibberish second query bubble = mic echo.
-- **The `/studio/` client + AVATAR PRESETS (2026-07-11).** `/studio/` (`local_services/studio_client/`, mounted by
-  `_install_studio_client` next to nimbus) is a **sibling** custom client for the **"Leo"** avatar — a man's face + his
-  cloned voice, built from a source clip. It is a WHITE-theme copy of nimbus reusing the SAME signaling + split-compositor
-  + transcript JS verbatim; only the theme/branding differ. `/nimbus/` and `/client/` are untouched fallbacks. Because one
-  GPU runs one avatar, the two pages share whichever **preset** is live. A preset = a full backend swap (portrait
-  `AVATAR_REF` + cloned voice `COSYVOICE_PROMPT_WAV/TEXT` + `LANGUAGE`), defined in `config_panel/server.py::PRESETS`
-  (`nimbus` = female weather en; `leo` = his face + voice, zh). The config panel's **"Avatar preset"** card
+- **AVATAR PRESETS (2026-07-11).** Because one GPU runs one avatar, `/studio/` shows whichever **preset**
+  is live. A preset = a full backend swap (portrait `AVATAR_REF` + cloned voice
+  `COSYVOICE_PROMPT_WAV/TEXT` + `LANGUAGE`), defined in `config_panel/server.py::PRESETS`
+  (`nimbus` = female weather en; `leo` = his face + voice, zh — both open at `/studio/`). The config
+  panel's **"Avatar preset"** card
   (`POST /preset`) writes those `.env` keys + `AVATAR_PRESET`, writes the CJK transcript to a WSL-sourced file
   (`.preset_voice.env` — keeps CJK OFF the mangling-prone WSL command line), then relaunches **CosyVoice → avatar →
   pipeline in the P15 load order** (frees `:8002` VRAM first). Leo's portrait is the full rectangular source frame (the
   server derives the split bbox+background from it). His voice reference must be **Simplified** zh (the clean CosyVoice
   path; Traditional garbles, P43) with an accurate transcript (verified by transcribe-back). ~2–4 min to switch.
-- **Fullscreen-avatar button (2026-07-11)** — both `/nimbus/` and `/studio/` have a top-right button that fullscreens the
+- **Fullscreen-avatar button (2026-07-11)** — `/studio/` has a top-right button that fullscreens the
   **`.presenter`** (bg + mouth-crop + name tag together, not the bare `<video>`). On `fullscreenchange` it recomputes
   `layoutSplitVideo()` so the split mouth-crop re-scales/re-positions onto the face at the new size (else the mouth lands
   wrong fullscreen). Handles standard + `webkit` fullscreen APIs; static files, so a reload picks it up (no restart).
@@ -561,7 +564,7 @@ the values equal — this closed the silent-failure mode, it did not make a mism
   clean-FLUSH — on the pipecat `InterruptionFrame` the avatar client drops in-flight server frames
   (`_flushing`, `musetalk_video.py`) and the MuseTalk server drains its `out_q` on `reset`
   (`app.py`, reuses the `seg_restart` path), so the avatar no longer keeps lip-moving silently / leaks
-  the old turn into the next; (b) a TYPED turn now barges in too — `/client/say` (the `/nimbus` keyboard
+  the old turn into the next; (b) a TYPED turn now barges in too — `/client/say` (the `/studio` keyboard
   path) emits an `InterruptionFrame` before the `LLMMessagesAppendFrame` when `allow_interruptions`
   (a typed turn otherwise emits no barge-in, so the old turn played to completion). The partial bot
   reply is preserved in context automatically (pipecat's assistant aggregator commits it on

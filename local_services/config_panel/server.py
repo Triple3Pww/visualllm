@@ -253,7 +253,7 @@ def restart_pipeline() -> dict:
 
 # --------------------------------------------------------------------------- avatar output (split)
 def read_split() -> bool:
-    """True if MUSETALK_SPLIT is on in .env (stream only the mouth crop; /nimbus composites it)."""
+    """True if MUSETALK_SPLIT is on in .env (stream only the mouth crop; /studio composites it)."""
     return (read_env().get("MUSETALK_SPLIT", "0") or "0").strip().lower() in ("1", "true", "yes", "on")
 
 
@@ -388,13 +388,14 @@ def read_cosy_model() -> str:
 # --------------------------------------------------------------------------- avatar presets
 # One GPU = one live avatar, so an "avatar preset" is a full backend swap: portrait (AVATAR_REF),
 # cloned voice (COSYVOICE_PROMPT_WAV/TEXT, delivered via the sourced _VOICE_ENV file), and language.
-# Both the prebuilt page family shares one active preset -- /nimbus and /studio show whichever is
-# live. voice_text is the EXACT transcript of voice_wav (zero-shot needs it) in SIMPLIFIED zh (the
-# clean CosyVoice path; Traditional garbles -- P43). No <|endofprompt|> marker: that is v3-only.
+# /studio/ is the single custom client page for every preset (/nimbus/ removed 2026-07-14 -- it was
+# a second ~740-line verbatim JS copy differing only in theme). voice_text is the EXACT transcript
+# of voice_wav (zero-shot needs it) in SIMPLIFIED zh (the clean CosyVoice path; Traditional garbles
+# -- P43). No <|endofprompt|> marker: that is v3-only.
 PRESETS = {
     "nimbus": {
         "label": "Nimbus -- weather presenter (female)",
-        "page": "/nimbus/",
+        "page": "/studio/",
         "env": {"AVATAR_REF": "assets/avatar_studio_match.png", "LANGUAGE": "en",
                 "LLM_PROVIDER": "openrouter"},
         "voice_wav": "/mnt/e/Claude/VisualLLm/tts/cosyvoice-server/CosyVoice/asset/pro_ref.wav",

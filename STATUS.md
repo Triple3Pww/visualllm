@@ -22,7 +22,7 @@ blamed on a mystery session-degradation bug — worth re-measuring that bug now 
 
 **(2) THE SIX `/client` `<head>`-PATCHES WERE INERT — so `CLIENT_FORCE_SPEAKER=1` was doing NOTHING on the pages you
 demo.** They inject into the prebuilt `/client` page ONLY, and `.env` runs `MUSETALK_SPLIT=1`, which makes `/client`
-unsupported. `/nimbus` + `/studio` implemented none of them (verified: 0 hits for `setSinkId` / `jitterBufferTarget` /
+unsupported. `/nimbus` + `/studio` implemented none of them [`/nimbus` removed 2026-07-14; `/studio` is the surviving custom client -- see the top-of-file entry for that session] (verified: 0 hits for `setSinkId` / `jitterBufferTarget` /
 `getStats` / `rVFC`). So `CLIENT_JITTER_BUFFER_MS`, `CLIENT_FORCE_SPEAKER`, `CLIENT_AV_STATS_MONITOR=1`,
 `CLIENT_PLAYOUT_PROBE=1` and `MEASURE_BUTTON=1` were all switched **on** and loading nothing. **The phone-loudspeaker
 fix was not dead code — it was a MISSING FEATURE.** The two real ones (jitter buffer + speaker route) now live IN the

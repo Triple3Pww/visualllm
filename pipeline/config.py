@@ -198,7 +198,7 @@ class Config:
     @property
     def avatar_split(self) -> bool:
         """Split mode (MUSETALK_SPLIT): the avatar server streams only the mouth crop and
-        /nimbus composites it over a pristine still. Default off (full-frame, /client works)."""
+        /studio composites it over a pristine still. Default off (full-frame, /client works)."""
         return (_get("MUSETALK_SPLIT", "0") or "0").lower() in ("1", "true", "yes", "on")
 
     @property

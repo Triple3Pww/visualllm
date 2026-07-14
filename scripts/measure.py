@@ -559,7 +559,7 @@ async def main(args):
     # Fill the playout row by ESTIMATE: headless arrival + the configured jitter buffer. (The
     # real-browser [client-playout] beacon that used to measure this row was removed with the
     # /client <head> patches -- it only ever injected into the prebuilt page, which MUSETALK_SPLIT=1
-    # makes unsupported, so it could not fire on /nimbus or /studio anyway.)
+    # makes unsupported, so it could not fire on /studio anyway.)
     playout_source = "est"
     if client_arrival is not None:
         jb = float(os.getenv("CLIENT_JITTER_BUFFER_MS", "400") or 400) / 1000.0

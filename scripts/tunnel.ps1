@@ -42,14 +42,9 @@ if (-not $exe) {
     return $null
 }
 
-# Recommended client path follows the live avatar preset (leo -> /studio/, else /nimbus/).
-$preset = $null
-$envFile = Join-Path $repo ".env"
-if (Test-Path $envFile) {
-    $m = Select-String -Path $envFile -Pattern '^\s*AVATAR_PRESET\s*=\s*(.+?)\s*(?:#.*)?$' -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($m) { $preset = $m.Matches[0].Groups[1].Value.Trim() }
-}
-$clientPath = if ($preset -eq "leo") { "/studio/" } else { "/nimbus/" }
+# /client is the prebuilt fallback but is unsupported under MUSETALK_SPLIT=1; /nimbus removed
+# 2026-07-14 -- /studio/ is now the single custom client page for every avatar preset.
+$clientPath = "/studio/"
 
 # Only one quick tunnel should exist, and a lingering cloudflared from a previous session keeps
 # logs\cloudflared.log OPEN -- then Set-Content below throws (ErrorAction Stop) and the whole
@@ -94,7 +89,7 @@ if (-not $url) {
 } else {
     Write-Host ""
     Write-Host "  PUBLIC LINK (share this): $url$clientPath" -ForegroundColor Green
-    Write-Host "  (base $url ; also /nimbus/ , /client/)" -ForegroundColor DarkGray
+    Write-Host "  (base $url ; also /client/)" -ForegroundColor DarkGray
     Write-Host ""
 }
 

@@ -1373,6 +1373,10 @@ Avatar A/V test tooling.
 
 ## P36 — custom "Nimbus AI" web client (figma-to-code) + the resolution-vs-sync ceiling on the shared GPU ✅ SHIPPED (2026-07-07, 11th session)
 
+**[`/nimbus/` removed 2026-07-14; `/studio/` is the surviving custom client — see STATUS.md for that session. The
+rest of this entry, and the other `/nimbus` mentions below it in this file, are left as the historical record of
+when and why the client was built; they are not describing the current system.]**
+
 **What.** A distinct, self-contained **custom client** at **`/nimbus/`** (a figma-to-code redesign — full-screen
 weather-anchor avatar on the left 70%, glass chat panel on the right 30%), served ALONGSIDE the pipecat prebuilt
 `/client` (untouched, still the fallback). It speaks the SAME SmallWebRTC signaling — `POST /api/offer`, then avatar

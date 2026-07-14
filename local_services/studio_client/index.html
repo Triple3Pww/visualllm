@@ -5,11 +5,13 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>Leo — AI Assistant</title>
 <!--
-  Leo AI Assistant — light/white client for the "leo" avatar preset (his face + cloned voice).
-  A sibling of /nimbus/: SAME SmallWebRTC signaling (POST /api/offer), SAME split-mouth compositor,
-  SAME transcript poll + /client/say. Only the THEME (white) and branding differ. Additive: the
-  prebuilt /client and the /nimbus page are untouched. One GPU = one live avatar, so whichever
-  preset is active streams to whichever page is open.
+  Leo AI Assistant — light/white client for the "leo" avatar preset (his face + cloned voice), and
+  also the page used for every other preset (e.g. "nimbus", his female weather counterpart) since
+  /nimbus/ -- a second, ~740-line verbatim JS copy of this page differing only in theme -- was
+  removed 2026-07-14. SAME SmallWebRTC signaling (POST /api/offer), SAME split-mouth compositor,
+  SAME transcript poll + /client/say as the prebuilt bundle. Additive: the prebuilt /client is
+  untouched (though unsupported under MUSETALK_SPLIT=1). One GPU = one live avatar, so whichever
+  preset is active streams to this page.
 -->
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Hanken+Grotesk:wght@600;700;800&family=Geist:wght@500;600;700&display=swap');
@@ -796,7 +798,7 @@
 
     // Poll the server transcript for new lines (bot replies + finalized user speech) -> bubbles,
     // plus the in-progress user utterance (STT interim) -> the live bubble.
-    // DUPLICATE BUBBLES (fixed -- same as /nimbus): setInterval fires every 200ms whether or not
+    // DUPLICATE BUBBLES (fixed, P46): setInterval fires every 200ms whether or not
     // the previous poll resolved, and `transcriptSeq` is read when the fetch is ISSUED. One
     // main-thread hitch (video decode / rAF analyser / DOM) and the next poll goes out with the
     // SAME stale `since`; the server returns the same rows to both, and BOTH render them -> the

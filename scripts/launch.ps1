@@ -188,14 +188,13 @@ try {
 Write-Host ""
 
 # ---------------------------------------------------------------------------
-# 5) Open the client. The page follows the live avatar preset (leo -> /studio/,
-#    else /nimbus/), same rule as tunnel.ps1 -- NEVER the prebuilt /client/:
-#    under MUSETALK_SPLIT=1 (the live baseline) /client can't composite the
-#    mouth crop and shows a floating 256px square, so opening it here handed
-#    the user a broken page on every one-click launch.
+# 5) Open the client. /studio/ is the single custom client page for every avatar
+#    preset (/nimbus/ removed 2026-07-14) -- NEVER the prebuilt /client/: under
+#    MUSETALK_SPLIT=1 (the live baseline) /client can't composite the mouth crop
+#    and shows a floating 256px square, so opening it here handed the user a
+#    broken page on every one-click launch. /client stays the unsupported fallback.
 # ---------------------------------------------------------------------------
-$preset = Get-EnvVal "AVATAR_PRESET"
-$clientPath = if ($preset -eq "leo") { "/studio/" } else { "/nimbus/" }
+$clientPath = "/studio/"
 Write-Host "[5/5] Opening the client in your browser ($clientPath)..." -ForegroundColor Cyan
 Start-Process ("http://localhost:7860{0}" -f $clientPath)
 Write-Host ""

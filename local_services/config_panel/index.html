@@ -58,10 +58,10 @@
     <h2>Avatar preset</h2>
     <div class="row">
       <div class="lab"><b>Who is on screen</b><span class="h">One GPU = one live avatar, so a preset is a
-        full backend swap: portrait + cloned voice + language. <b>Nimbus</b> = female weather presenter
-        (<code>/nimbus</code>); <b>Leo</b> = his face + cloned voice, Chinese (<code>/studio</code>).
-        Applying relaunches CosyVoice&rarr;avatar&rarr;pipeline in the safe order (~2&ndash;4&nbsp;min, all
-        three briefly stop). Then open that preset's page.</span></div>
+        full backend swap: portrait + cloned voice + language. <b>Nimbus</b> = female weather presenter;
+        <b>Leo</b> = his face + cloned voice, Chinese. Both open at <code>/studio</code> (the single
+        custom client page). Applying relaunches CosyVoice&rarr;avatar&rarr;pipeline in the safe order
+        (~2&ndash;4&nbsp;min, all three briefly stop). Then open that preset's page.</span></div>
       <div>
         <select id="presetSel"></select>
         <button class="restart" id="presetApply" style="margin-top:8px; width:100%">Apply preset</button>
@@ -99,12 +99,12 @@
     <h2>Avatar output</h2>
     <div class="row">
       <div class="lab"><b>Picture mode</b><span class="h">Full frame = today (both <code>/client</code> and
-        <code>/nimbus</code>). Split mouth-crop = crisp pristine background + only the mouth streamed,
-        composited in <code>/nimbus</code> ONLY (<code>/client</code> won't work). Applying RESTARTS the
+        <code>/studio</code>). Split mouth-crop = crisp pristine background + only the mouth streamed,
+        composited in <code>/studio</code> ONLY (<code>/client</code> won't work). Applying RESTARTS the
         avatar server (~1&nbsp;min) AND the pipeline. Needs a static portrait (Idle motion = 0). The
         background gets sharp; the animated mouth stays 256&nbsp;px (model limit).</span></div>
       <div>
-        <select id="splitSel"><option value="off">Full frame</option><option value="on">Split mouth-crop (/nimbus)</option></select>
+        <select id="splitSel"><option value="off">Full frame</option><option value="on">Split mouth-crop (/studio)</option></select>
         <button class="restart" id="splitApply" style="margin-top:8px; width:100%">Apply + restart avatar</button>
       </div>
     </div>

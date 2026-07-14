@@ -78,7 +78,7 @@ PARSING_MODE = os.getenv("MUSETALK_PARSING_MODE", "jaw")
 # slows the per-frame full-frame compositing (PIL). Keeps the face well above the
 # 256px VAE crop while making blending realtime.
 BASE_MAX = int(os.getenv("MUSETALK_BASE_MAX", "768"))
-# Split mode: stream ONLY the fixed-size mouth crop and let /nimbus composite it over a
+# Split mode: stream ONLY the fixed-size mouth crop and let /studio composite it over a
 # pristine still (crisp background, encoder budget on the mouth). Default off (full-frame).
 SPLIT = os.getenv("MUSETALK_SPLIT", "0").lower() in ("1", "true", "yes")
 SPLIT_SIZE = int(os.getenv("MUSETALK_SPLIT_SIZE", "256"))
@@ -960,7 +960,7 @@ async def stream(ws: WebSocket):
 
 @app.get("/overlay-assets")
 def overlay_assets():
-    """One-time compositing assets for the split-mode /nimbus client: the pristine
+    """One-time compositing assets for the split-mode /studio client: the pristine
     background portrait + the bbox the mouth crop maps into. Derived from the already-
     prepared frame_cycle[0]/coord_cycle[0], so it is automatic for any AVATAR_REF image."""
     import base64
