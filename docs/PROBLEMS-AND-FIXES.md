@@ -2185,7 +2185,8 @@ were Groq congestion (cleared on the third run, 1.19s) — that hop is upstream 
 (`_sync_routing`, `_screech_repro`, `_interrupt_flush`, `_frame_deficit`); live measure ×3 with proto 2 active —
 TTFO 3.56/6.53*/3.61s vs baseline 3.69/3.84/2.53s (*the 6.53 was a 3.93s Groq LLM tail spike, avatar rows
 normal), 12 fps steady, freeze ≤121 ms, `[avatar timing]` end drift ±0.04s, held/dup counter still sane (4 =
-lead-prime). **Awaiting the user's live eye on /studio/ (P19: the probe passes what the eye rejects).**
+lead-prime). **✅ The user's live eye confirmed it same day (after the proto-2-only cleanup below): "still
+sync" — the P19 gate is passed in the direction that matters, and this is the verified sync baseline.**
 
 **Lesson:** when one side of a wire infers what the other side knows, the inference is a bug that hasn't
 happened yet. The cheapest fix for a heuristic is a protocol field.
