@@ -2,11 +2,19 @@
 
 Protocol (matches local_services/musetalk_video.py):
   client -> server:
-    text json {"type":"config","fps":25}
+    text json {"type":"config","fps":25[,"proto":2]}
     text json {"type":"speech_start"} / {"type":"speech_end"} / {"type":"reset"}
     binary: 16-bit PCM mono @16 kHz audio chunks (TTS audio, resampled by client)
   server -> client:
     binary: raw RGB frame buffers (IMAGE_SIZE*IMAGE_SIZE*3 bytes) at `fps`
+    proto 2 (opt-in via config, acked with {"type":"proto","v":2}): every binary
+    frame is prefixed with a 16-byte header (FRAME_HDR below) carrying kind
+    (0=real render / 1=held re-send / 2=idle-neutral) + audio_pos (cumulative 16k
+    samples of the turn's REAL audio covered once this frame shows). The client
+    pairs its buffered voice to audio_pos instead of index/fps arithmetic, so a
+    held frame or an fps disagreement can never shift the audio<->lip mapping.
+    Clients that never send "proto" get the bare-frame wire unchanged (the
+    offline harnesses _capture.py/_drive_frames.py/_capture_synced.py).
 
 Implementation notes
 --------------------
@@ -40,6 +48,7 @@ import json
 import math
 import os
 import pickle
+import struct
 import sys
 import asyncio
 from pathlib import Path
@@ -86,6 +95,14 @@ SPLIT_SIZE = int(os.getenv("MUSETALK_SPLIT_SIZE", "256"))
 # was dropped and reverting to the idle loop. Must comfortably exceed the largest
 # normal inter-chunk gap within one utterance, or it flips to idle mid-sentence.
 IDLE_WATCHDOG_S = float(os.getenv("MUSETALK_IDLE_WATCHDOG_S", "3.0"))
+# --- proto-2 frame header (see the module docstring) ------------------------
+# 16 bytes, little-endian: magic 4s | kind u8 | 3 pad | audio_pos u64.
+# kind: 0 = REAL lip-synced frame (audio_pos valid), 1 = HELD re-send (render
+# underflow or lead-prime), 2 = IDLE/neutral. audio_pos is the pairing SOURCE OF
+# TRUTH for the proto-2 client, so it counts only real turn samples (never the
+# speech_end zero-pad).
+FRAME_HDR = struct.Struct("<4sB3xQ")
+FRAME_MAGIC = b"MTF2"
 
 app = FastAPI(title="MuseTalk realtime")
 
@@ -758,6 +775,8 @@ async def stream(ws: WebSocket):
     fps = engine.fps
     seg_samples = engine.samples_for_frames(SEG_FRAMES, fps)   # ceil-sized: exactly SEG_FRAMES/seg
     audio_buf = np.zeros(0, dtype=np.float32)
+    proto = 1        # bare frames until the client opts into proto 2 via config
+    turn_pos = 0     # cumulative REAL 16k samples rendered this turn (proto-2 audio_pos)
     # Bounded queue of rendered frames; the pump drains it at a STEADY fps. A SMALLER
     # cap is the documented SAFE lag lever for live mode: under GPU contention the render
     # skips stale frames instead of letting the lips fall arbitrarily far behind the voice.
@@ -783,6 +802,14 @@ async def stream(ws: WebSocket):
         except Exception:  # noqa: BLE001 -- markers are best-effort
             pass
 
+    async def send_frame(fb: bytes, kind: int, pos: int) -> None:
+        # Reads `proto` from the enclosing scope each call (same pattern as the pump's
+        # per-tick fps re-read), so a config arriving after the pump starts is honored.
+        if proto >= 2:
+            await ws.send_bytes(FRAME_HDR.pack(FRAME_MAGIC, kind, pos) + fb)
+        else:
+            await ws.send_bytes(fb)
+
     async def pump():
         """Emit a steady `fps` video stream. WebRTC/mobile decoders freeze on
         bursty input, so we pace output: send the next rendered frame if one is
@@ -793,6 +820,7 @@ async def stream(ws: WebSocket):
         idle_n = len(idle)
         idle_i = 0
         last = idle[0] if idle_n else engine.neutral_frame()
+        last_pos = 0     # audio_pos of the last REAL frame sent (held re-sends repeat it)
         was_speaking = False
         nxt = loop.time()
         # Marker state, driven by REAL frames drained (not idle/held): `playing` spans a
@@ -849,7 +877,7 @@ async def stream(ws: WebSocket):
                 # gives the locked audio a cushion so a render hiccup is absorbed (no stutter)
                 # and the voice starts in step with a ready avatar. Hold the last frame while priming.
                 if not playing and sp and out_q.qsize() < lead_frames:
-                    await ws.send_bytes(last)
+                    await send_frame(last, 1, last_pos)   # lead-prime hold = a HELD re-send
                     nxt += interval
                     await asyncio.sleep(max(0.0, nxt - loop.time()))
                     continue
@@ -860,7 +888,9 @@ async def stream(ws: WebSocket):
                 except asyncio.QueueEmpty:
                     pass
                 if got is not None:
-                    last = got
+                    last, out_kind, out_pos = got
+                    if out_kind == 0:
+                        last_pos = out_pos              # held re-sends repeat the last REAL pos
                     if not playing:                     # primed & ready: start the clock
                         playing = True
                         real_sent = 0
@@ -872,6 +902,7 @@ async def stream(ws: WebSocket):
                         last_clock = real_sent
                         await _mark({"type": "video_clock", "frames": real_sent})
                 else:
+                    out_kind, out_pos = 1, last_pos     # default: a HELD re-send of `last`
                     if playing:
                         now = loop.time()
                         if empty_since is None:
@@ -889,6 +920,7 @@ async def stream(ws: WebSocket):
                     elif not sp and idle_n:
                         last = idle[idle_i % idle_n]
                         idle_i += 1
+                        out_kind, out_pos = 2, 0
                     elif not sp:
                         # No idle loop (MUSETALK_IDLE_MOTION=0): settle to the NEUTRAL rest pose
                         # between turns. Without this `last` stays on the last drained frame -- which
@@ -896,15 +928,16 @@ async def stream(ws: WebSocket):
                         # the face would rest parted AND the client's close crossfade would cache that
                         # as its target (a no-op). END_TAIL>0 used to hide this by draining a neutral.
                         last = engine.neutral_frame()
+                        out_kind, out_pos = 2, 0
                 # Always emit a frame this tick (real, held-last, or idle) so the video never
                 # freezes -- the end-of-turn freeze was caused by skipping the send on underflow.
-                await ws.send_bytes(last)
+                await send_frame(last, out_kind, out_pos)
                 nxt += interval
                 await asyncio.sleep(max(0.0, nxt - loop.time()))
         except Exception:  # noqa: BLE001
             pass
 
-    def enqueue(frame: bytes) -> None:
+    def enqueue(frame: bytes, kind: int = 0, pos: int = 0) -> None:
         # Stay realtime: drop the oldest frame rather than lag behind (or, for the
         # closing neutral frame, rather than raise QueueFull and kill the socket).
         if out_q.full():
@@ -912,15 +945,23 @@ async def stream(ws: WebSocket):
                 out_q.get_nowait()
             except asyncio.QueueEmpty:
                 pass
-        out_q.put_nowait(frame)
+        out_q.put_nowait((frame, kind, pos))
 
-    async def render(segment: np.ndarray) -> int:
+    async def render(segment: np.ndarray, real_len: int | None = None) -> int:
         # One GPU inference at a time across the whole process (shared engine).
+        nonlocal turn_pos
+        real = len(segment) if real_len is None else real_len
         async with _render_lock:
             frames = await asyncio.to_thread(engine.render_segment, segment)
-        for f in frames:
-            enqueue(f)
-        return len(frames)
+        n = len(frames)
+        for k, f in enumerate(frames):
+            # Cumulative REAL samples covered once frame k is shown. Linear within the
+            # segment, exact at its end -- pos is the pairing SOURCE OF TRUTH for the
+            # proto-2 client, so it must never include the speech_end zero-pad.
+            pos = turn_pos + (real * (k + 1)) // n if n else turn_pos
+            enqueue(f, 0, pos)
+        turn_pos += real
+        return n
 
     pump_task = asyncio.create_task(pump())
     turn_frames = 0
@@ -938,9 +979,13 @@ async def stream(ws: WebSocket):
                     fps = int(evt.get("fps", fps))
                     engine.fps = fps
                     seg_samples = engine.samples_for_frames(SEG_FRAMES, fps)
-                    logger.info(f"[stream] config: fps={fps}")
+                    if int(evt.get("proto", 1)) >= 2:
+                        proto = 2
+                        await _mark({"type": "proto", "v": 2})   # ack: headers from now on
+                    logger.info(f"[stream] config: fps={fps} proto={proto}")
                 elif kind == "speech_start":
                     turn_frames = 0
+                    turn_pos = 0                   # proto-2 audio_pos restarts with the turn
                     st["seg_restart"] = True       # force a fresh video_start for this turn
                     speaking.set()                 # pump holds, not idle, now
                     st["last_audio"] = loop.time()
@@ -955,11 +1000,12 @@ async def stream(ws: WebSocket):
                         f_final = max(1, math.ceil(len(audio_buf) / AUDIO_SR * fps))
                         seg_len = engine.samples_for_frames(f_final, fps)
                         pad = max(0, seg_len - len(audio_buf))
+                        real_tail = len(audio_buf)     # pos must exclude the zero-pad below
                         seg = (
                             np.concatenate([audio_buf, np.zeros(pad, np.float32)])
                             if pad else audio_buf
                         )
-                        turn_frames += await render(seg)
+                        turn_frames += await render(seg, real_len=real_tail)
                     audio_buf = np.zeros(0, dtype=np.float32)
                     engine.reset_idx()
                     speaking.clear()               # let the idle loop resume
@@ -979,7 +1025,7 @@ async def stream(ws: WebSocket):
                         # last SPOKEN frame, so we must NOT append any neutral tail (allow a true 0).
                         tail = int(os.getenv("MUSETALK_END_TAIL_FRAMES", "4"))
                         for _ in range(max(0, tail)):
-                            enqueue(engine.neutral_frame())
+                            enqueue(engine.neutral_frame(), 2, 0)   # neutral tail, not lip audio
                 continue
 
             data = msg.get("bytes")
