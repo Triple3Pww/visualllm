@@ -1,5 +1,56 @@
 # VisualLLm — Project Status & Next Steps
 
+_Last updated: 2026-07-15 (**25th session — PER-FRAME AUDIO COUPLING (proto 2) shipped, the client's sync guessing
+layer DELETED, warmup fixed, and the user's LIVE EYE confirmed sync. Branch `chore/cleanup-and-tts-merge`, 9 commits
+ahead, NOT pushed. P51.**
+
+**(0) Where it came from:** source-level research on `docs/research/ttfo-sub-1.5s.md`'s two "mine for ideas" targets
+(two web agents): **OpenAvatarChat** (their MuseTalk handler couples audio to video per-frame — 960 samples ride in
+each frame packet, drift impossible by construction; no TRT, no lead cushion but a ~1s input-slicing floor, no stall
+handling — we are ahead everywhere except that coupling idea) and **vLLM-Omni** (⚠️ **the July-15 spike's "no ref
+caching upstream" verdict is STALE**: `SpeakerEmbeddingCache` PR #2630 is MERGED, keyed on registered voice names —
+register the leo ref once via `POST /v1/audio/voices`, send `{"voice":name}` per turn, and the probe's 0.83s-flat
+number may be reachable TODAY; the spike sent inline `ref_audio`, which bypasses it. Cheap next test. Their RAS
+solution — vectorized sampler + `repetition_penalty: 1.0001` purely to make vLLM track output ids — is also cleaner
+than our logits processor and portable.)
+
+**(1) proto 2 — the frame declares itself (`984a726` server, `c62e1d9` client, P51).** Every MuseTalk ws frame can
+carry a 16-byte header: `MTF2` | kind (0 real / 1 held re-send / 2 idle) | audio_pos (cumulative REAL 16k samples of
+the turn covered once the frame shows). The steady client releases voice paired to `audio_pos` — the server's own
+account of what it rendered — instead of `i/fps` arithmetic; held frames are declared instead of byte-compare-guessed.
+An fps mismatch (P47.3's silent failure mode) structurally cannot shift the mapping anymore. OpenAvatarChat's
+bytes-in-packet was deliberately translated to *metadata*: the delivered voice is the original 24k TTS audio and the
+server only sees the 16k lip-sync copy — coupling bytes would downgrade the heard voice. Opt-in negotiation
+(`"proto":2` in config → `{"type":"proto","v":2}` ack); the offline harnesses never ask and keep the bare wire
+byte-identical. Probe: final `audio_pos` == fed samples EXACT (90970/90970).
+
+**(2) The proto-1 guessing layer is DELETED from the client (`f2baf54`, `8cd22fa` — user-directed cleanup).** Gone:
+the P39 byte-compare, the `i/fps` pairing, the P10 audio-cap (unneeded by construction: a real frame's pos can never
+exceed voice already buffered — `_abuf.append` happens in the same `process_frame` call that queues the feed), and the
+`video_clock` release-heartbeat (diagnostic-only marker now). A bare frame inside a synced turn = an older server →
+LOUD `_unsynced` fallback instead of silent mis-pairing. **Deliberately KEPT (different problems, not pairing
+guesses):** `_align_even`/`_odd_carry` (P3), `_srv_carry` (P40), ceil sizing (P9), lead-prime + burst feed, interrupt
+flush (P44), close crossfade (P12), the `sync_with_audio`/`video_out_is_live` transport coupling. Gates: preflight +
+all 4 archive regressions PASS; measure ×3 avatar rows best of day (lead-hold 0.56/0.65/1.76s, lips +0.44s, end drift
+±0.04s). **✅ THE USER'S LIVE EYE CONFIRMED: "still sync" — this is the verified sync baseline now (P19 gate passed).**
+
+**(3) Warmup fixed (`d9c47db`).** `_warmup()` ran BEFORE TRT init — warming the torch UNet/VAE that
+`MUSETALK_FREE_TORCH` freed moments later, leaving the TRT engines' first execution cold for the first real turn.
+Relocated to run LAST, after the render path is final (TRT → free-torch → GPU-composite → warmup 0.5s). Honest:
+a correctness win, not a measured latency win. (Idea also from OpenAvatarChat's per-worker warmup.)
+
+**(4) ⚠️ Measure-harness landmine (external, cost this session an hour):** `output/q_ai.wav` — the default `--mic` —
+**stopped transcribing on Deepgram** between 07-14 21:58 and 07-15 13:39 (finals come back EMPTY conf 0.0; verified
+via raw ws + batch REST on the same sha256 file; other zh clips transcribe conf 1.0 → a server-side model change
+flipped this marginal synthetic clip, nothing local). Symptom: no turn fires, measure silently reports a STALE turn
+from the log. **Use `--mic output/_zh_q_def.wav`.** Baseline measured with it: TTFO 3.69/3.84/2.53s (median 3.69).
+Two later runs also caught ~3.8s **Groq congestion** LLM rows (cleared to 1.19s) — distrust any single-run TTFO.
+
+**Next:** the vLLM-Omni registered-voice rerun (cheap, possibly −0.2s TTS + variance gone); the session-degradation
+re-measure now `OPENROUTER_MAX_TOKENS` is real; LiteAvatar (CPU avatar = GPU-contention escape) blocked on "can it
+drive a custom face (Leo)?"; push/merge decision for the 9-commit branch.)_
+<!-- prior handoff -->
+
 _Last updated: 2026-07-15 (**24th session — VRAM squeezed to fit an 8GB card: whole stack 11.4GB → 7.8GB live
 (project share ≈ 6.9GB, the user's ≤7GB target HIT). Two levers, both shipped + live-verified; P50. Branch
 `chore/cleanup-and-tts-merge`, uncommitted.**

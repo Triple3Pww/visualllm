@@ -111,9 +111,10 @@ Chinese voice starts later than English — that's CosyVoice's zh first-chunk TT
 transport. It:
 1. Resamples each TTS audio chunk to **16 kHz mono PCM** and feeds it to the avatar server
    (the first `MUSETALK_FEED_BURST_S` of a turn un-paced, then real-time-paced so no backlog).
-2. **Buffers the downstream voice copy** and releases it frame-clocked to the real video
-   the server reports rendering (so audio never runs ahead of the lips), tagging frames for
-   A/V sync in `steady` mode (see §5).
+2. **Buffers the downstream voice copy** and releases it paired to each real frame's
+   **`audio_pos`** — the server's own account of the audio it consumed rendering that frame
+   (proto 2, P51) — so audio never runs ahead of the lips, tagging frames for A/V sync in
+   `steady` mode (see §5).
 3. Keeps every downstream audio frame whole-sample (`_align_even`) — the anti-screech guard.
 
 ### Avatar (server side) — MuseTalk on the GPU
@@ -131,14 +132,21 @@ disconnect.
 To understand either side you must read both (`musetalk_video.py` + `musetalk_server/app.py`):
 
 **Client → server:**
-- `{"type":"config","fps":20}` — sets output fps.
+- `{"type":"config","fps":20,"proto":2}` — sets output fps; `"proto":2` opts into self-describing
+  frames (the pipeline client always asks; the offline harnesses don't).
 - `{"type":"speech_start"}` / `{"type":"speech_end"}` / `{"type":"reset"}` — turn markers / barge-in.
 - binary **16 kHz mono PCM** chunks (the TTS audio).
 
 **Server → client:**
-- binary RGB frame buffers at a steady fps.
+- binary RGB frame buffers at a steady fps. **Under proto 2** (server acks `{"type":"proto","v":2}`,
+  P51) each is prefixed with a 16-byte header — `MTF2` | kind u8 | audio_pos u64: kind 0 = real
+  render / 1 = held re-send / 2 = idle-neutral; `audio_pos` = cumulative REAL 16k samples of the
+  turn covered once the frame shows. **This is what clocks the synced voice release** — the pairing
+  is the server's own account, so an fps mismatch can't shift it and held frames are declared, not
+  guessed. Clients that never ask get bare frames (byte-identical old wire).
 - `{"type":"video_start"}` / `{"type":"video_clock","frames":N}` / `{"type":"video_end"}` —
-  sync markers counting only *real* rendered frames; these clock the client's voice release.
+  turn-boundary markers (activation, tail drain, close fade). `video_clock` is diagnostic-only
+  since proto 2 (it used to clock the release).
 
 ### Inside the server
 - **Mouth-region lip-sync.** MuseTalk animates the mouth region of the `AVATAR_REF` portrait —
@@ -156,8 +164,9 @@ To understand either side you must read both (`musetalk_video.py` + `musetalk_se
   (`floor(len/sr*fps)`) yields exactly `SEG_FRAMES` per batch. The old `int(16000/fps)*SEG_FRAMES`
   sizing truncated at fps that don't divide 16000 (e.g. 12 → 7 frames/8-frame batch), losing ~12.5%
   of frames over a turn so the lips finished ~1–2s before the voice. See `docs/PROBLEMS-AND-FIXES.md`
-  P9. (A leftover-audio blip ~1–2s *after* the turn is a separate, **known + unfixed** issue — P10,
-  fix reverted by preference.)
+  P9. (The end-of-turn leftover-audio blip was the separate P10 — fixed by a ceil on the client's
+  audio-cap, and that whole cap is gone since proto 2: the voice pairs to each frame's `audio_pos`,
+  so the trailing sub-frame releases in step by construction.)
 - **OS env only.** The server reads `AVATAR_REF` / `MUSETALK_SIZE` / `MUSETALK_FPS` from the OS
   environment (no `python-dotenv` in its conda env); `scripts/run.ps1` propagates them from `.env`.
 
@@ -169,8 +178,9 @@ The HARD constraint: **MuseTalk and CosyVoice share ONE GPU.** MuseTalk renders 
 CosyVoice bursts the GPU while streaming a reply and slows the render unpredictably. Two modes
 (`MUSETALK_SYNC_MODE`):
 
-- **steady (DEFAULT) — VIDEO-MASTER:** the voice is buffered and released paced to the server's
-  `video_clock` markers (real rendered frames), so the voice waits when the render stalls and never
+- **steady (DEFAULT) — VIDEO-MASTER:** the voice is buffered and released paired to each real
+  frame's proto-2 `audio_pos` (the server's own account of the audio it rendered — P51; formerly
+  the `video_clock` markers + i/fps arithmetic), so the voice waits when the render stalls and never
   drifts ahead — a synced start. Per-frame pinning: each turn's frames are tagged
   `OutputImageRawFrame.sync_with_audio=True` and routed through the transport's **audio queue** so
   each frame displays at its audio position. **Load-bearing coupling (`main.py`):** this only works
