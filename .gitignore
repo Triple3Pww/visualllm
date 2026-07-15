@@ -12,6 +12,8 @@ checkpoints/
 *.png
 *.jpg
 *.jpeg
+# paper figures are versioned deliverables (repo-wide *.png above)
+!paper/figures/*.png
 
 # Local MuseTalk (cloned upstream + multi-GB weights + caches)
 local_services/musetalk_server/vendor/
