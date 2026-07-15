@@ -195,18 +195,6 @@ class MuseTalkEngine:
                         f"(bbox={self._split_bbox}).")
         self._build_idle_loop()
         self._ready = True
-        self._warmup()   # pay the first-inference cost NOW so the first real turn isn't cold
-        # VRAM trim: warmup ran dummy segments to pay one-time cuDNN/kernel/alloc costs;
-        # that leaves reserved-but-unused blocks in PyTorch's caching allocator. Return
-        # them to the driver so the idle footprint reflects the real working set (this is
-        # where the measured ~8.7GB vs the model's ~4-6GB gap mostly hides). Best-effort:
-        # an empty_cache failure must never block the server coming up.
-        try:
-            if self.torch.cuda.is_available():
-                self.torch.cuda.synchronize()
-                self.torch.cuda.empty_cache()
-        except Exception:  # noqa: BLE001 -- cache release is best-effort
-            logger.exception("empty_cache after warmup failed (non-fatal).")
         # Optional TensorRT render path. Engines are a prebuilt artifact (built offline,
         # ~7min); load them if present. ANY failure -> stay on the proven PyTorch path.
         if os.getenv("MUSETALK_TRT", "0").lower() in ("1", "true", "yes"):
@@ -221,6 +209,22 @@ class MuseTalkEngine:
             ).lower() in ("1", "true", "yes"):
                 self._free_torch_render_models()
         self._init_gpu_composite()
+        # Warmup runs LAST, after the render path is final (TRT/free-torch/GPU-composite),
+        # so it exercises exactly the path real turns will take. It used to run before TRT
+        # init: that warmed the torch UNet+VAE (about to be freed) and left the TRT engines'
+        # first execution + the GPU-composite first torch ops COLD for the first real turn.
+        self._warmup()   # pay the first-inference cost NOW so the first real turn isn't cold
+        # VRAM trim: warmup ran dummy segments to pay one-time cuDNN/kernel/alloc costs;
+        # that leaves reserved-but-unused blocks in PyTorch's caching allocator. Return
+        # them to the driver so the idle footprint reflects the real working set (this is
+        # where the measured ~8.7GB vs the model's ~4-6GB gap mostly hides). Best-effort:
+        # an empty_cache failure must never block the server coming up.
+        try:
+            if self.torch.cuda.is_available():
+                self.torch.cuda.synchronize()
+                self.torch.cuda.empty_cache()
+        except Exception:  # noqa: BLE001 -- cache release is best-effort
+            logger.exception("empty_cache after warmup failed (non-fatal).")
         logger.info(
             f"MuseTalk ready. {len(self.frame_cycle)} base frame(s) prepared; "
             f"{len(self._idle_loop)} idle frame(s)."

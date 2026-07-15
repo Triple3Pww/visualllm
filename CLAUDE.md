@@ -419,8 +419,11 @@ the avatar immediately. `TtfoMeter` (`pipeline/metrics.py`) measures the gap fro
 
 **The avatar is a separate GPU process.** `local_services/musetalk_video.py`
 (`MuseTalkVideoService`, the pipeline FrameProcessor) ↔ `local_services/musetalk_server/app.py`
-(FastAPI ws server, `musetalk` env). Mouth-region lip-sync, no warmup, female portrait via
-`AVATAR_REF`, port `:8002`. The wire contract:
+(FastAPI ws server, `musetalk` env). Mouth-region lip-sync, portrait via
+`AVATAR_REF`, port `:8002`. A load-time warmup renders 2 dummy segments through the FINAL
+render path — it runs AFTER TRT init + free-torch + GPU-composite (2026-07-15; it used to run
+before them, warming the torch UNet/VAE that `MUSETALK_FREE_TORCH` was about to free while
+leaving the TRT engines' first execution cold for the first real turn). The wire contract:
 
 - Client → server: a `config` json, `speech_start`/`speech_end`/`reset` json, and
   binary **16 kHz mono PCM** chunks (the TTS audio, resampled client-side).
