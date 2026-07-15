@@ -2162,11 +2162,23 @@ the literal audio bytes into the frame packet; we translated it to *metadata* be
 original 24 kHz TTS audio and the server only sees a 16 kHz lip-sync copy — bytes-in-packet would have downgraded
 the heard voice.
 
-**Compatibility:** opt-in negotiation (`"proto": 2` in the client config, `{"type":"proto","v":2}` ack; the
-client resets to proto 1 per reconnect so an older server downgrades cleanly). Clients that never ask — the
-offline harnesses `_capture.py` / `_drive_frames.py` / `_capture_synced.py` and the archive tests — get the
-bare-frame wire byte-identical. The P10 audio-cap stays for proto 1 only (a proto-2 `audio_pos` can never exceed
-audio the client already buffered: `_abuf.append` happens in the same `process_frame` call that queues the feed).
+**Compatibility:** opt-in negotiation (`"proto": 2` in the client config, `{"type":"proto","v":2}` ack).
+Clients that never ask — the offline harnesses `_capture.py` / `_drive_frames.py` / `_capture_synced.py` and
+the archive tests — get the bare-frame wire byte-identical (the SERVER keeps proto 1 forever for them).
+
+**Follow-up (same day): the pipeline CLIENT went proto-2-only.** The superseded guessing layer was deleted
+outright per the house "an untried fallback is not a safety net" rule: the P39 byte-compare, the `i/fps`
+pairing in `_emit_pair`, the P10 audio-cap in `_advance` (a proto-2 `audio_pos` can never exceed audio the
+client already buffered: `_abuf.append` happens in the same `process_frame` call that queues the feed — so the
+cap guards nothing), and the `video_clock` release-heartbeat (it existed to un-stick cap-parked frames; the
+marker is diagnostic-only now). A bare frame arriving inside a synced turn — i.e. an older server — now trips
+a LOUD `_unsynced` fallback (voice forwarded immediately, frames free-run) instead of silently mis-pairing.
+`git revert` restores the dual-path client if ever needed. Still load-bearing and deliberately UNTOUCHED:
+`_align_even`/`_odd_carry` (P3), `_srv_carry` (P40), ceil segment sizing (P9), lead-prime + burst feed,
+interrupt flush (P44), close crossfade (P12), the `sync_with_audio`/`video_out_is_live` transport coupling.
+Verified after the deletion: preflight + all four archive regressions PASS; measure ×3 — avatar rows the best
+of the day (lead-hold 0.56/0.65/1.76s, lips start +0.44s, end drift ±0.04s); two ~3.8s LLM rows in the middle
+were Groq congestion (cleared on the third run, 1.19s) — that hop is upstream of the avatar client.
 
 **Verified:** proto2 probe — 69 real frames, kinds {0,1,2}, final pos == fed samples EXACTLY (90970/90970);
 `_drive_frames` (proto 1) unchanged (162/163 = audio×fps −1); preflight + all four archive regressions PASS

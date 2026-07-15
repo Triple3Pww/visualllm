@@ -6,10 +6,15 @@ server over a websocket, receives lip-synced RGB frames back, and pushes both vi
 
 A/V sync is the hard part. The server renders with some
 latency, so we cannot just forward the audio immediately and let the video free-run (that is
-the desync). Instead the server emits markers -- `video_start` / `video_clock{frames:N}` /
-`video_end` -- and this client buffers the voice and releases each audio chunk paired with its
-matching rendered frame, tagging the frame `OutputImageRawFrame.sync_with_audio=True` so the
-transport (non-live) pins each frame to its audio position. Two strategies (MUSETALK_SYNC_MODE):
+the desync). Instead every server frame is SELF-DESCRIBING (proto 2, P51): a 16-byte header
+carries kind (real render / held re-send / idle) + audio_pos, the cumulative 16k samples the
+server actually consumed rendering it. This client buffers the voice and, per real frame,
+releases the audio due by that frame's audio_pos, tagging the frame
+`OutputImageRawFrame.sync_with_audio=True` so the transport (non-live) pins each frame to its
+audio position -- pairing is the server's own account, so an fps disagreement or a held frame
+can never shift the audio<->lip mapping. `video_start`/`video_end` markers still bound the
+turn (activation, tail drain, close fade); `video_clock` is diagnostic. A server that never
+acks proto 2 trips the loud unsynced fallback. Two strategies (MUSETALK_SYNC_MODE):
 
   steady    : release incrementally as `video_clock` advances. Because MuseTalk renders
               steadily at ~real-time (no diffusion warmup), the clock advances smoothly so the
@@ -24,7 +29,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import math
 import os
 import struct
 
@@ -372,14 +376,22 @@ class MuseTalkVideoService(FrameProcessor):
             # Post-interrupt: an old-turn frame still draining from the server (ws + out_q). Drop it
             # entirely -- do not count it, buffer it, or forward it as idle. Cleared on next TTSStarted.
             return
-        # HELD/dup detection (see the append guard below): the server re-sends the last frame
-        # byte-for-byte during a render underflow. A held frame is not new lip motion, so it must
-        # neither count as delivered video nor land in the synced buffer. proto 2 declares it
-        # (kind 1/2 = not a new real frame); the byte-compare is the proto-1 heuristic. (single
-        # writer = this loop, so reading _vbuf[-1] here without the lock is safe.)
+        # HELD/dup detection: the server re-sends the last frame during a render underflow (or
+        # the lead-prime). A held frame is not new lip motion, so it must neither count as
+        # delivered video nor land in the synced buffer. proto 2 DECLARES it (kind 1/2 = not a
+        # new real frame) -- the old byte-compare-with-_vbuf[-1] heuristic (P39) was retired with
+        # the index/fps pairing when proto 2 became required for synced mode (P51).
         is_dup = (self._sync and self._video_active and not self._unsynced
-                  and ((kind != 0) if kind is not None
-                       else (bool(self._vbuf) and img == self._vbuf[-1])))
+                  and kind is not None and kind != 0)
+        if (kind is None and self._sync and self._video_active and not self._unsynced):
+            # Bare frame inside a synced turn = the server never acked proto 2 (an older build).
+            # Synced pairing REQUIRES the per-frame audio_pos now, so fail LOUDLY into the same
+            # unsynced fallback _fallback_watch uses (voice forwarded immediately, frames
+            # free-run) instead of silently mis-pairing.
+            logger.warning("MuseTalk server sent a bare frame (no proto-2 header); synced "
+                           "pairing needs proto 2 -- forwarding this turn unsynced.")
+            self._unsynced = True
+            await self._drain_audio()
         if self._video_active and not is_dup:   # count only REAL frames + trace the offset
             now = asyncio.get_running_loop().time()
             if self._t_vid_first is None:
@@ -422,7 +434,7 @@ class MuseTalkVideoService(FrameProcessor):
                     self._held_dups += 1
                 else:
                     self._vbuf.append(img)
-                    self._vpos.append(pos if kind == 0 else 0)   # 0 = pair by index (proto 1)
+                    self._vpos.append(pos)   # kind-0 frames always carry a real pos (>0)
             if self._mode == "steady":
                 await self._advance()   # release paced to frames AS they arrive (continuous)
         else:
@@ -455,9 +467,11 @@ class MuseTalkVideoService(FrameProcessor):
             if self._dump_deliv:
                 self._deliv_active = True   # begin capturing the real speaking segment (A/V aligned)
         elif kind == "video_clock":
+            # Diagnostic only since proto 2 (P51): pairing rides on each frame's audio_pos, and
+            # release fires on frame receipt. Under proto 1 this marker ALSO re-ran _advance to
+            # un-stick frames the audio-cap had parked until more voice arrived -- both the cap
+            # and that heartbeat are gone (a proto-2 pos can never exceed audio already buffered).
             self._server_real = int(evt.get("frames", self._server_real))  # server's REAL frame count
-            if not self._unsynced and self._mode == "steady":
-                await self._advance()   # heartbeat (real pacing is on frame receipt)
         elif kind == "video_end":
             close_start = self._vbuf[-1] if self._vbuf else None   # last spoken frame (crossfade src)
             await self._advance()       # flush whatever is buffered (prerender: the whole reply)
@@ -478,38 +492,24 @@ class MuseTalkVideoService(FrameProcessor):
                 asyncio.create_task(self._play_close_fade(close_start, self._rest_frame))
 
     async def _advance(self):
-        """Release received frames, each paired (in order) with the audio due by its time and
-        tagged sync_with_audio so the transport pins it. Never release past the voice we have
-        buffered (the audio_cap below), so the video can't run ahead of the voice."""
+        """Release received frames, each paired (in order) with the audio due by its audio_pos
+        and tagged sync_with_audio so the transport pins it. No audio-cap is needed (the old
+        P10 ceil-cap guarded the index/fps pairing): a real frame's audio_pos can never exceed
+        voice the client already buffered -- _abuf.append happens in the same process_frame call
+        that queues the server feed, and the server renders only from audio it was fed -- so a
+        pos-paired release can't run ahead of the voice by construction (P51)."""
         async with self._lock:
-            # Never release video past the voice we actually have buffered: a frame at index
-            # i needs the audio up to i/fps, so cap at the buffered-audio position. This stops
-            # the video running AHEAD of the voice (e.g. if frames briefly outpace audio).
-            target = len(self._vbuf)
-            if not self._proto2:
-                # ceil (not floor): a turn's audio is rarely a whole number of frames
-                # (13.6s*12 = 163.2), so int()/floor stranded the final sub-frame of audio to the
-                # delayed video_end drain -> it played ~1s late as a blip (PROBLEMS-AND-FIXES P10).
-                # ceil makes the trailing frame reachable so the last sub-frame releases in step.
-                # proto 2 needs no cap: a real frame's audio_pos can never exceed audio the client
-                # already buffered (_abuf.append happens in the same process_frame call that
-                # queues the server feed), so pos-paired release can't outrun the voice.
-                audio_cap = math.ceil(self._audio_clock_s * self._fps) + 1
-                target = min(target, audio_cap)
-            while self._released_idx < target:
+            while self._released_idx < len(self._vbuf):
                 await self._emit_pair(self._released_idx)
                 self._released_idx += 1
             self._log_hold()
 
     async def _emit_pair(self, i: int):
-        """Audio due by frame i's time (in order), then frame i tagged sync_with_audio. Caller
-        holds the lock. Frame is skipped if not buffered yet (a caught-up cursor ran ahead).
-        proto 2: the frame's own audio_pos (what the server ACTUALLY consumed rendering it)
-        defines the audio due -- index/fps arithmetic is the proto-1 fallback, and also covers
-        a proto-2 frame that carried no pos (pos 0, e.g. a dequeued neutral tail)."""
-        ft = (self._vpos[i] / MUSETALK_SR
-              if i < len(self._vpos) and self._vpos[i] > 0
-              else i / self._fps)
+        """Audio due by frame i's audio_pos (in order), then frame i tagged sync_with_audio.
+        Caller holds the lock. The frame's own audio_pos -- what the server ACTUALLY consumed
+        rendering it -- defines the audio due; the old i/fps index arithmetic went with proto 1
+        (P51), so an fps disagreement can't shift the mapping."""
+        ft = self._vpos[i] / MUSETALK_SR
         while self._aidx < len(self._abuf) and self._abuf[self._aidx][0] <= ft:
             _e, af, ad = self._abuf[self._aidx]
             self._aidx += 1
@@ -763,7 +763,8 @@ class MuseTalkVideoService(FrameProcessor):
             else:
                 # READINESS-GATED (steady): hold the voice and release it locked to the real
                 # rendered frames -- the voice waits until the avatar is ready, then they play
-                # together. No drift, no end cut. (See _advance / video_clock handling.)
+                # together. No drift, no end cut. (See _advance / _emit_pair: each frame's
+                # audio_pos defines the audio released with it.)
                 # The mid-speech "screech" that steady used to hit is NOT a held-frame problem --
                 # it was pipecat discarding a partial (odd) audio buffer; fixed by _align_even (every
                 # downstream frame kept whole-sample) + the BOT_VAD_STOP_FALLBACK_SECS raise in
