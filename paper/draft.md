@@ -30,10 +30,11 @@ to run the entire loop — speech in, photoreal lip-synchronized speech-and-vide
 consumer GPU, with no per-minute API bill, no audio or video leaving the machine, and latency
 low enough for conversation?
 
-The latency question is the sharp one. A conversational turn tolerates roughly three seconds
-before it stops feeling like dialogue; a naive serial composition of even good local
-components (transcribe, then generate, then synthesize, then render) spends that budget
-several times over. And local operation on a single card creates a problem cloud
+The latency question is the sharp one. We adopt three seconds from end-of-utterance to the
+first synchronized audio-and-video as the design budget — beyond that, an exchange stops
+feeling like dialogue — and a naive serial composition of even good local components
+(transcribe, then generate, then synthesize, then render) spends that budget several times
+over. And local operation on a single card creates a problem cloud
 architectures never face: the speech synthesizer and the video renderer *contend for the same
 GPU*, so the renderer cannot promise a frame rate, and audio–visual synchronization becomes a
 first-class design problem rather than a transport detail.
@@ -174,9 +175,9 @@ serves one sentence per request, so a pool sized for ~7 maximum-length sequences
 memory) replaces the default multi-gigabyte reservation with ~0.16 GiB, without measurable
 speed cost. Second, once the renderer's TensorRT engines are loaded, the PyTorch copies of its
 UNet and VAE are freed (−1.8 GB): the TRT-vs-PyTorch fallback decision happens at load time,
-after which the originals are dead weight. The full stack holds ~7.8 GB, leaving half the card
-free (Table 4); load order matters (TTS server before renderer) and is enforced by the
-launcher.
+after which the originals are dead weight. The project's processes hold ~5.6 GB, leaving most
+of the card free (Table 4); load order matters (TTS server before renderer) and is enforced by
+the launcher.
 
 ## 3.5 Client
 
