@@ -1,0 +1,81 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="780" height="430" viewBox="0 0 780 430" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arr2" markerWidth="9" markerHeight="9" refX="7" refY="3.5" orient="auto">
+      <path d="M0,0 L7,3.5 L0,7 z" fill="#333"/>
+    </marker>
+  </defs>
+  <rect width="780" height="430" fill="white"/>
+
+  <text x="20" y="30" font-size="13" font-weight="bold" fill="#222">steady (video-master) release with per-frame audio-position coupling (proto 2)</text>
+
+  <!-- time axis -->
+  <line x1="120" y1="380" x2="740" y2="380" stroke="#999" stroke-width="1" marker-end="url(#arr2)"/>
+  <text x="745" y="384" font-size="11" fill="#666">t</text>
+
+  <!-- Lane labels -->
+  <text x="20" y="105" font-size="12" font-weight="bold" fill="#DD8452">TTS audio</text>
+  <text x="20" y="120" font-size="10.5" fill="#666">(buffered)</text>
+  <text x="20" y="205" font-size="12" font-weight="bold" fill="#55A868">frames from</text>
+  <text x="20" y="220" font-size="10.5" fill="#666">render server</text>
+  <text x="20" y="305" font-size="12" font-weight="bold" fill="#4C72B0">voice released</text>
+  <text x="20" y="320" font-size="10.5" fill="#666">to the browser</text>
+
+  <!-- Lane 1: TTS chunks arriving (fast, ahead of render) -->
+  <rect x="120" y="85" width="90" height="34" fill="#fdf3ee" stroke="#DD8452"/>
+  <rect x="212" y="85" width="90" height="34" fill="#fdf3ee" stroke="#DD8452"/>
+  <rect x="304" y="85" width="90" height="34" fill="#fdf3ee" stroke="#DD8452"/>
+  <text x="260" y="106" text-anchor="middle" font-size="10.5" fill="#333">audio chunks arrive faster than real time</text>
+  <text x="120" y="78" font-size="10" fill="#999">buffered, NOT forwarded on arrival</text>
+
+  <!-- Lane 2: frames with headers -->
+  <g font-size="9.5">
+    <rect x="120" y="185" width="52" height="40" fill="#eef7f0" stroke="#55A868"/>
+    <text x="146" y="201" text-anchor="middle" fill="#333">kind 0</text>
+    <text x="146" y="215" text-anchor="middle" fill="#333">pos 1333</text>
+    <rect x="180" y="185" width="52" height="40" fill="#eef7f0" stroke="#55A868"/>
+    <text x="206" y="201" text-anchor="middle" fill="#333">kind 0</text>
+    <text x="206" y="215" text-anchor="middle" fill="#333">pos 2666</text>
+    <rect x="240" y="185" width="52" height="40" fill="#f2f2f2" stroke="#999" stroke-dasharray="4,3"/>
+    <text x="266" y="201" text-anchor="middle" fill="#666">kind 1</text>
+    <text x="266" y="215" text-anchor="middle" fill="#666">(held)</text>
+    <rect x="300" y="185" width="52" height="40" fill="#eef7f0" stroke="#55A868"/>
+    <text x="326" y="201" text-anchor="middle" fill="#333">kind 0</text>
+    <text x="326" y="215" text-anchor="middle" fill="#333">pos 4000</text>
+    <!-- render stall gap -->
+    <rect x="360" y="185" width="110" height="40" fill="none" stroke="#C44E52" stroke-dasharray="5,4"/>
+    <text x="415" y="203" text-anchor="middle" fill="#C44E52">render stall</text>
+    <text x="415" y="217" text-anchor="middle" fill="#C44E52">(GPU contention)</text>
+    <rect x="478" y="185" width="52" height="40" fill="#eef7f0" stroke="#55A868"/>
+    <text x="504" y="201" text-anchor="middle" fill="#333">kind 0</text>
+    <text x="504" y="215" text-anchor="middle" fill="#333">pos 5333</text>
+    <rect x="538" y="185" width="52" height="40" fill="#eef7f0" stroke="#55A868"/>
+    <text x="564" y="201" text-anchor="middle" fill="#333">kind 0</text>
+    <text x="564" y="215" text-anchor="middle" fill="#333">pos 6666</text>
+  </g>
+  <text x="120" y="178" font-size="10" fill="#999">16-byte header per frame: MTF2 | kind (0 real / 1 held / 2 idle) | audio_pos (u64, cumulative 16 kHz samples rendered)</text>
+
+  <!-- Lane 3: voice released paced to real frames -->
+  <rect x="120" y="290" width="112" height="34" fill="#eef3fb" stroke="#4C72B0"/>
+  <text x="176" y="311" text-anchor="middle" font-size="10" fill="#333">released to pos 2666</text>
+  <rect x="300" y="290" width="52" height="34" fill="#eef3fb" stroke="#4C72B0"/>
+  <text x="326" y="311" text-anchor="middle" font-size="10" fill="#333">4000</text>
+  <!-- pause during stall -->
+  <text x="415" y="345" text-anchor="middle" font-size="10.5" font-style="italic" fill="#C44E52">voice pauses — never drifts ahead</text>
+  <rect x="478" y="290" width="112" height="34" fill="#eef3fb" stroke="#4C72B0"/>
+  <text x="534" y="311" text-anchor="middle" font-size="10" fill="#333">resumes to pos 6666</text>
+
+  <!-- vertical pairing guides -->
+  <line x1="232" y1="225" x2="232" y2="290" stroke="#4C72B0" stroke-width="1" stroke-dasharray="3,3" marker-end="url(#arr2)"/>
+  <line x1="352" y1="225" x2="352" y2="290" stroke="#4C72B0" stroke-width="1" stroke-dasharray="3,3" marker-end="url(#arr2)"/>
+  <line x1="590" y1="225" x2="590" y2="290" stroke="#4C72B0" stroke-width="1" stroke-dasharray="3,3" marker-end="url(#arr2)"/>
+  <text x="600" y="262" font-size="10" fill="#4C72B0">release voice up to the audio_pos</text>
+  <text x="600" y="276" font-size="10" fill="#4C72B0">of the last REAL frame shown</text>
+
+  <!-- held-frame note -->
+  <line x1="266" y1="185" x2="266" y2="150" stroke="#999" stroke-width="1" stroke-dasharray="3,3"/>
+  <text x="266" y="140" text-anchor="middle" font-size="10" fill="#666">held re-sends are declared (kind 1), not guessed —</text>
+  <text x="266" y="152" text-anchor="middle" font-size="10" fill="#666">they advance no audio</text>
+
+  <text x="20" y="406" font-size="10.5" fill="#888">The renderer's own account of covered audio (audio_pos) replaces frame-index arithmetic:</text>
+  <text x="20" y="420" font-size="10.5" fill="#888">an fps mismatch between server and client cannot shift the audio-to-lip mapping.</text>
+</svg>

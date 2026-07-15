@@ -1,0 +1,80 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="780" height="500" viewBox="0 0 780 500" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arr" markerWidth="9" markerHeight="9" refX="7" refY="3.5" orient="auto">
+      <path d="M0,0 L7,3.5 L0,7 z" fill="#333"/>
+    </marker>
+  </defs>
+  <rect width="780" height="500" fill="white"/>
+
+  <!-- Browser (both directions) -->
+  <rect x="20" y="150" width="115" height="120" rx="8" fill="#eef3fb" stroke="#4C72B0" stroke-width="1.5"/>
+  <text x="77" y="195" text-anchor="middle" font-size="13" font-weight="bold" fill="#222">Browser</text>
+  <text x="77" y="213" text-anchor="middle" font-size="11" fill="#444">WebRTC</text>
+  <text x="77" y="229" text-anchor="middle" font-size="11" fill="#444">mic in / A+V out</text>
+
+  <!-- Top row: VAD -> STT -> LLM -->
+  <rect x="185" y="60" width="110" height="72" rx="8" fill="#f7f7f7" stroke="#555" stroke-width="1.2"/>
+  <text x="240" y="88" text-anchor="middle" font-size="12" font-weight="bold" fill="#222">Silero VAD</text>
+  <text x="240" y="106" text-anchor="middle" font-size="11" fill="#444">local</text>
+
+  <rect x="340" y="60" width="140" height="72" rx="8" fill="#f7f7f7" stroke="#555" stroke-width="1.2"/>
+  <text x="410" y="83" text-anchor="middle" font-size="12" font-weight="bold" fill="#222">STT</text>
+  <text x="410" y="100" text-anchor="middle" font-size="11" fill="#444">Deepgram (cloud) /</text>
+  <text x="410" y="115" text-anchor="middle" font-size="11" fill="#444">sherpa-onnx (local CPU)</text>
+
+  <rect x="525" y="60" width="140" height="72" rx="8" fill="#f7f7f7" stroke="#555" stroke-width="1.2"/>
+  <text x="595" y="83" text-anchor="middle" font-size="12" font-weight="bold" fill="#222">LLM</text>
+  <text x="595" y="100" text-anchor="middle" font-size="11" fill="#444">OpenRouter (cloud) /</text>
+  <text x="595" y="115" text-anchor="middle" font-size="11" fill="#444">Ollama (local)</text>
+
+  <!-- Single-GPU dashed group: TTS + render server -->
+  <rect x="510" y="205" width="255" height="270" rx="10" fill="none" stroke="#C44E52" stroke-width="1.5" stroke-dasharray="7,5"/>
+  <text x="637" y="225" text-anchor="middle" font-size="11.5" font-weight="bold" fill="#C44E52">single 16 GB consumer GPU</text>
+
+  <rect x="530" y="240" width="215" height="82" rx="8" fill="#fdf3ee" stroke="#DD8452" stroke-width="1.5"/>
+  <text x="637" y="263" text-anchor="middle" font-size="12" font-weight="bold" fill="#222">CosyVoice TTS server</text>
+  <text x="637" y="281" text-anchor="middle" font-size="11" fill="#444">CosyVoice2-0.5B LM on vLLM</text>
+  <text x="637" y="297" text-anchor="middle" font-size="11" fill="#444">(WSL2, streaming, :8001)</text>
+
+  <rect x="530" y="370" width="215" height="82" rx="8" fill="#eef7f0" stroke="#55A868" stroke-width="1.5"/>
+  <text x="637" y="393" text-anchor="middle" font-size="12" font-weight="bold" fill="#222">MuseTalk render server</text>
+  <text x="637" y="411" text-anchor="middle" font-size="11" fill="#444">TensorRT UNet+VAE</text>
+  <text x="637" y="427" text-anchor="middle" font-size="11" fill="#444">(:8002)</text>
+
+  <!-- Avatar client (pipeline process) -->
+  <rect x="250" y="240" width="180" height="82" rx="8" fill="#f7f7f7" stroke="#555" stroke-width="1.2"/>
+  <text x="340" y="263" text-anchor="middle" font-size="12" font-weight="bold" fill="#222">Avatar client</text>
+  <text x="340" y="281" text-anchor="middle" font-size="11" fill="#444">A/V sync + pacing</text>
+  <text x="340" y="297" text-anchor="middle" font-size="11" fill="#444">(in-pipeline processor)</text>
+
+  <!-- Arrows: browser -> VAD -> STT -> LLM -->
+  <line x1="135" y1="180" x2="181" y2="110" stroke="#333" stroke-width="1.4" marker-end="url(#arr)"/>
+  <text x="140" y="132" font-size="10.5" fill="#666">mic audio</text>
+  <line x1="295" y1="96" x2="336" y2="96" stroke="#333" stroke-width="1.4" marker-end="url(#arr)"/>
+  <line x1="480" y1="96" x2="521" y2="96" stroke="#333" stroke-width="1.4" marker-end="url(#arr)"/>
+  <text x="500" y="88" text-anchor="middle" font-size="10.5" fill="#666">transcript</text>
+
+  <!-- LLM -> TTS (streaming note) -->
+  <line x1="620" y1="132" x2="637" y2="236" stroke="#333" stroke-width="1.4" marker-end="url(#arr)"/>
+  <text x="600" y="160" text-anchor="end" font-size="10.5" fill="#666">sentence stream: sentence 1 reaches</text>
+  <text x="600" y="174" text-anchor="end" font-size="10.5" fill="#666">TTS before the answer is complete</text>
+
+  <!-- TTS -> avatar client -->
+  <line x1="530" y1="281" x2="434" y2="281" stroke="#333" stroke-width="1.4" marker-end="url(#arr)"/>
+  <text x="482" y="273" text-anchor="middle" font-size="10.5" fill="#666">24 kHz audio</text>
+
+  <!-- avatar client <-> render server (ws) -->
+  <path d="M 400 322 L 400 400 L 526 400" fill="none" stroke="#333" stroke-width="1.4" marker-end="url(#arr)"/>
+  <text x="408" y="352" font-size="10.5" fill="#666">16 kHz PCM (ws)</text>
+  <path d="M 526 425 L 320 425 L 320 326" fill="none" stroke="#333" stroke-width="1.4" marker-end="url(#arr)"/>
+  <text x="330" y="443" font-size="10.5" fill="#666">frames + video_start/clock/end,</text>
+  <text x="330" y="457" font-size="10.5" fill="#666">proto-2 header: MTF2 | kind | audio_pos</text>
+
+  <!-- avatar client -> browser -->
+  <line x1="250" y1="270" x2="139" y2="240" stroke="#333" stroke-width="1.4" marker-end="url(#arr)"/>
+  <text x="150" y="278" font-size="10.5" fill="#666">synced A/V</text>
+  <text x="150" y="292" font-size="10.5" fill="#666">(WebRTC)</text>
+
+  <!-- footnote -->
+  <text x="20" y="486" font-size="10.5" fill="#888">Every stage is a thin single-provider factory selected by environment config; cloud stages have drop-in local alternatives.</text>
+</svg>
