@@ -202,13 +202,14 @@ everything. It's a C# shim (`scripts/Launcher.cs`) over `scripts/launch.ps1`; re
 # 1. CosyVoice TTS server — vLLM in WSL (TTFB ~1.1s). Then set COSYVOICE_URL to the WSL IP.
 wsl -d Ubuntu -e bash -c "bash /mnt/e/Claude/VisualLLm/tts/cosyvoice-server/run_vllm_server.sh"   # :8001
 #   vLLM shares the 16GB card with MuseTalk. gpu_memory_utilization (COSYVOICE_VLLM_GPU_UTIL,
-#   default 0.3, in the cosyvoice repo) must be high enough for vLLM's ~4GB footprint or it
-#   crashes "No available memory for the cache blocks" (0.2 was too low). Raise toward 0.35 if a
-#   heavy GPU app is closed; lower if MuseTalk OOMs. The log line "Available KV cache memory" must
-#   be positive.
-#   ORDER IS REQUIRED: start CosyVoice (this step) BEFORE MuseTalk. At util 0.3 vLLM needs the card
-#   mostly free; restarting it while MuseTalk already holds ~5GB crashes the same way. If you must
-#   recover, stop all three, start cosyvoice here on the near-empty card, THEN run.ps1. (P15.)
+#   default 0.07 since 2026-07-15, in run_vllm_server.sh -- NOT .env, the launcher forwards only
+#   COSYVOICE_MODEL) must clear vLLM's ~0.98GiB non-KV floor (weights 0.7 + CUDA graphs 0.15 +
+#   activations) or it crashes "No available memory for the cache blocks"; the wall is ~0.062 on
+#   16GB, and util is a FRACTION OF THE CARD (~0.14 on an 8GB card for the same absolute). The log
+#   line "Available KV cache memory" must be positive. Whole WSL server ~2.3GB at 0.07 (P50).
+#   ORDER IS REQUIRED: start CosyVoice (this step) BEFORE MuseTalk (P15). The low util makes vLLM
+#   far friendlier to a busy card, but keep the order. If you must recover, stop all three, start
+#   cosyvoice here first, THEN run.ps1.
 
 # 2 + 3. MuseTalk avatar server + pipeline (one script: starts both, propagates the MuseTalk knobs)
 .\scripts\run.ps1
@@ -284,7 +285,8 @@ in order of effectiveness:
 | `MUSETALK_FPS` / `MUSETALK_SIZE` | `20` / `512` | avatar output fps / frame px (shrinking SIZE does NOT cut MuseTalk compute). **Keep FPS a divisor of 16000** (8/10/16/20/25) so frame count = audio length; the `samples_for_frames` fix makes the current `12` correct too (P9) |
 | `MUSETALK_TRT` | `1` (default) | **TensorRT render path** (UNet+VAE engines in `musetalk_server/trt_cache/`): per-segment render ~389ms→~255ms, so the avatar holds ~12fps under CosyVoice's shared-GPU contention where the PyTorch path drifts seconds behind the voice on long turns (`docs/PROBLEMS-AND-FIXES.md` P16). Engines are ~1.75GB, gitignored, GPU/driver-specific — build with `local_services/musetalk_server/trt_build.py` (`python -m local_services.musetalk_server.trt_build`); any load failure falls back to PyTorch. `0` = PyTorch |
 | `MUSETALK_GPU_COMPOSITE` | `1` | **GPU per-frame composite**: runs the mask-blend + downscale on the GPU (torch) instead of CPU PIL/cv2 — composite ~73ms→~11ms per 8-frame seg → total render 246→182ms (−26%, ceiling ~33→44fps) (`docs/PROBLEMS-AND-FIXES.md` P17). **Only active with `MUSETALK_TRT=1`** (VAE output is already a GPU tensor); the PyTorch path keeps the CPU composite. Output pixel-identical (SSIM 1.0, ≤1 LSB). Benchmarked: at 12fps it does NOT change A/V drift (TRT already holds ≥12fps even under 100% contention) — the win is reserve headroom + a freed CPU. Falls back to CPU if a crop_box runs off-frame. Code default off (opt-in). `0` = CPU composite |
-| `COSYVOICE_VLLM_GPU_UTIL` | `0.3` | *(set in the **cosyvoice repo**, not this `.env`)* fraction of the 16GB card vLLM may use. 0.2 was too low (< its ~4GB footprint → KV cache crash); 0.3 fits alongside MuseTalk. Raise to ~0.35 with more free VRAM |
+| `COSYVOICE_VLLM_GPU_UTIL` | `0.07` | *(set in **`tts/cosyvoice-server/run_vllm_server.sh`**, not this `.env` — the launcher forwards only `COSYVOICE_MODEL`)* fraction of the card vLLM may use. Must clear the ~0.98GiB non-KV floor; wall ~0.062 on 16GB; ~0.14 on an 8GB card for the same absolute. 0.07 verified (24s zh paragraph, gen speed unchanged; WSL server ~2.3GB). If a vLLM/driver bump crashes "No available memory for the cache blocks", raise to 0.08+ (P50) |
+| `MUSETALK_FREE_TORCH` | `1` (default) | free the torch UNet+VAE once the TRT engines load — they were dead weight kept resident (−1.8GB; avatar server ~5.2→~3.3GB). Only fires when `MUSETALK_TRT=1` engines actually loaded (the load-failure fallback still works). `0` = keep them resident (pre-2026-07-15 behavior). Render verified: `_drive_frames` = audio×fps ±1 after the free (P50) |
 | `MUSETALK_LEAD_FRAMES` | `14` | video-start cushion — **load-bearing** (lower starves the queue → freeze) |
 | `MUSETALK_FEED_BURST_S` | `1.0` | burst the first 1s of a turn's audio un-paced → renderer not starved at turn start (lip-start lag ~1.9s→~0.8s; `docs/PROBLEMS-AND-FIXES.md` P2) |
 | `MUSETALK_END_TAIL_FRAMES` | `0` | static neutral frames after speech. **0** with the close crossfade below (so the last buffered frame stays the last SPOKEN frame); `>0` = the old clean snap. The server settles to neutral when idle regardless |
@@ -354,3 +356,4 @@ TTS/avatar servers are managed separately (the status dots tell you if the provi
 | **Remote mic dies** mid-call ("works sometimes") | WebRTC ICE candidate pollution | `WEBRTC_ICE_SUBNET=100.64.0.0/10` pins ICE to Tailscale |
 | Avatar **laggy on the GPU box itself** | onnxruntime fell back to CPU, or fps mismatch | Verify CUDA DLLs on path; keep one `MUSETALK_FPS` everywhere |
 | Judging sync **over RDP** looks wrong | RDP desyncs audio/video paths | Judge natively (remote browser) or via `_capture.py` offline |
+| "**No microphone found**" on connect (was "Could not connect: Requested device not found") | zero capture devices — classic case: an RDP session without audio-recording redirection | `/studio/` now connects anyway in **type-to-talk** mode (avatar + voice still play; chat box is the input). For a real mic over RDP: mstsc → Local Resources → Remote audio → Settings → "Record from this computer" |

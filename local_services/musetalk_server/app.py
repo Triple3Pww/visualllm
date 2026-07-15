@@ -216,6 +216,10 @@ class MuseTalkEngine:
             except Exception:  # noqa: BLE001 -- TRT is best-effort; fall back to torch
                 logger.exception("TRT init failed; using the PyTorch render path.")
                 self._trt = None
+            if self._trt is not None and os.getenv(
+                "MUSETALK_FREE_TORCH", "1"
+            ).lower() in ("1", "true", "yes"):
+                self._free_torch_render_models()
         self._init_gpu_composite()
         logger.info(
             f"MuseTalk ready. {len(self.frame_cycle)} base frame(s) prepared; "
@@ -238,6 +242,41 @@ class MuseTalkEngine:
             "unet": TRTModule(str(unet_e), self.device),
             "vae": TRTModule(str(vae_e), self.device),
         }
+
+    def _free_torch_render_models(self):
+        """VRAM trim (MUSETALK_FREE_TORCH=1, default): once the TRT engines are live, the
+        torch UNet + VAE are dead weight (~1.5GB fp16) -- every rendered frame goes through
+        self._trt, and the only fallback decision (engine load failure) has already NOT
+        happened by the time this runs. The VAE *encoder* finished its one-time job too
+        (_prepare_avatar precomputed the reference latents before TRT init). What stays:
+        the VAE wrapper object (its .scaling_factor float is read per segment), self.pe
+        and self.whisper (not TRT-duplicated), and self.weight_dtype (captured at load,
+        used where unet.model.dtype was). Set MUSETALK_FREE_TORCH=0 to keep the torch
+        copies resident (the pre-2026-07-15 behavior). Best-effort: a failure here must
+        never block the server."""
+        try:
+            import gc
+
+            before = self.torch.cuda.memory_allocated()
+            # Null the INNER modules, not just self.unet/self.vae: this runs inside
+            # load(), whose locals (`vae, unet` from load_all_model) still reference
+            # the same wrapper objects until load() returns -- dropping only the
+            # self.* ref frees NOTHING for the UNet (measured: 165 MiB = the VAE,
+            # which freed precisely because vae.vae is the inner attr). Setting the
+            # wrapper's attribute kills the module no matter who holds the wrapper.
+            self.unet.model = None
+            self.unet = None       # then the wrapper -- loud AttributeError if misused
+            self.vae.vae = None    # AutoencoderKL (encoder+decoder); wrapper stays
+            gc.collect()           # sweep any reference cycles in the module graph
+            self.torch.cuda.synchronize()
+            self.torch.cuda.empty_cache()
+            freed = (before - self.torch.cuda.memory_allocated()) / 1024**2
+            logger.info(
+                f"Freed torch UNet+VAE ({freed:.0f} MiB allocator-freed) -- "
+                f"TRT engines are the only render path now (MUSETALK_FREE_TORCH=0 reverts)."
+            )
+        except Exception:  # noqa: BLE001 -- freeing is an optimization, never fatal
+            logger.exception("freeing torch render models failed (non-fatal).")
 
     # --- avatar preparation (mmpose-free, cached) -------------------------
     def _avatar_key(self) -> str:
@@ -645,7 +684,9 @@ class MuseTalkEngine:
                 n = w_batch.shape[0]
                 idxs = [(self.idx + k) % L for k in range(n)]
                 latent_batch = torch.cat([self.latent_cycle[x] for x in idxs], dim=0).to(
-                    device=self.device, dtype=self.unet.model.dtype
+                    # weight_dtype, NOT unet.model.dtype: the torch UNet may have been
+                    # freed after the TRT engines loaded (_free_torch_render_models).
+                    device=self.device, dtype=self.weight_dtype
                 )
                 audio_feat = self.pe(w_batch)
                 if self._trt is not None:
@@ -656,7 +697,7 @@ class MuseTalkEngine:
                     sample = self._trt["unet"](
                         latent=latent_batch, timestep=self.timesteps, audio=audio_feat
                     )["sample"]
-                    dec_in = (1.0 / self.vae.scaling_factor) * sample.to(self.vae.vae.dtype)
+                    dec_in = (1.0 / self.vae.scaling_factor) * sample.to(self.weight_dtype)
                     img = self._trt["vae"](latent=dec_in)["image"]   # (n,3,256,256) raw decode
                     img = (img / 2 + 0.5).clamp(0, 1)   # (n,3,256,256) RGB[0,1] on GPU
                     if self._gpu_composite:

@@ -747,6 +747,10 @@
 
     let pc = null, micStream = null, connected = false, connecting = false, muted = false;
     let disconnectTimer = null;  // grace period before a 'disconnected' blip tears the call down
+    let noMic = false;           // no capture device (e.g. RDP without audio-in redirection):
+    //   connect anyway in type-to-talk mode -- avatar video + bot voice are inbound tracks and
+    //   the chat box speaks via /client/say, so a missing mic must not block the session.
+    function idleLabel() { return noMic ? 'Type to talk' : (muted ? 'Muted' : 'Listening'); }
 
     // Toggle the mic on/off by enabling/disabling the outgoing audio track (stays connected;
     // Disconnect is the separate button). A disabled track sends silence, so STT hears nothing.
@@ -756,7 +760,7 @@
       micBtn.classList.toggle('muted', on);
       micBtn.setAttribute('aria-label', on ? 'Unmute microphone' : 'Mute microphone');
       micBtn.title = on ? 'Unmute' : 'Mute';
-      if (connected && !speaking) setState('live', on ? 'Muted' : 'Listening');
+      if (connected && !speaking) setState('live', idleLabel());
     }
     let audioCtx = null, rafId = 0, speaking = false, pendingText = null;
     let transcriptSeq = 0, pollTimer = 0;
@@ -890,7 +894,7 @@
           const rms = Math.sqrt(sum / buf.length);
           if (rms > 0.02) { hi++; lo = 0; } else { lo++; hi = 0; }
           if (!speaking && hi > 2) { speaking = true; setState('speaking','Speaking'); }
-          else if (speaking && lo > 12) { speaking = false; if (connected) setState('live', muted ? 'Muted' : 'Listening'); }
+          else if (speaking && lo > 12) { speaking = false; if (connected) setState('live', idleLabel()); }
           rafId = requestAnimationFrame(tick);
         };
         rafId = requestAnimationFrame(tick);
@@ -948,9 +952,9 @@
             if (disconnectTimer) { clearTimeout(disconnectTimer); disconnectTimer = null; }
             connected = true; connecting = false;
             micBtn.classList.remove('connecting'); micBtn.classList.add('active');
-            setState('live', 'Listening');
+            setState('live', idleLabel());
             setOverlay('live');
-            addSystem('Connected — speak or type to Leo');
+            addSystem(noMic ? 'Connected — type to Leo (no microphone)' : 'Connected — speak or type to Leo');
             startPolling();
             if (pendingText) { const t = pendingText; pendingText = null; postSay(t); }
           } else if (s === 'disconnected') {
@@ -969,8 +973,18 @@
           }
         };
 
-        micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        micStream.getTracks().forEach(t => pc.addTrack(t, micStream));
+        noMic = false;
+        try {
+          micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        } catch (err) {
+          // NotFoundError = no capture device at all (classic case: an RDP session without
+          // audio-recording redirection). Permission-denied lands here too. Either way the
+          // session is still fully usable read-side, so warn and continue without a mic.
+          micStream = null; noMic = true;
+          addSystem('No microphone found — connecting anyway; use the chat box to talk (voice input off)');
+        }
+        if (micStream) micStream.getTracks().forEach(t => pc.addTrack(t, micStream));
+        else pc.addTransceiver('audio', { direction: 'recvonly' });  // still RECEIVE the bot's voice
         pc.addTransceiver('video', { direction: 'recvonly' });
 
         await pc.setLocalDescription(await pc.createOffer());
@@ -1029,7 +1043,10 @@
     // Mic button: connect when offline; once connected, toggle mute (Disconnect is its own button).
     micBtn.addEventListener('click', () => {
       if (connecting) return;
-      if (connected) setMuted(!muted);
+      if (connected) {
+        if (noMic) { addSystem('No microphone available — type in the chat box instead'); return; }
+        setMuted(!muted);
+      }
       else connect();
     });
     connectBtn.addEventListener('click', connect);

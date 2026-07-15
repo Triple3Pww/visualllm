@@ -153,9 +153,12 @@ Why each piece (each was a real blocker — all baked into `run_vllm_server.sh`)
 - `COSYVOICE_VLLM=1` — engine switch to the vLLM LLM (in `tts_engine.py`).
 - `VLLM_ENABLE_V1_MULTIPROCESSING=0` — run in-process (spawn re-imports `__main__`, crashes).
 - `VLLM_USE_FLASHINFER_SAMPLER=0` — flashinfer's sampler JITs with nvcc (absent) → use torch.
-- `COSYVOICE_VLLM_EAGER=1` (default) — skip torch.compile/CUDA-graph capture.
-- `COSYVOICE_VLLM_GPU_UTIL=0.3` (default) — vLLM's slice of the **whole** 16 GB card; must
-  exceed vLLM's ~4 GB footprint or load crashes "No available memory for the cache blocks".
+- `COSYVOICE_VLLM_EAGER=0` (default since 2026-07-14) — CUDA graphs ON, every language (the
+  TTS-first-chunk win; `=1` skips capture, debug only).
+- `COSYVOICE_VLLM_GPU_UTIL=0.07` (default since 2026-07-15) — vLLM's slice of the **whole**
+  card; must clear vLLM's ~0.98 GiB non-KV floor (weights + graphs + activations) or load
+  crashes "No available memory for the cache blocks". Wall ~0.062 on 16 GB; use ~0.14 on an
+  8 GB card (it's a fraction of the card). See P50.
 
 **Launch it:**
 ```bash

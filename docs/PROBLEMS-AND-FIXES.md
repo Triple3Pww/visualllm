@@ -2099,3 +2099,47 @@ red); and 4 phantom `.env` keys (`AVATAR`, `DITTO_SIZE`, `OPENROUTER_REASONING_E
 Both live bugs here were invisible precisely because `.env` confidently described behaviour that no code
 implemented. When auditing, grep for a *reader* before believing a knob exists. And **docs lie**: CLAUDE.md
 claimed `COSYVOICE_MODEL=v3` was "the current baseline" while `.env` has always run `v2`.
+
+## P50 — VRAM squeeze: vLLM KV pool 20x oversized + the torch UNet/VAE kept resident after TRT load ✅ SHIPPED (2026-07-15, 24th session)
+
+**Goal:** the user wants the stack to fit an **8GB card with ~1GB overhead** (≤7GB). Trigger question was
+"can PolarQuant help?" — **no**: PolarQuant quantizes KV-cache *contents*, and our KV cache was **99.7% empty**
+(vLLM log: 139k-token pool, 0.2–0.3% used on real turns; CosyVoice generates one short sentence per request).
+Pool *sizing*, not content compression, was the win. Measured result: **whole card 11,448 → 7,842 MiB with the
+full stack live** (project share ≈ 6.9GB — target hit on the 16GB card).
+
+**Fix 1 — `COSYVOICE_VLLM_GPU_UTIL` default 0.16 → 0.07 (`run_vllm_server.sh`; −1.5GB, WSL server 3.8→2.3GB).**
+Re-measured vLLM's non-KV floor: **~0.98GiB** (weights 0.7 + CUDA graphs 0.15 + activations). With
+`COSYVOICE_VLLM_MAX_LEN=2048` the KV need is tiny, so util is essentially floor + cushion: 0.07 leaves a
+0.16GiB pool (13.9k tokens = ~6.7 max-len seqs, ~35x a real turn's ~400). Verified: 24s zh paragraph via
+`/tts` + `/tts/stream`, output length + gen speed (5.7s) identical to 0.16. **The wall is ~0.062 on 16GB**;
+if a future vLLM/driver bump fails "No available memory for the cache blocks", raise to 0.08+. Util is a
+**fraction of the card** — ~0.14 on an 8GB card for the same absolute. NOTE the knob lives in the script,
+NOT `.env` (the launcher forwards only `COSYVOICE_MODEL`).
+
+**Fix 2 — `MUSETALK_FREE_TORCH=1` (default): drop the torch UNet+VAE once the TRT engines load
+(`app.py::_free_torch_render_models`; −1.8GB, avatar server ~5.2→~3.3GB).** With `MUSETALK_TRT=1` every frame
+renders through the engines; the torch copies existed only for the load-time fallback, which by then has
+already NOT happened. The VAE *encoder*'s one-time job (reference latents) also precedes TRT init. Kept:
+the VAE wrapper (`.scaling_factor` is read per segment), `self.pe`, whisper, and `self.weight_dtype`
+(replacing the two hot-path `unet.model.dtype` / `vae.vae.dtype` reads). `trt_build.py` is safe — it forces
+`MUSETALK_TRT=0` for its export capture. `0` reverts to resident.
+
+**The bug that ate two attempts (the reason this P exists): freeing `self.unet` freed NOTHING.** First run
+reclaimed exactly **165 MiB — the VAE alone**. Wrong theory #1: module-graph reference cycles → added
+`gc.collect()` → still 165. An isolated probe (same load sequence, module scope) freed the full 1.6GB fine —
+so the retention was in the *server*: `_free_torch_render_models()` runs **inside `load()`, whose local
+variables (`vae, unet` from `load_all_model`) still alias the wrappers until `load()` returns**. `self.unet =
+None` dropped one of two refs; the VAE freed only because `vae.vae` is an **inner attribute** of the shared
+wrapper object. **Fix: null the INNER module (`self.unet.model = None`) so it dies regardless of who holds
+the wrapper.** After: **1,803 MiB freed** in the live server log.
+
+**Verified (render intact):** `python -m scripts._drive_frames output/reply_concise.wav 12` on the restarted
+stack → **162 real frames for 13.56s audio** (audio×fps −1, within the documented ±1), effective render
+11.8fps, no torch-path crash — the TRT path is fully self-sufficient. Full-stack restart in the P15 order.
+
+**Lesson:** `torch.cuda.memory_allocated()` before/after is the honest scorecard for a "free" — log it. A
+free that reports 165 MiB when you expected 1,800 is not "partially working", it is telling you exactly which
+object died (the one whose inner attr you nulled) and which didn't (the one you only unbound a name from).
+And when a del "doesn't work", check who else holds a reference **including the enclosing frame's locals** —
+an isolated repro that frees fine proves it's a liveness problem, not an allocator problem.

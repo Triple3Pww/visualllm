@@ -75,16 +75,20 @@ measurable delta is not automatically a perceived one; the live eye is the arbit
 The independent Lever-4 poll-tighten (`model.py` 0.1→0.02) stays.
 
 **Shared-GPU VRAM (why "won't talk" can mean CosyVoice crashed):** vLLM and MuseTalk share the one
-16GB card. vLLM's `gpu_memory_utilization` (env `COSYVOICE_VLLM_GPU_UTIL`, **default `0.3`**, set in
-the cosyvoice repo) must exceed vLLM's own ~4GB footprint or load crashes with "No available memory
-for the cache blocks" (the old hardcoded `0.2` = 3.26GB was too low). If the avatar shows but the bot
-is silent, first check `:8001` is actually up — the pipeline log shows "Cannot connect to host …:8001".
-Free VRAM (close a heavy GPU app) or nudge the util fraction; the "Available KV cache memory" log line
-must be positive. **LOAD ORDER MATTERS: start CosyVoice (vLLM) BEFORE MuseTalk.** At `gpu_util 0.3` vLLM
-needs the card mostly free; if you restart cosyvoice *while MuseTalk already holds ~5GB*, vLLM crashes
-"No available memory for the cache blocks" (and raising util then trips "Free memory … less than desired").
-Clean recovery = stop all three → start cosyvoice on the near-empty card (`run_vllm_server.sh`) → then
-`scripts/run.ps1` (MuseTalk + pipeline). The launcher already does this order. (`docs/PROBLEMS-AND-FIXES.md` P15.)
+16GB card. vLLM's `gpu_memory_utilization` (env `COSYVOICE_VLLM_GPU_UTIL`, **default `0.07` since
+2026-07-15**, set in `run_vllm_server.sh` — NOT `.env`; the launcher forwards only `COSYVOICE_MODEL`)
+must clear vLLM's non-KV floor (~0.98GiB: weights 0.7 + CUDA graphs 0.15 + activations) plus a KV
+cushion, or load crashes with "No available memory for the cache blocks". With `COSYVOICE_VLLM_MAX_LEN`
+capped at 2048 the KV need is tiny, so 0.07 (KV 0.16GiB = ~6.7 max-len seqs, ~35x a real turn) is
+verified clean (24s zh paragraph, /tts + /tts/stream, gen speed unchanged; whole WSL server
+3.8GB→2.3GB; the wall is ~0.062 on 16GB — if a vLLM/driver bump fails to load, raise to 0.08+).
+The old "~4GB footprint / 0.3 default" text described the UNCAPPED max_len era. If the avatar shows but
+the bot is silent, first check `:8001` is actually up — the pipeline log shows "Cannot connect to host
+…:8001". The "Available KV cache memory" log line must be positive.
+**LOAD ORDER STILL MATTERS: start CosyVoice (vLLM) BEFORE MuseTalk** (the low util makes vLLM far
+friendlier to a busy card, but keep the order). Clean recovery = stop all three → start cosyvoice
+(`run_vllm_server.sh`) → then `scripts/run.ps1` (MuseTalk + pipeline). The launcher already does this
+order. (`docs/PROBLEMS-AND-FIXES.md` P15.)
 
 **Chinese first-chunk is slower than English, and each language has its own TTFO lever (updated
 2026-07-04 — the 2026-07-03 hop_zh=5 verdict is REVERSED, see P22).** CosyVoice's first-chunk TTFB
@@ -236,7 +240,13 @@ un-stretched into the bbox rect client-side). `docs/superpowers/specs/2026-07-11
 per-segment render ~389ms→~255ms so the avatar keeps ~12fps under CosyVoice's shared-GPU
 contention — where the PyTorch path drifts seconds behind the voice on long turns. Engines live in
 `musetalk_server/trt_cache/` (~1.75GB, gitignored, GPU/driver-specific — rebuild with `trt_build.py`);
-any load failure silently falls back to PyTorch. `0` = PyTorch. `docs/PROBLEMS-AND-FIXES.md` P16),
+any load failure silently falls back to PyTorch. `0` = PyTorch. `docs/PROBLEMS-AND-FIXES.md` P16.
+**`MUSETALK_FREE_TORCH` (1 = default, 2026-07-15 VRAM trim):** once the engines load, the torch
+UNet+VAE are dropped (−1.8GB; avatar server ~5.2→~3.3GB) — the fallback decision already happened at
+load time, so they were pure dead weight. `0` keeps them resident. Verified: `_drive_frames` renders
+audio×fps ±1 after the free. Gotcha that cost the first attempt: `_free_torch_render_models` runs
+inside `load()`, whose LOCALS still alias the wrappers — null the INNER attrs (`unet.model`,
+`vae.vae`), not just `self.unet`, or nothing frees),
 `MUSETALK_GPU_COMPOSITE` (**1** — runs the per-frame mask-blend + downscale on the GPU (torch) instead
 of CPU PIL/cv2: composite ~73ms→~11ms per 8-frame seg → total render 246→182ms (−26%, ceiling ~33→44fps).
 **Only active with `MUSETALK_TRT=1`** (the VAE output is already a GPU tensor there; the PyTorch path
@@ -518,6 +528,14 @@ the values equal — this closed the silent-failure mode, it did not make a mism
   path leaves it False → gating on it dropped every user bubble). The mic button **mutes** (toggles the audio track,
   not disconnect) once connected. **Single-connection:** a new `/api/offer` disconnects the previous session
   (`_active_connection`) so two clients never fight the single-client avatar server.
+  **No-mic fallback (2026-07-15):** if `getUserMedia` fails (classic case: an **RDP session without
+  audio-recording redirection** — the box then has only a "Remote Audio" playback endpoint, so Chrome throws
+  `NotFoundError: Requested device not found`), the client no longer refuses to connect. It warns "No microphone
+  found — connecting anyway", sends `audio` as **recvonly** (the bot's voice + avatar video are inbound tracks,
+  so nothing else changes), shows **"Type to talk"** instead of "Listening", and the chat box (`/client/say`)
+  remains the input. Verified against the live pipeline with the mic-less `_webrtc_probe` (both tracks arrive,
+  greeting audio plays). To get a real mic over RDP: mstsc → Local Resources → Remote audio → Settings →
+  "Record from this computer".
   **Two rules the transcript path has now paid for in blood — do not undo either:**
   - **Dedupe frames on `frame.id`, NEVER `id(frame)`** (`docs/PROBLEMS-AND-FIXES.md` **P45**). The observer must dedupe
     (one frame OBJECT is pushed by several processors, so it is seen more than once), but `id(frame)` is the MEMORY

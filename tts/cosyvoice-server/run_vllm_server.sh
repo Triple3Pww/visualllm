@@ -56,15 +56,19 @@ export COSYVOICE_VLLM_EAGER=${COSYVOICE_VLLM_EAGER:-0}
 # zh steady-hold 1.9-2.2s -> ~0.8s). hop>0 remains only a knob for experiments.
 # (Per-language plumbing kept: tts_engine.py::_apply_first_hop, per request, zh-only by is_cjk.)
 export COSYVOICE_FIRST_HOP_ZH=${COSYVOICE_FIRST_HOP_ZH:-0}
-# VRAM trim (2026-06-30, measured): cap max sequence length + the card fraction vLLM may use.
-# CosyVoice generates ONE short sentence of speech tokens per request, so the default KV
-# reservation (max_model_len 32768) is wildly oversized. Capping max-len to 2048 lets the
-# util fraction drop far below the old ~0.25 "floor": at 0.16 -> vLLM ~3.7GB with 74x KV
-# headroom; at 0.12 -> ~3.4GB / 47x (verified: en + a 27s zh paragraph synth clean, no
-# truncation). 0.16 is the robust default; set COSYVOICE_VLLM_GPU_UTIL=0.12 to squeeze the
-# whole stack under 8GB. Lower util also reserves less of the shared card -> friendlier to
-# the MuseTalk load-order (less "No available memory for the cache blocks"). Override either.
+# VRAM trim (re-measured 2026-07-15; original pass 2026-06-30): cap max sequence length + the
+# card fraction vLLM may use. CosyVoice generates ONE short sentence of speech tokens per
+# request, so the default KV reservation (max_model_len 32768) is wildly oversized; max-len
+# 2048 makes the KV need tiny. vLLM's non-KV floor on this card is ~0.98GiB (weights 0.7 +
+# CUDA graphs 0.15 + activations), so util is essentially floor + KV cushion:
+#   0.16 -> KV 1.59GiB (139k tok, ~65x oversized); 0.08 -> KV 0.32GiB; 0.07 -> KV 0.16GiB
+#   (13.9k tok = ~6.7 max-len seqs, still ~35x a real turn's ~400 tok).
+# 0.07 is the default (verified: 24s zh paragraph via /tts + /tts/stream, output byte-identical
+# to 0.16, same gen speed; whole WSL server 3.8GB -> 2.3GB). The wall is ~0.062 on 16GB --
+# util*card must clear the ~0.98GiB floor. If a future vLLM/driver bump fails to load with
+# "No available memory for the cache blocks", raise to 0.08+. NOTE util is a FRACTION OF THE
+# CARD: on an 8GB card use ~0.14 for the same absolute budget. Override either var to tune.
 export COSYVOICE_VLLM_MAX_LEN=${COSYVOICE_VLLM_MAX_LEN:-2048}
-export COSYVOICE_VLLM_GPU_UTIL=${COSYVOICE_VLLM_GPU_UTIL:-0.16}
+export COSYVOICE_VLLM_GPU_UTIL=${COSYVOICE_VLLM_GPU_UTIL:-0.07}
 cd /mnt/e/Claude/VisualLLm/tts/cosyvoice-server
 exec $ENV/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8001

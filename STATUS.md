@@ -1,5 +1,30 @@
 # VisualLLm — Project Status & Next Steps
 
+_Last updated: 2026-07-15 (**24th session — VRAM squeezed to fit an 8GB card: whole stack 11.4GB → 7.8GB live
+(project share ≈ 6.9GB, the user's ≤7GB target HIT). Two levers, both shipped + live-verified; P50. Branch
+`chore/cleanup-and-tts-merge`, uncommitted.**
+
+**(0) The trigger was "can PolarQuant help?" — ruled out with our own logs:** PolarQuant quantizes KV-cache
+*contents*, and vLLM's log showed our 139k-token KV pool at **0.2–0.3% usage** on real turns (CosyVoice = one
+short sentence per request). Pool *sizing*, not content compression, was the win.
+**(1) `COSYVOICE_VLLM_GPU_UTIL` default 0.16 → 0.07** (`run_vllm_server.sh` — the knob does NOT live in `.env`;
+the launcher forwards only `COSYVOICE_MODEL`). Re-measured floor: ~0.98GiB non-KV (weights 0.7 + graphs 0.15 +
+activations); 0.07 leaves a 0.16GiB KV pool = ~35× a real turn. **WSL TTS server 3.8GB → 2.3GB.** Verified: 24s
+zh paragraph via `/tts` + `/tts/stream`, output + gen speed identical to 0.16. Wall ≈ 0.062 on 16GB; **on an 8GB
+card use ~0.14** (fraction-of-card). CUDA graphs untouched (load-bearing TTFB).
+**(2) `MUSETALK_FREE_TORCH=1` (new, default): the torch UNet+VAE are freed once the TRT engines load** — they
+were pure dead weight (the fallback decision already happened at load). **−1,803 MiB; avatar server ~5.2GB →
+~3.3GB.** Two failed attempts first: `self.unet = None` freed only 165 MiB (the VAE) because the free runs
+inside `load()` whose **locals still alias the wrappers** — fix = null the INNER module (`unet.model = None`).
+Render verified after restart: `_drive_frames` → 162 real frames / 13.56s audio (audio×fps −1, in tolerance),
+11.8fps effective. `trt_build.py` rebuilds unaffected (it forces `MUSETALK_TRT=0`).
+**(3) Docs updated to match:** CLAUDE.md (stale "util 0.3 / ~4GB footprint" text), WORKFLOW.md §1 + the knob
+table (+ the new `MUSETALK_FREE_TORCH` row), P50 in `docs/PROBLEMS-AND-FIXES.md`. **In reserve if ever needed:**
+`MUSETALK_BATCH=4` (~−1GB peak — but under TRT it needs a max-batch-4 engine rebuild to realize the saving, and
+render is at 11.8fps vs the 12fps budget, so it must be re-measured). **Recommended before merge: one live-eye
+spoken turn** (the render harness is clean, but the house rule stands — the probe passes what the eye rejects).)_
+<!-- prior handoff -->
+
 _Last updated: 2026-07-15 (**23rd session continued — committed the audit fixes, a robustness batch, removed
 `/nimbus`, and re-measured the session-degradation bug. Branch `chore/cleanup-and-tts-merge`, still NOT
 merged/pushed.**
@@ -25,7 +50,12 @@ turn before their `lips start` line could log) also stayed flat (**+0.61s -> +0.
 documented +1.47s). **Read: degradation NOT reproduced in this run, MODERATE confidence** (only 2 of 5 turns
 have `lips start` data; a first-run attempt at 15s gaps was too short and produced overlapping/interrupted turns,
 discarded as low-confidence). Recommend a live-eye check for a fully confident verdict — the probe passes what
-the eye rejects (P19).)_
+the eye rejects (P19).
+**(4) `/studio/` no-mic fallback (2026-07-15)** — connecting from an RDP session (no audio-capture redirection →
+zero capture devices) made `getUserMedia` throw `NotFoundError` and the client refused to connect at all
+("Could not connect: Requested device not found"). Now it warns "No microphone found — connecting anyway",
+connects with `audio` recvonly, labels the state "Type to talk", and the chat box remains the input path.
+Verified live with the mic-less `_webrtc_probe` (avatar video + greeting audio both arrive).)_
 <!-- prior handoff -->
 
 _Last updated: 2026-07-14 (**23rd session — LINE-BY-LINE DEAD-CODE AUDIT + the TTS server merged INTO this repo.
