@@ -210,7 +210,42 @@ is a human watching the live avatar.
 
 # 7. Discussion and Lessons Learned
 
-<!-- Task 12 -->
+Three lessons from this system's measurement history generalize beyond it.
+
+**Instrumented metrics and human perception diverge — in both directions.** Our automated
+probe repeatedly passed configurations a human viewer rejected: a lead cushion of 8 frames
+measured a clean, faster start on every probe metric, yet every value below 14 produced
+visible delay or freezes live, and was abandoned. The converse also happened: a measured
+difference in the synthesized Chinese waveform under CUDA-graph decoding led us to *predict* a
+lip-sync degradation the viewer never saw, and the "fix" (disabling graphs) cost real latency
+until the prediction was re-tested live and reversed. The rule we now operate by: a measurable
+delta is neither necessary nor sufficient for a perceptual defect; instruments gate
+regressions, but a human watching the live system is the arbiter in both directions.
+
+**A verification's reference must not share the suspect input.** A long-lived lip-sync bug —
+one corrupted byte offsetting every subsequent 16-bit audio sample sent to the renderer —
+survived three debugging sessions because our checks compared the live render against an
+offline render *fed the same corrupted stream*, or against audio captured downstream of the
+repair point. Such tests are deterministic-consistency checks that cannot fail, mistaken for
+end-to-end validation. Any audit of a processing chain must source its reference upstream of
+every suspect component.
+
+**Restore invariants at the producer, not the consumers.** That same byte-alignment invariant
+(PCM frames must contain whole samples) was first patched at two consumer sites; both patches
+were correct and the bug still recurred elsewhere. The durable fix was four lines at the single
+point where network chunks become frames — carrying the dangling byte across reads — after
+which every consumer patch was deleted. In a streaming pipeline, an invariant enforced where
+data is created is one fix; enforced where data is used, it is one fix per consumer, forever.
+
+**Limitations.** The renderer serves a single client; multi-viewer operation would need a
+frame fan-out layer. MuseTalk generates the animated mouth region at 256×256 regardless of
+output resolution — a model bound, not a transport one. Perceptual quality judgments in this
+paper (sync acceptance, naturalness) come from a single expert viewer, not a formal MOS panel;
+a small user study is the natural next step. Thai is supported through a separate TTS engine
+(CosyVoice does not speak Thai) with known end-of-utterance truncation issues. Finally, on
+long multi-turn sessions we have observed the turn-start latency degrade by ~1 s and not
+recover; the cause is under investigation, which is why the evaluation protocol uses fresh
+sessions.
 
 # 8. Conclusion
 
