@@ -26,6 +26,7 @@ import asyncio
 import json
 import math
 import os
+import struct
 
 import numpy as np
 import websockets
@@ -45,6 +46,14 @@ from pipecat.frames.frames import (
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
 MUSETALK_SR = 16000  # Whisper (server-side) expects 16 kHz mono
+
+# proto-2 frame header (mirrors musetalk_server/app.py): magic 4s | kind u8 | 3 pad |
+# audio_pos u64 LE. kind 0 = real render, 1 = held re-send, 2 = idle/neutral. audio_pos =
+# cumulative 16k samples of the turn's audio covered once the frame shows -- the server's
+# own account of what it rendered, which replaces both the i/fps pairing arithmetic and
+# the byte-identical held-frame heuristic (P39) when the server speaks proto 2.
+FRAME_HDR = struct.Struct("<4sB3xQ")
+FRAME_MAGIC = b"MTF2"
 
 
 def _to_16k_mono_pcm(audio: bytes, in_rate: int, channels: int) -> bytes:
@@ -121,6 +130,8 @@ class MuseTalkVideoService(FrameProcessor):
         self._aidx = 0                # audio release cursor into _abuf
         self._audio_clock_s = 0.0     # seconds of audio buffered this turn
         self._vbuf: list[bytes] = []  # rendered frames this turn (index == real frame #)
+        self._vpos: list[int] = []    # proto-2: per-frame audio_pos (16k samples; 0 = unknown)
+        self._proto2 = False          # server acked {"type":"proto","v":2} on this ws
         self._released_idx = 0        # video release cursor into _vbuf
         self._video_active = False    # between video_start and video_end
         self._unsynced = False        # fallback engaged this turn
@@ -254,7 +265,11 @@ class MuseTalkVideoService(FrameProcessor):
         self._ws = await websockets.connect(
             self._ws_url, max_size=None, ping_interval=None, close_timeout=1
         )
-        await self._ws.send(json.dumps({"type": "config", "fps": self._fps}))
+        # Request proto 2 (self-describing frames). _proto2 flips on the server's ack
+        # marker only, and resets here so a reconnect to an OLDER server downgrades
+        # cleanly to the bare-frame wire + the index/fps pairing.
+        self._proto2 = False
+        await self._ws.send(json.dumps({"type": "config", "fps": self._fps, "proto": 2}))
 
     async def _feed_loop(self):
         """Send queued items to the server, pacing AUDIO to real-time so the renderer never
@@ -346,16 +361,25 @@ class MuseTalkVideoService(FrameProcessor):
 
     async def _on_frame(self, img: bytes):
         """A rendered RGB frame from the server."""
+        # proto 2: every binary message is header + pixels. kind/pos make the frame
+        # self-describing; kind stays None on the bare (proto-1) wire so the byte-compare
+        # heuristics below keep covering old servers.
+        kind, pos = None, 0
+        if self._proto2 and len(img) >= FRAME_HDR.size and img[:4] == FRAME_MAGIC:
+            _m, kind, pos = FRAME_HDR.unpack(img[:FRAME_HDR.size])
+            img = img[FRAME_HDR.size:]
         if self._flushing:
             # Post-interrupt: an old-turn frame still draining from the server (ws + out_q). Drop it
             # entirely -- do not count it, buffer it, or forward it as idle. Cleared on next TTSStarted.
             return
         # HELD/dup detection (see the append guard below): the server re-sends the last frame
         # byte-for-byte during a render underflow. A held frame is not new lip motion, so it must
-        # neither count as delivered video nor land in the synced buffer. (single writer = this loop,
-        # so reading _vbuf[-1] here without the lock is safe.)
+        # neither count as delivered video nor land in the synced buffer. proto 2 declares it
+        # (kind 1/2 = not a new real frame); the byte-compare is the proto-1 heuristic. (single
+        # writer = this loop, so reading _vbuf[-1] here without the lock is safe.)
         is_dup = (self._sync and self._video_active and not self._unsynced
-                  and bool(self._vbuf) and img == self._vbuf[-1])
+                  and ((kind != 0) if kind is not None
+                       else (bool(self._vbuf) and img == self._vbuf[-1])))
         if self._video_active and not is_dup:   # count only REAL frames + trace the offset
             now = asyncio.get_running_loop().time()
             if self._t_vid_first is None:
@@ -398,6 +422,7 @@ class MuseTalkVideoService(FrameProcessor):
                     self._held_dups += 1
                 else:
                     self._vbuf.append(img)
+                    self._vpos.append(pos if kind == 0 else 0)   # 0 = pair by index (proto 1)
             if self._mode == "steady":
                 await self._advance()   # release paced to frames AS they arrive (continuous)
         else:
@@ -416,7 +441,11 @@ class MuseTalkVideoService(FrameProcessor):
 
     async def _on_marker(self, evt: dict):
         kind = evt.get("type")
-        if kind == "video_start":
+        if kind == "proto":
+            self._proto2 = int(evt.get("v", 1)) >= 2
+            logger.info(f"MuseTalk server speaks proto {evt.get('v', 1)} "
+                        f"(per-frame audio_pos pairing {'ON' if self._proto2 else 'off'}).")
+        elif kind == "video_start":
             # New turn segment. TTSStartedFrame already reset the turn (audio + buffers) BEFORE
             # any audio was buffered, so here we ONLY mark active. We deliberately do NOT clear
             # _vbuf / _released_idx -- they stay continuous across the whole turn so a stray
@@ -457,12 +486,16 @@ class MuseTalkVideoService(FrameProcessor):
             # i needs the audio up to i/fps, so cap at the buffered-audio position. This stops
             # the video running AHEAD of the voice (e.g. if frames briefly outpace audio).
             target = len(self._vbuf)
-            # ceil (not floor): a turn's audio is rarely a whole number of frames
-            # (13.6s*12 = 163.2), so int()/floor stranded the final sub-frame of audio to the
-            # delayed video_end drain -> it played ~1s late as a blip (PROBLEMS-AND-FIXES P10).
-            # ceil makes the trailing frame reachable so the last sub-frame releases in step.
-            audio_cap = math.ceil(self._audio_clock_s * self._fps) + 1
-            target = min(target, audio_cap)
+            if not self._proto2:
+                # ceil (not floor): a turn's audio is rarely a whole number of frames
+                # (13.6s*12 = 163.2), so int()/floor stranded the final sub-frame of audio to the
+                # delayed video_end drain -> it played ~1s late as a blip (PROBLEMS-AND-FIXES P10).
+                # ceil makes the trailing frame reachable so the last sub-frame releases in step.
+                # proto 2 needs no cap: a real frame's audio_pos can never exceed audio the client
+                # already buffered (_abuf.append happens in the same process_frame call that
+                # queues the server feed), so pos-paired release can't outrun the voice.
+                audio_cap = math.ceil(self._audio_clock_s * self._fps) + 1
+                target = min(target, audio_cap)
             while self._released_idx < target:
                 await self._emit_pair(self._released_idx)
                 self._released_idx += 1
@@ -470,8 +503,13 @@ class MuseTalkVideoService(FrameProcessor):
 
     async def _emit_pair(self, i: int):
         """Audio due by frame i's time (in order), then frame i tagged sync_with_audio. Caller
-        holds the lock. Frame is skipped if not buffered yet (a caught-up cursor ran ahead)."""
-        ft = i / self._fps
+        holds the lock. Frame is skipped if not buffered yet (a caught-up cursor ran ahead).
+        proto 2: the frame's own audio_pos (what the server ACTUALLY consumed rendering it)
+        defines the audio due -- index/fps arithmetic is the proto-1 fallback, and also covers
+        a proto-2 frame that carried no pos (pos 0, e.g. a dequeued neutral tail)."""
+        ft = (self._vpos[i] / MUSETALK_SR
+              if i < len(self._vpos) and self._vpos[i] > 0
+              else i / self._fps)
         while self._aidx < len(self._abuf) and self._abuf[self._aidx][0] <= ft:
             _e, af, ad = self._abuf[self._aidx]
             self._aidx += 1
@@ -529,6 +567,7 @@ class MuseTalkVideoService(FrameProcessor):
         self._aidx = 0
         self._audio_clock_s = 0.0
         self._vbuf = []
+        self._vpos = []
         self._released_idx = 0
         self._video_active = False
         self._unsynced = False
