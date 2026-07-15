@@ -276,7 +276,68 @@ is a human watching the live avatar.
 
 # 6. Evaluation
 
-<!-- Task 11 -->
+## 6.1 Setup and protocol
+
+All measurements ran on the deployment machine itself: one NVIDIA RTX 5060 Ti (16 GB,
+Blackwell), Windows 11 with the TTS server in WSL2. Configuration: CosyVoice2-0.5B on vLLM,
+MuseTalk with TensorRT at 12 fps / 512 px output, steady (video-master) sync with a 14-frame
+lead cushion, `llama-4-scout` pinned to one provider, first-clause splitting on for both
+languages, filler words off.
+
+Protocol: 10 runs per language (2026-07-16), each on a **fresh session** — the headless probe
+reconnects per run, and the single-client renderer drops the previous session. Fresh sessions
+are deliberate: we have observed long multi-turn sessions degrade turn-start latency (§7), so
+a long-session campaign would conflate that open issue with the architecture's baseline.
+Medians are the headline; p95 keeps the honest tail (GPU-contention variance and provider
+congestion are both real and both appear in it). The question wavs are fixed recordings — a
+zh "what is AI, explain in detail" prompt and an en weather-style prompt — so runs are
+comparable within a language; the probe caveat for the LLM row is discussed in §4.
+
+## 6.2 Latency results
+
+**Table 3. TTFO and per-stage medians, 10 fresh sessions per language.**
+
+| | zh | en |
+|---|---|---|
+| TTFO median | **2.92 s** | **2.20 s** |
+| TTFO p95 | 4.94 s | 2.83 s |
+| TTFO min / max | 2.14 / 4.94 s | 1.86 / 2.83 s |
+| — TTS first chunk (median) | 0.89 s | 0.89 s |
+| — sync lead-hold (median) | 0.64 s | 0.60 s |
+| — transport + network (median) | 0.16 s | 0.17 s |
+| — jitter + playout (estimate) | 0.15 s | 0.15 s |
+| end-to-end to the ear (median) | 3.31 s | 2.75 s |
+
+Both languages meet the 3 s TTFO target at the median. The zh tail is wider: its slow runs
+attribute entirely to the sync lead-hold stretching under shared-GPU render variance (0.6 s
+typical, up to 2.4 s on the worst run) — the TTS first chunk stayed within 0.66–1.04 s across
+all 20 runs. This localizes future work precisely: the tail is a rendering-contention problem,
+not a synthesis or network one.
+
+## 6.3 Synchronization results
+
+Across the 20 runs the probe received a median 12.1 fps (the configured rate is 12) with a
+worst frame gap of 441 ms — below the 500 ms freeze threshold, and absorbed by the lead
+cushion rather than audible as a voice pause. End-of-turn audio/video drift on offline
+captures of the delivered stream is within ±0.04 s (development-time measurement, §5.4), and
+the per-turn audio-position invariant (§5.4) held exactly on every probed turn. Sync
+acceptance on live viewing is a human judgment and is discussed as a limitation in §7.
+
+## 6.4 Resource footprint
+
+**Table 4. Resident GPU memory, live stack (Windows per-process performance counters).**
+
+| Process | Role | Dedicated GPU memory |
+|---|---|---|
+| WSL2 VM | CosyVoice2-0.5B on vLLM (KV pool at 7% of GPU) | 2,312 MiB |
+| Renderer | MuseTalk + TensorRT (PyTorch weights freed) | 3,286 MiB |
+| Pipeline | Pipecat + Silero VAD (CPU inference) | < 100 MiB |
+| **Project total** | | **≈ 5.6 GB** |
+
+The project's ~5.6 GB on a 16 GB card leaves headroom for a larger renderer or a local LLM;
+conversely, with the documented settings (a slightly larger KV fraction on a smaller card),
+the stack fits an 8 GB consumer GPU. The individual ablations behind this profile — vLLM KV
+sizing, freed PyTorch weights, TensorRT — are the levers of Table 2 and §3.4.
 
 # 7. Discussion and Lessons Learned
 
