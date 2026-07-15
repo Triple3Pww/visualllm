@@ -1,0 +1,568 @@
+{
+  "meta": {
+    "when": "2026-07-16 00:04",
+    "question": "什麼 是人工智慧 請詳細說明",
+    "machine": "this box (RTX 5060 Ti, Blackwell)",
+    "stack": "Deepgram STT - OpenRouter LLM - CosyVoice2 (vLLM/WSL) TTS - MuseTalk avatar",
+    "ttfo": 2.28,
+    "ttfo_target": 3.0,
+    "ttfo_pass": true
+  },
+  "events": [
+    {
+      "stage": "capture",
+      "t": -2.0,
+      "end": 0,
+      "kind": "span",
+      "label": "User speaking",
+      "why": "Browser mic -> WebRTC -> Silero VAD listens for the end of the utterance.",
+      "src": "log user-turn-started"
+    },
+    {
+      "stage": "stt",
+      "t": -2.0,
+      "end": 0,
+      "kind": "span",
+      "label": "Deepgram nova-2 streaming (receives mic)",
+      "why": "STT's input is the live mic the whole time the user talks; partials refine into one final transcript.",
+      "src": "log STT stream"
+    },
+    {
+      "stage": "capture",
+      "t": 0,
+      "kind": "turn",
+      "label": "User STOPPED speaking - t0",
+      "why": "VAD + turn-analyzer agree the turn ended. This instant starts the <3s TTFO stopwatch.",
+      "src": "log user-turn-stopped"
+    },
+    {
+      "stage": "stt",
+      "t": 0,
+      "kind": "emit",
+      "label": "STT emits final transcript",
+      "why": "\"什麼 是人工智慧 請詳細說明\" pushed into the LLM context aggregator.",
+      "src": "log t0"
+    },
+    {
+      "stage": "llm",
+      "t": 0,
+      "kind": "recv",
+      "from": "STT",
+      "label": "◯ LLM receives the transcript",
+      "why": "Generation starts at t0; the LLM was pre-warmed on connect, so no cold start.",
+      "src": "log 'Generating chat from context'"
+    },
+    {
+      "stage": "llm",
+      "t": 0,
+      "end": 0.691,
+      "kind": "span",
+      "label": "OpenRouter generating",
+      "subtle": true,
+      "why": "Streams tokens; the whole answer is ready well before TTS finishes sentence 1.",
+      "src": "log LLM"
+    },
+    {
+      "stage": "llm",
+      "t": 0.691,
+      "kind": "emit",
+      "label": "LLM emits first token",
+      "why": "OpenRouter TTFB 0.691s - the transpacific cloud hop is the LLM's main cost.",
+      "src": "log LLM TTFB 0.691s"
+    },
+    {
+      "stage": "tts",
+      "t": 0.709,
+      "kind": "recv",
+      "from": "LLM",
+      "label": "◯ TTS receives sentence 1",
+      "why": "\"人工智慧很厲害。\" First complete sentence flushed early so TTS can start before the full answer exists.",
+      "src": "log run_tts"
+    },
+    {
+      "stage": "tts",
+      "t": 0.709,
+      "end": 1.657,
+      "kind": "span",
+      "label": "CosyVoice synthesizing sentence 1",
+      "why": "First audio at TTFB 0.941s; done at +1.66s. This first chunk is the single biggest piece of TTFO.",
+      "src": "log run_tts->TTFB"
+    },
+    {
+      "stage": "tts",
+      "t": 1.65,
+      "kind": "emit",
+      "label": "TTS emits sentence-1 first chunk",
+      "why": "CosyVoice TTFB 0.941s after receiving the sentence. This is what starts the bot speaking.",
+      "src": "log TTS TTFB 0.941s"
+    },
+    {
+      "stage": "tts",
+      "t": 1.657,
+      "kind": "recv",
+      "from": "LLM",
+      "label": "◯ TTS receives sentence 2",
+      "why": "Starts as the previous sentence finished - CosyVoice synthesizes one sentence at a time (serial).",
+      "src": "log run_tts"
+    },
+    {
+      "stage": "tts",
+      "t": 1.657,
+      "end": 3.544,
+      "kind": "span",
+      "label": "CosyVoice synthesizing sentence 2",
+      "why": "First audio at TTFB 1.882s; done at +3.54s. Synthesized while earlier audio is already playing, so it doesn't affect TTFO.",
+      "src": "log run_tts->TTFB"
+    },
+    {
+      "stage": "tts",
+      "t": 3.538,
+      "kind": "emit",
+      "label": "TTS emits sentence-2 first chunk",
+      "why": "CosyVoice TTFB 1.882s after receiving the sentence.",
+      "src": "log TTS TTFB 1.882s"
+    },
+    {
+      "stage": "tts",
+      "t": 3.544,
+      "kind": "recv",
+      "from": "LLM",
+      "label": "◯ TTS receives sentence 3",
+      "why": "Starts as the previous sentence finished - CosyVoice synthesizes one sentence at a time (serial).",
+      "src": "log run_tts"
+    },
+    {
+      "stage": "tts",
+      "t": 3.544,
+      "end": 5.123,
+      "kind": "span",
+      "label": "CosyVoice synthesizing sentence 3",
+      "why": "First audio at TTFB 1.571s; done at +5.12s. Synthesized while earlier audio is already playing, so it doesn't affect TTFO.",
+      "src": "log run_tts->TTFB"
+    },
+    {
+      "stage": "tts",
+      "t": 5.116,
+      "kind": "emit",
+      "label": "TTS emits sentence-3 first chunk",
+      "why": "CosyVoice TTFB 1.571s after receiving the sentence.",
+      "src": "log TTS TTFB 1.571s"
+    },
+    {
+      "stage": "tts",
+      "t": 5.123,
+      "kind": "recv",
+      "from": "LLM",
+      "label": "◯ TTS receives sentence 4",
+      "why": "Starts as the previous sentence finished - CosyVoice synthesizes one sentence at a time (serial).",
+      "src": "log run_tts"
+    },
+    {
+      "stage": "tts",
+      "t": 5.123,
+      "end": 8.293,
+      "kind": "span",
+      "label": "CosyVoice synthesizing sentence 4",
+      "why": "First audio at TTFB 2.035s; done at +8.29s. Synthesized while earlier audio is already playing, so it doesn't affect TTFO.",
+      "src": "log run_tts->TTFB"
+    },
+    {
+      "stage": "tts",
+      "t": 7.157,
+      "kind": "emit",
+      "label": "TTS emits sentence-4 first chunk",
+      "why": "CosyVoice TTFB 2.035s after receiving the sentence.",
+      "src": "log TTS TTFB 2.035s"
+    },
+    {
+      "stage": "tts",
+      "t": 8.293,
+      "kind": "recv",
+      "from": "LLM",
+      "label": "◯ TTS receives sentence 5",
+      "why": "Starts as the previous sentence finished - CosyVoice synthesizes one sentence at a time (serial).",
+      "src": "log run_tts"
+    },
+    {
+      "stage": "tts",
+      "t": 8.293,
+      "end": 11.651,
+      "kind": "span",
+      "label": "CosyVoice synthesizing sentence 5",
+      "why": "First audio at TTFB 2.030s; done at +11.65s. Synthesized while earlier audio is already playing, so it doesn't affect TTFO.",
+      "src": "log run_tts->TTFB"
+    },
+    {
+      "stage": "tts",
+      "t": 10.323,
+      "kind": "emit",
+      "label": "TTS emits sentence-5 first chunk",
+      "why": "CosyVoice TTFB 2.030s after receiving the sentence.",
+      "src": "log TTS TTFB 2.030s"
+    },
+    {
+      "stage": "tts",
+      "t": 11.651,
+      "kind": "recv",
+      "from": "LLM",
+      "label": "◯ TTS receives sentence 6",
+      "why": "Starts as the previous sentence finished - CosyVoice synthesizes one sentence at a time (serial).",
+      "src": "log run_tts"
+    },
+    {
+      "stage": "tts",
+      "t": 11.651,
+      "end": 14.586,
+      "kind": "span",
+      "label": "CosyVoice synthesizing sentence 6",
+      "why": "First audio at TTFB 2.009s; done at +14.59s. Synthesized while earlier audio is already playing, so it doesn't affect TTFO.",
+      "src": "log run_tts->TTFB"
+    },
+    {
+      "stage": "tts",
+      "t": 13.66,
+      "kind": "emit",
+      "label": "TTS emits sentence-6 first chunk",
+      "why": "CosyVoice TTFB 2.009s after receiving the sentence.",
+      "src": "log TTS TTFB 2.009s"
+    },
+    {
+      "stage": "tts",
+      "t": 14.586,
+      "kind": "recv",
+      "from": "LLM",
+      "label": "◯ TTS receives sentence 7",
+      "why": "Starts as the previous sentence finished - CosyVoice synthesizes one sentence at a time (serial).",
+      "src": "log run_tts"
+    },
+    {
+      "stage": "tts",
+      "t": 14.586,
+      "end": 16.67,
+      "kind": "span",
+      "label": "CosyVoice synthesizing sentence 7",
+      "why": "First audio at TTFB 2.075s; done at +16.67s. Synthesized while earlier audio is already playing, so it doesn't affect TTFO.",
+      "src": "log run_tts->TTFB"
+    },
+    {
+      "stage": "tts",
+      "t": 16.661,
+      "kind": "emit",
+      "label": "TTS emits sentence-7 first chunk",
+      "why": "CosyVoice TTFB 2.075s after receiving the sentence.",
+      "src": "log TTS TTFB 2.075s"
+    },
+    {
+      "stage": "tts",
+      "t": 16.67,
+      "kind": "recv",
+      "from": "LLM",
+      "label": "◯ TTS receives sentence 8",
+      "why": "Starts as the previous sentence finished - CosyVoice synthesizes one sentence at a time (serial).",
+      "src": "log run_tts"
+    },
+    {
+      "stage": "tts",
+      "t": 16.67,
+      "end": 18.038,
+      "kind": "span",
+      "label": "CosyVoice synthesizing sentence 8",
+      "why": "First audio at TTFB 1.364s; done at +18.04s. Synthesized while earlier audio is already playing, so it doesn't affect TTFO.",
+      "src": "log run_tts->TTFB"
+    },
+    {
+      "stage": "tts",
+      "t": 18.033,
+      "kind": "emit",
+      "label": "TTS emits sentence-8 first chunk",
+      "why": "CosyVoice TTFB 1.364s after receiving the sentence.",
+      "src": "log TTS TTFB 1.364s"
+    },
+    {
+      "stage": "avatar",
+      "t": 0,
+      "end": 2.287,
+      "kind": "span",
+      "label": "Idle / neutral frames",
+      "subtle": true,
+      "why": "A calm neutral face between turns (real-time fps) so the picture is never frozen while TTS works.",
+      "src": "probe: video pre-speech"
+    },
+    {
+      "stage": "avatar",
+      "t": 1.65,
+      "kind": "recv",
+      "from": "CosyVoice",
+      "label": "◯ MuseTalk receives the voice",
+      "why": "The avatar forwards the first PCM chunk to the :8002 render server the instant TTS emits it (real-time-paced).",
+      "src": "~ TTS first chunk"
+    },
+    {
+      "stage": "deliver",
+      "t": 2.287,
+      "kind": "turn",
+      "big": true,
+      "label": "Bot started speaking -> TTFO 2.28s",
+      "why": "The VOICE starts reaching the client here. Under the default steady (video-master) sync the voice is HELD until MUSETALK_LEAD_FRAMES lip frames are rendered, then released in step with them -- so this instant is the synced A/V start. TTFO measures it: 2.28s vs the 3s target.",
+      "src": "log [TTFO] (audio-path event)"
+    },
+    {
+      "stage": "avatar",
+      "t": 2.287,
+      "end": 2.287,
+      "kind": "span",
+      "label": "MuseTalk lip-sync render",
+      "why": "Mouth-region frames, steady/video-master sync (default): the voice is paced to the REAL rendered frames, so a render stall pauses the voice instead of drifting. (MUSETALK_SYNC_MODE=live is the audio-master alternative: voice instant, lips trail best-effort.)",
+      "src": "log render window"
+    },
+    {
+      "stage": "deliver",
+      "t": 2.287,
+      "kind": "turn",
+      "label": "Bot stopped speaking - turn complete",
+      "why": "Full answer delivered. Mic un-mutes; the assistant aggregator records the turn so the next turn has full history.",
+      "src": "log bot-stopped"
+    }
+  ],
+  "handoffs": [
+    {
+      "from": "stt",
+      "to": "llm",
+      "t": 0.0,
+      "what": "final transcript (text)",
+      "note": "The question text enters the LLM at t0; generation starts immediately (pre-warmed)."
+    },
+    {
+      "from": "llm",
+      "to": "tts",
+      "t": 0.709,
+      "what": "sentence 1 (text)",
+      "note": "First complete sentence flushed early, so speech can begin before the full answer exists."
+    },
+    {
+      "from": "tts",
+      "to": "avatar",
+      "t": 1.65,
+      "what": "first voice chunk (16kHz PCM)",
+      "star": true,
+      "note": "CosyVoice -> MuseTalk: the avatar forwards the chunk to the :8002 render server the instant TTS emits it."
+    },
+    {
+      "from": "avatar",
+      "to": "deliver",
+      "t": 2.287,
+      "what": "voice starts (synced A/V start)",
+      "note": "MuseTalk -> browser: under steady (default) the voice is held for the MUSETALK_LEAD_FRAMES render cushion, then released paced to the real rendered frames. This synced start is TTFO."
+    }
+  ],
+  "metrics": [
+    {
+      "k": "TTFO",
+      "v": "2.28",
+      "u": "s",
+      "n": "target 3s",
+      "tag": "ok"
+    },
+    {
+      "k": "Startup (connect -> 1st frame)",
+      "v": "11.14",
+      "u": "s",
+      "n": "incl. idle warmup",
+      "tag": ""
+    },
+    {
+      "k": "Received video",
+      "v": "12.1",
+      "u": "fps",
+      "n": "server output rate",
+      "tag": "ok"
+    },
+    {
+      "k": "Frame interval",
+      "v": "82.6",
+      "u": "ms mean",
+      "n": "p95 97.7 - max 143.2",
+      "tag": ""
+    },
+    {
+      "k": "Freeze (max gap)",
+      "v": "143",
+      "u": "ms",
+      "n": "OK <500ms",
+      "tag": "ok"
+    },
+    {
+      "k": "Audio arrival gap",
+      "v": "54.8",
+      "u": "ms max",
+      "n": "p95 41.5ms",
+      "tag": "warn"
+    },
+    {
+      "k": "Lip offset",
+      "v": "n/a",
+      "u": "",
+      "n": "no video in mp4",
+      "tag": ""
+    },
+    {
+      "k": "Frames / audio pkts",
+      "v": "412",
+      "u": "/ 1801",
+      "n": "over the capture",
+      "tag": ""
+    }
+  ],
+  "waterfall": [
+    {
+      "stage": "STT finalize -> LLM",
+      "delta": 0.0,
+      "cum": 0.0,
+      "source": "assumed",
+      "status": "ok"
+    },
+    {
+      "stage": "LLM first token",
+      "delta": 0.691,
+      "cum": 0.691,
+      "source": "log",
+      "status": "ok"
+    },
+    {
+      "stage": "LLM -> TTS (sentence-1 flush)",
+      "delta": 0.018,
+      "cum": 0.709,
+      "source": "log",
+      "status": "ok"
+    },
+    {
+      "stage": "TTS synth first chunk",
+      "delta": 0.941,
+      "cum": 1.65,
+      "source": "log",
+      "status": "ok"
+    },
+    {
+      "stage": "TTS -> bot-start (steady lead-hold)",
+      "delta": 0.637,
+      "cum": 2.287,
+      "source": "log",
+      "status": "ok"
+    },
+    {
+      "stage": "Transport + encode + network",
+      "delta": 0.291,
+      "cum": 2.578,
+      "source": "probe",
+      "status": "ok"
+    },
+    {
+      "stage": "Browser jitter + decode + playout",
+      "delta": 0.15,
+      "cum": 2.728,
+      "source": "est",
+      "status": "ok"
+    },
+    {
+      "stage": "END-TO-END, user hears",
+      "delta": null,
+      "cum": 2.728,
+      "source": "",
+      "status": "total"
+    }
+  ],
+  "raw": {
+    "probe": {
+      "video_frames": 412,
+      "audio_packets": 1801,
+      "startup_s": 11.14,
+      "recv_fps": 12.1,
+      "frame_ms_mean": 82.6,
+      "frame_ms_p95": 97.7,
+      "frame_ms_max": 143.2,
+      "freeze_ms": 143,
+      "audio_gap_p95_ms": 41.5,
+      "audio_gap_max_ms": 54.8,
+      "lip_offset": null,
+      "lip_offset_note": "no video in mp4"
+    },
+    "ttfo_s": 2.28,
+    "anchors": {
+      "llm_recv": 0.0,
+      "llm_ttfb": 0.691,
+      "tts_recv": 0.709,
+      "tts_ttfb": 1.65,
+      "bot_started": 2.287,
+      "client_arrival": 2.578,
+      "playout": 2.728
+    },
+    "sentences": [
+      [
+        0.709,
+        "人工智慧很厲害。"
+      ],
+      [
+        1.657,
+        "人工智慧是一種模擬人類智能行為和思考的技術，透過電腦系統實現。"
+      ],
+      [
+        3.544,
+        "它可以學習、推理、解決問題，甚至創造藝術和音樂。"
+      ],
+      [
+        5.123,
+        "人工智慧的發展歷程可以追溯到1950年代，當時計算機科學家開始探索如何讓機器具備智能。"
+      ],
+      [
+        8.293,
+        "現在，人工智慧已經廣泛應用於各個領域，包括醫療保健、金融服務、交通運輸、教育和娛樂等。"
+      ],
+      [
+        11.651,
+        "舉例來說，虛擬助手如Siri和Google Assistant就是人工智慧的應用，它們可以理解語音指令並提供相應的服務。"
+      ],
+      [
+        14.586,
+        "人工智慧還可以用於圖像和語音識別、自然語言處理和機器學習等方面。"
+      ],
+      [
+        16.67,
+        "它的發展正在改變我們的生活方式和工作方式。"
+      ]
+    ],
+    "tts_ttfb": [
+      [
+        1.65,
+        0.941
+      ],
+      [
+        3.538,
+        1.882
+      ],
+      [
+        5.116,
+        1.571
+      ],
+      [
+        7.157,
+        2.035
+      ],
+      [
+        10.323,
+        2.03
+      ],
+      [
+        13.66,
+        2.009
+      ],
+      [
+        16.661,
+        2.075
+      ],
+      [
+        18.033,
+        1.364
+      ]
+    ]
+  }
+}
