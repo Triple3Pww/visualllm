@@ -270,8 +270,9 @@ class MuseTalkVideoService(FrameProcessor):
             self._ws_url, max_size=None, ping_interval=None, close_timeout=1
         )
         # Request proto 2 (self-describing frames). _proto2 flips on the server's ack
-        # marker only, and resets here so a reconnect to an OLDER server downgrades
-        # cleanly to the bare-frame wire + the index/fps pairing.
+        # marker only, and resets here per connection. Synced mode REQUIRES proto 2 now
+        # (the index/fps pairing was deleted, P51): an older server that never acks trips
+        # the loud _unsynced fallback in _on_frame instead of silently mis-pairing.
         self._proto2 = False
         await self._ws.send(json.dumps({"type": "config", "fps": self._fps, "proto": 2}))
 
@@ -366,8 +367,9 @@ class MuseTalkVideoService(FrameProcessor):
     async def _on_frame(self, img: bytes):
         """A rendered RGB frame from the server."""
         # proto 2: every binary message is header + pixels. kind/pos make the frame
-        # self-describing; kind stays None on the bare (proto-1) wire so the byte-compare
-        # heuristics below keep covering old servers.
+        # self-describing; kind stays None on a bare (proto-1) frame, which synced mode
+        # treats as a protocol error (the loud fallback below) -- the guessing heuristics
+        # that used to cover bare frames were deleted with the index/fps pairing (P51).
         kind, pos = None, 0
         if self._proto2 and len(img) >= FRAME_HDR.size and img[:4] == FRAME_MAGIC:
             _m, kind, pos = FRAME_HDR.unpack(img[:FRAME_HDR.size])
@@ -419,18 +421,16 @@ class MuseTalkVideoService(FrameProcessor):
         if self._video_active and not self._unsynced:
             async with self._lock:
                 if is_dup:
-                    # The server re-sends the LAST frame byte-for-byte to keep the WebRTC track alive
-                    # whenever its render underflows mid-turn (GPU contention with CosyVoice, or a
-                    # real-time feed briefly starving it). In steady/prerender the CLIENT re-paces video
-                    # to audio, so a held frame landing in _vbuf becomes a PHANTOM real frame: it shifts
-                    # every following viseme one frame late (a freeze, then the real frames delivered
-                    # late) -- the live "lips don't match the words" that offline prerender (GPU-alone,
-                    # no underflow) never shows. DROP it so _vbuf stays exactly the REAL rendered
-                    # sequence and audio i/fps always pairs with real lip-frame i. Under a stall the
-                    # client then holds the last real frame and the voice pauses IN SYNC (the intended
-                    # steady tradeoff) instead of drifting. Genuine consecutive render frames are never
-                    # byte-identical (the Whisper-of-waveform conditioning varies frame to frame even in
-                    # silence), so this only ever drops a true server hold. docs/PROBLEMS-AND-FIXES.md P39.
+                    # The server re-sends the LAST frame to keep the WebRTC track alive whenever
+                    # its render underflows mid-turn (GPU contention with CosyVoice, or a real-time
+                    # feed briefly starving it). A held frame landing in _vbuf would be a PHANTOM
+                    # real frame: it pairs voice with lip motion that never happened and delivers
+                    # every following real frame late -- the live "lips don't match the words" that
+                    # offline prerender (GPU-alone, no underflow) never shows (P39). DROP it so
+                    # _vbuf stays exactly the REAL rendered sequence; under a stall the client then
+                    # holds the last real frame and the voice pauses IN SYNC (the intended steady
+                    # tradeoff) instead of drifting. Detection is the wire's own kind flag (held /
+                    # idle), not a guess -- the byte-compare heuristic went with proto 1 (P51).
                     self._held_dups += 1
                 else:
                     self._vbuf.append(img)
