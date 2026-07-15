@@ -1,0 +1,398 @@
+{
+  "meta": {
+    "when": "2026-07-16 00:22",
+    "question": "HELLO CAN YOU HEAR ME WHAT IS THE WEATHER LIKE TODAY",
+    "machine": "this box (RTX 5060 Ti, Blackwell)",
+    "stack": "Deepgram STT - OpenRouter LLM - CosyVoice2 (vLLM/WSL) TTS - MuseTalk avatar",
+    "ttfo": 2.0,
+    "ttfo_target": 3.0,
+    "ttfo_pass": true
+  },
+  "events": [
+    {
+      "stage": "capture",
+      "t": -2.0,
+      "end": 0,
+      "kind": "span",
+      "label": "User speaking",
+      "why": "Browser mic -> WebRTC -> Silero VAD listens for the end of the utterance.",
+      "src": "log user-turn-started"
+    },
+    {
+      "stage": "stt",
+      "t": -2.0,
+      "end": 0,
+      "kind": "span",
+      "label": "Deepgram nova-2 streaming (receives mic)",
+      "why": "STT's input is the live mic the whole time the user talks; partials refine into one final transcript.",
+      "src": "log STT stream"
+    },
+    {
+      "stage": "capture",
+      "t": 0,
+      "kind": "turn",
+      "label": "User STOPPED speaking - t0",
+      "why": "VAD + turn-analyzer agree the turn ended. This instant starts the <3s TTFO stopwatch.",
+      "src": "log user-turn-stopped"
+    },
+    {
+      "stage": "stt",
+      "t": 0,
+      "kind": "emit",
+      "label": "STT emits final transcript",
+      "why": "\"HELLO CAN YOU HEAR ME WHAT IS THE WEATHER LIKE TODAY\" pushed into the LLM context aggregator.",
+      "src": "log t0"
+    },
+    {
+      "stage": "llm",
+      "t": 0,
+      "kind": "recv",
+      "from": "STT",
+      "label": "◯ LLM receives the transcript",
+      "why": "Generation starts at t0; the LLM was pre-warmed on connect, so no cold start.",
+      "src": "log 'Generating chat from context'"
+    },
+    {
+      "stage": "llm",
+      "t": 0,
+      "end": 0.599,
+      "kind": "span",
+      "label": "OpenRouter generating",
+      "subtle": true,
+      "why": "Streams tokens; the whole answer is ready well before TTS finishes sentence 1.",
+      "src": "log LLM"
+    },
+    {
+      "stage": "llm",
+      "t": 0.599,
+      "kind": "emit",
+      "label": "LLM emits first token",
+      "why": "OpenRouter TTFB 0.599s - the transpacific cloud hop is the LLM's main cost.",
+      "src": "log LLM TTFB 0.599s"
+    },
+    {
+      "stage": "tts",
+      "t": 0.606,
+      "kind": "recv",
+      "from": "LLM",
+      "label": "◯ TTS receives sentence 1",
+      "why": "\"I can hear you loud and clear.\" First complete sentence flushed early so TTS can start before the full answer exists.",
+      "src": "log run_tts"
+    },
+    {
+      "stage": "tts",
+      "t": 0.606,
+      "end": 1.375,
+      "kind": "span",
+      "label": "CosyVoice synthesizing sentence 1",
+      "why": "First audio at TTFB 0.766s; done at +1.38s. This first chunk is the single biggest piece of TTFO.",
+      "src": "log run_tts->TTFB"
+    },
+    {
+      "stage": "tts",
+      "t": 1.372,
+      "kind": "emit",
+      "label": "TTS emits sentence-1 first chunk",
+      "why": "CosyVoice TTFB 0.766s after receiving the sentence. This is what starts the bot speaking.",
+      "src": "log TTS TTFB 0.766s"
+    },
+    {
+      "stage": "tts",
+      "t": 1.375,
+      "kind": "recv",
+      "from": "LLM",
+      "label": "◯ TTS receives sentence 2",
+      "why": "Starts as the previous sentence finished - CosyVoice synthesizes one sentence at a time (serial).",
+      "src": "log run_tts"
+    },
+    {
+      "stage": "tts",
+      "t": 1.375,
+      "end": 2.846,
+      "kind": "span",
+      "label": "CosyVoice synthesizing sentence 2",
+      "why": "First audio at TTFB 1.466s; done at +2.85s. Synthesized while earlier audio is already playing, so it doesn't affect TTFO.",
+      "src": "log run_tts->TTFB"
+    },
+    {
+      "stage": "tts",
+      "t": 2.841,
+      "kind": "emit",
+      "label": "TTS emits sentence-2 first chunk",
+      "why": "CosyVoice TTFB 1.466s after receiving the sentence.",
+      "src": "log TTS TTFB 1.466s"
+    },
+    {
+      "stage": "tts",
+      "t": 2.846,
+      "kind": "recv",
+      "from": "LLM",
+      "label": "◯ TTS receives sentence 3",
+      "why": "Starts as the previous sentence finished - CosyVoice synthesizes one sentence at a time (serial).",
+      "src": "log run_tts"
+    },
+    {
+      "stage": "tts",
+      "t": 2.846,
+      "end": 3.853,
+      "kind": "span",
+      "label": "CosyVoice synthesizing sentence 3",
+      "why": "First audio at TTFB 1.003s; done at +3.85s. Synthesized while earlier audio is already playing, so it doesn't affect TTFO.",
+      "src": "log run_tts->TTFB"
+    },
+    {
+      "stage": "tts",
+      "t": 3.849,
+      "kind": "emit",
+      "label": "TTS emits sentence-3 first chunk",
+      "why": "CosyVoice TTFB 1.003s after receiving the sentence.",
+      "src": "log TTS TTFB 1.003s"
+    },
+    {
+      "stage": "avatar",
+      "t": 0,
+      "end": 1.998,
+      "kind": "span",
+      "label": "Idle / neutral frames",
+      "subtle": true,
+      "why": "A calm neutral face between turns (real-time fps) so the picture is never frozen while TTS works.",
+      "src": "probe: video pre-speech"
+    },
+    {
+      "stage": "avatar",
+      "t": 1.372,
+      "kind": "recv",
+      "from": "CosyVoice",
+      "label": "◯ MuseTalk receives the voice",
+      "why": "The avatar forwards the first PCM chunk to the :8002 render server the instant TTS emits it (real-time-paced).",
+      "src": "~ TTS first chunk"
+    },
+    {
+      "stage": "deliver",
+      "t": 1.998,
+      "kind": "turn",
+      "big": true,
+      "label": "Bot started speaking -> TTFO 2.0s",
+      "why": "The VOICE starts reaching the client here. Under the default steady (video-master) sync the voice is HELD until MUSETALK_LEAD_FRAMES lip frames are rendered, then released in step with them -- so this instant is the synced A/V start. TTFO measures it: 2.0s vs the 3s target.",
+      "src": "log [TTFO] (audio-path event)"
+    },
+    {
+      "stage": "avatar",
+      "t": 1.998,
+      "end": 11.299,
+      "kind": "span",
+      "label": "MuseTalk lip-sync render",
+      "why": "Mouth-region frames, steady/video-master sync (default): the voice is paced to the REAL rendered frames, so a render stall pauses the voice instead of drifting. (MUSETALK_SYNC_MODE=live is the audio-master alternative: voice instant, lips trail best-effort.)",
+      "src": "log render window"
+    },
+    {
+      "stage": "deliver",
+      "t": 11.299,
+      "kind": "turn",
+      "label": "Bot stopped speaking - turn complete",
+      "why": "Full answer delivered. Mic un-mutes; the assistant aggregator records the turn so the next turn has full history.",
+      "src": "log bot-stopped"
+    }
+  ],
+  "handoffs": [
+    {
+      "from": "stt",
+      "to": "llm",
+      "t": 0.0,
+      "what": "final transcript (text)",
+      "note": "The question text enters the LLM at t0; generation starts immediately (pre-warmed)."
+    },
+    {
+      "from": "llm",
+      "to": "tts",
+      "t": 0.606,
+      "what": "sentence 1 (text)",
+      "note": "First complete sentence flushed early, so speech can begin before the full answer exists."
+    },
+    {
+      "from": "tts",
+      "to": "avatar",
+      "t": 1.372,
+      "what": "first voice chunk (16kHz PCM)",
+      "star": true,
+      "note": "CosyVoice -> MuseTalk: the avatar forwards the chunk to the :8002 render server the instant TTS emits it."
+    },
+    {
+      "from": "avatar",
+      "to": "deliver",
+      "t": 1.998,
+      "what": "voice starts (synced A/V start)",
+      "note": "MuseTalk -> browser: under steady (default) the voice is held for the MUSETALK_LEAD_FRAMES render cushion, then released paced to the real rendered frames. This synced start is TTFO."
+    }
+  ],
+  "metrics": [
+    {
+      "k": "TTFO",
+      "v": "2.0",
+      "u": "s",
+      "n": "target 3s",
+      "tag": "ok"
+    },
+    {
+      "k": "Startup (connect -> 1st frame)",
+      "v": "11.06",
+      "u": "s",
+      "n": "incl. idle warmup",
+      "tag": ""
+    },
+    {
+      "k": "Received video",
+      "v": "12.2",
+      "u": "fps",
+      "n": "server output rate",
+      "tag": "ok"
+    },
+    {
+      "k": "Frame interval",
+      "v": "81.9",
+      "u": "ms mean",
+      "n": "p95 97.1 - max 109.7",
+      "tag": ""
+    },
+    {
+      "k": "Freeze (max gap)",
+      "v": "110",
+      "u": "ms",
+      "n": "OK <500ms",
+      "tag": "ok"
+    },
+    {
+      "k": "Audio arrival gap",
+      "v": "55.0",
+      "u": "ms max",
+      "n": "p95 42.8ms",
+      "tag": "warn"
+    },
+    {
+      "k": "Lip offset",
+      "v": "n/a",
+      "u": "",
+      "n": "no video in mp4",
+      "tag": ""
+    },
+    {
+      "k": "Frames / audio pkts",
+      "v": "415",
+      "u": "/ 1802",
+      "n": "over the capture",
+      "tag": ""
+    }
+  ],
+  "waterfall": [
+    {
+      "stage": "STT finalize -> LLM",
+      "delta": 0.0,
+      "cum": 0.0,
+      "source": "assumed",
+      "status": "ok"
+    },
+    {
+      "stage": "LLM first token",
+      "delta": 0.599,
+      "cum": 0.599,
+      "source": "log",
+      "status": "ok"
+    },
+    {
+      "stage": "LLM -> TTS (sentence-1 flush)",
+      "delta": 0.007,
+      "cum": 0.606,
+      "source": "log",
+      "status": "ok"
+    },
+    {
+      "stage": "TTS synth first chunk",
+      "delta": 0.766,
+      "cum": 1.372,
+      "source": "log",
+      "status": "ok"
+    },
+    {
+      "stage": "TTS -> bot-start (steady lead-hold)",
+      "delta": 0.626,
+      "cum": 1.998,
+      "source": "log",
+      "status": "ok"
+    },
+    {
+      "stage": "Transport + encode + network",
+      "delta": null,
+      "cum": null,
+      "source": "probe",
+      "status": "unknown"
+    },
+    {
+      "stage": "Browser jitter + decode + playout",
+      "delta": null,
+      "cum": null,
+      "source": "est",
+      "status": "unknown"
+    },
+    {
+      "stage": "END-TO-END, user hears",
+      "delta": null,
+      "cum": 1.998,
+      "source": "",
+      "status": "total"
+    }
+  ],
+  "raw": {
+    "probe": {
+      "video_frames": 415,
+      "audio_packets": 1802,
+      "startup_s": 11.06,
+      "recv_fps": 12.2,
+      "frame_ms_mean": 81.9,
+      "frame_ms_p95": 97.1,
+      "frame_ms_max": 109.7,
+      "freeze_ms": 110,
+      "audio_gap_p95_ms": 42.8,
+      "audio_gap_max_ms": 55.0,
+      "lip_offset": null,
+      "lip_offset_note": "no video in mp4"
+    },
+    "ttfo_s": 2.0,
+    "anchors": {
+      "llm_recv": 0.0,
+      "llm_ttfb": 0.599,
+      "tts_recv": 0.606,
+      "tts_ttfb": 1.372,
+      "bot_started": 1.998,
+      "client_arrival": null,
+      "playout": null
+    },
+    "sentences": [
+      [
+        0.606,
+        "I can hear you loud and clear."
+      ],
+      [
+        1.375,
+        "The current weather depends on your location, though - could you tell me your city or region?"
+      ],
+      [
+        2.846,
+        "I'd be happy to provide a local forecast."
+      ]
+    ],
+    "tts_ttfb": [
+      [
+        1.372,
+        0.766
+      ],
+      [
+        2.841,
+        1.466
+      ],
+      [
+        3.849,
+        1.003
+      ]
+    ]
+  }
+}

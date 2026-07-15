@@ -43,7 +43,10 @@ _Campaign date: 2026-07-16 (zh + en TTFO campaigns, Tasks 2–3 of the paper pla
 - 10 runs per language, each a fresh probe connection (= fresh session; the single-client avatar
   server drops the previous session), `python -m scripts.measure`.
 - zh mic wav: `output/_zh_q_def.wav` (`q_ai.wav` stopped transcribing on Deepgram 2026-07-15).
-- en mic wav: recorded below after Task 3's verification step.
+- en mic wav: `output/_en_q.wav` — transcribes as "HELLO CAN YOU HEAR ME WHAT IS THE WEATHER
+  LIKE TODAY" (verified before the campaign, 2026-07-16 00:16, TTFO 2.02 s on the check run).
+- After the en campaign `.env` `LANGUAGE` was restored to `zh` and verified with a throwaway
+  zh run (2026-07-16 00:27, question transcribed in Chinese, TTFO 3.84 s).
 - Known outlier source: Groq provider congestion adds ~2–3 s to the LLM row on occasional runs;
   such runs are kept (p95 is meant to see them) and noted below.
 
@@ -61,3 +64,7 @@ _Campaign date: 2026-07-16 (zh + en TTFO campaigns, Tasks 2–3 of the paper pla
   turn populates it"). The campaign's LLM row therefore measures overlap, not the LLM hop; the
   citable real-turn LLM numbers are the development-time Groq-pin measurements (zh 0.80 s / en
   0.67 s median). The paper must label this.
+- **en campaign (2026-07-16 00:17–00:25):** TTFO per-run 2.30, 2.26, 2.78, 1.88, 2.83, 2.24,
+  2.00, 2.16, 1.86, 2.12 s — tight band, no outliers; the zh campaign's late-run lead-hold
+  inflation did not recur (different question length and a different GPU-load moment; treat the
+  zh p95 as the honest tail, not a fluke to discard).
