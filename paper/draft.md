@@ -6,11 +6,64 @@ bibliography: references.bib
 
 # Abstract
 
-<!-- Task 12 -->
+We present VisualLLm, a real-time conversational agent that turns a user's speech into a
+photoreal talking-head answer — speech recognition, language model, speech synthesis, and
+lip-synchronized video — running fully streaming and fully local on a single consumer GPU. On
+an RTX 5060 Ti (16 GB), the system reaches a median time-to-first-output of 2.20 s (English)
+and 2.92 s (Mandarin) over fresh-session trials, with the whole stack resident in ~5.6 GB of
+GPU memory, and supports multiple languages and swappable avatar identities. The contribution
+is architectural rather than model-level: a linear streaming pipeline in which every stage
+overlaps its successor; per-language latency engineering grounded in a measurement methodology
+that attributes every millisecond from the end of the user's utterance to the user's ear; and
+an audio–visual synchronization design in which each rendered frame declares the audio
+position it covers, making lip drift structurally impossible rather than heuristically
+corrected. We report the measured cost of each design decision, the engineering lessons —
+including two systematic ways latency instruments and human perception disagree — and the
+limitations of the current system.
 
 # 1. Introduction
 
-<!-- Task 12 -->
+Embodied conversational agents — systems you *talk to* and that answer as a talking face —
+are commercially available today as cloud services, and as research prototypes at the model
+level. Between the two lies a gap this paper addresses: what does it take, architecturally,
+to run the entire loop — speech in, photoreal lip-synchronized speech-and-video out — on one
+consumer GPU, with no per-minute API bill, no audio or video leaving the machine, and latency
+low enough for conversation?
+
+The latency question is the sharp one. A conversational turn tolerates roughly three seconds
+before it stops feeling like dialogue; a naive serial composition of even good local
+components (transcribe, then generate, then synthesize, then render) spends that budget
+several times over. And local operation on a single card creates a problem cloud
+architectures never face: the speech synthesizer and the video renderer *contend for the same
+GPU*, so the renderer cannot promise a frame rate, and audio–visual synchronization becomes a
+first-class design problem rather than a transport detail.
+
+This paper describes VisualLLm, a system built to answer that question, and reports what it
+measures. The design principles are: stream everything (the language model's first sentence
+is being spoken before the answer is finished being generated, §3); spend engineering where
+the measured milliseconds are (a to-the-ear latency waterfall attributes every stage, §4);
+and make synchronization structural (every rendered frame carries the renderer's own account
+of the audio it covers, §5).
+
+Concretely, the contributions are:
+
+1. **An end-to-end streaming architecture** for a fully local, multilingual talking-head
+   agent on one consumer GPU, in which every stage is a configuration-selected single
+   provider with a local alternative (§3).
+2. **Per-language time-to-first-output engineering** and the measurement methodology that
+   drives it: a same-clock waterfall from end-of-utterance to the user's ear, and levers
+   whose measured effects are reported individually (§4, Table 2).
+3. **A drift-free audio–visual synchronization mechanism**: video-master pacing driven by
+   per-frame audio-position metadata declared by the renderer, verified by an exact
+   per-turn invariant (§5).
+4. **Resource engineering** that fits the TTS language model (on vLLM) and the TensorRT
+   renderer in ~5.6 GB of shared VRAM (§3.4, §6.4).
+
+We evaluate on the deployment hardware with 10 fresh-session trials per language (§6):
+median time-to-first-output 2.92 s (Mandarin) and 2.20 s (English), ~5.6 GB resident, 12 fps
+delivered video, end-of-turn A/V drift within ±0.04 s. Section 7 reports the engineering
+lessons — including where automated latency probes and human perception systematically
+disagree — and the system's honest limitations.
 
 # 2. Related Work
 
@@ -380,7 +433,15 @@ sessions.
 
 # 8. Conclusion
 
-<!-- Task 12 -->
+VisualLLm demonstrates that a photoreal, multilingual, speech-to-speech talking-head agent is
+achievable on one consumer GPU with open models and careful system architecture: stream every
+stage, measure to the ear, and make audio–visual synchronization a declared per-frame contract
+instead of a heuristic. The measured result — ~2.2–2.9 s median to the first synchronized
+audio-and-video of an answer, in ~5.6 GB of VRAM — was reached not by a new model but by an
+accumulation of individually measured architectural decisions, each reported here with its
+cost or win. We believe the sync design (§5) and the measurement discipline (§4, §7) transfer
+directly to other real-time multimodal systems; the natural next steps are a formal perceptual
+study, multi-client serving, and closing the long-session degradation issue.
 
 # References
 
