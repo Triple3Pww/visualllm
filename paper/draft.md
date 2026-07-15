@@ -136,7 +136,77 @@ untouched.
 
 # 4. Latency Engineering
 
-<!-- Task 9 -->
+![Fig. 2. Per-stage latency to the user's ear, median stage deltas over 10 fresh sessions per
+language. The LLM segment is near zero in this probe because the synthetic microphone drive
+lets generation overlap the tail of the recorded utterance; on real turns the LLM hop is
+~0.7–0.9 s (see §4.3). Bar totals are sums of independently computed stage medians; median
+TTFO is reported in Table 3.](figures/waterfall.png)
+
+## 4.1 The metric and how it is measured
+
+Our primary metric is **time-to-first-output (TTFO)**: the interval from the instant the turn
+analyzer declares the user's utterance finished (t0) to the instant the synchronized
+audio+video answer starts toward the client. We additionally measure the remaining path to the
+user's ear with a headless WebRTC probe that runs on the same machine as the pipeline — the
+pipeline log's t0 and the probe's packet-arrival clock are then the *same wall clock*, so
+per-stage log anchors and client-side arrival times stitch into one waterfall that sums to a
+true end-to-end number (Fig. 2). Only the final segment (browser jitter buffer and playout,
+~0.15 s) is an estimate rather than a measurement. What TTFO deliberately does *not* include is
+the turn-end detection time before t0: voice-activity and semantic turn-end decisions are
+latency the user feels but that no post-t0 engineering can recover, and we report them as out
+of scope.
+
+## 4.2 Where the time goes
+
+At the measured baseline (Table 3: median TTFO 2.92 s zh, 2.20 s en), the two dominant post-t0
+costs are the TTS first chunk (median 0.89 s in both languages) and the synchronized-start
+lead-hold (median 0.60–0.64 s; §5) — the LLM hop, transport, and playout make up the rest.
+This profile is the *result* of the engineering below; at the project's start the same path
+cost 7–8 s on bad turns.
+
+## 4.3 The levers
+
+**Serve the TTS language model properly.** CosyVoice's autoregressive LM originally ran in
+plain PyTorch, costing ~3.4 s to first audio. Moving that model onto vLLM [@vllm2023] (with
+CUDA graphs on) cut first-chunk latency to ~1.1 s — the single largest win, and the one that
+turned the avatar's lip-start lag from a defect into a tuning problem. One subtlety: vLLM's
+serving optimizations silently dropped CosyVoice's repetition-aware sampling, which
+intermittently looped Chinese synthesis on the silence token (a 4 s sentence becoming 12 s of
+dead air); it was restored as a custom logits processor.
+
+**Send the TTS a clause, not a paragraph.** CosyVoice prefills its entire input sentence
+before emitting the first audio token, so first-chunk cost scales with *input* length — a
+16-word opening sentence cost ~3.0 s where a short clause costs ~1.7 s. The pipeline therefore
+flushes the turn's first *clause* to TTS early. The split is language-specific. For English,
+split at a comma or word boundary within an 18–32 character window (measured: TTFO ~4.6 →
+~3.2 s). For Chinese — where the English rule never fires (no ASCII commas, no spaces) — split
+only at full-width punctuation (，；：), never at a character cap, because a cap cuts inside
+words; with a 5-character minimum so the first clause's audio covers the next clause's
+synthesis (measured on long-opener turns: 4.78 → 3.08 s, with 59–65 ms audio gaps — no audible
+pause).
+
+**Pin the LLM route.** The LLM hop is a cloud round-trip with provider-dependent variance;
+routed by default, it cost 1.6 s median (zh) with a 7–8 s tail. Pinning the OpenAI-compatible
+router to a single fast inference provider cut it to 0.80 s (zh) / 0.67 s (en) median on real
+turns and eliminated the tail — configuration, not code. (Fig. 2 shows this row near zero
+because the probe's recorded utterance lets generation overlap the end of "speech"; the
+real-turn numbers are the honest ones.)
+
+**Accept the lead-hold.** The remaining large segment, the ~0.6 s synchronized-start cushion,
+is §5's deliberate tradeoff: 14 lip frames must exist before the voice starts. Every attempt
+to shrink it below 14 frames passed the automated probe and failed human viewing (delay or
+visible freezes) — it is the price of a face that is moving when the voice begins, and we
+report it as such rather than tuning it away on instrument evidence (§7).
+
+**Table 2. Levers and their measured effect (development-time A/B measurements).**
+
+| Lever | Before → after |
+|---|---|
+| TTS LM on vLLM (vs PyTorch serving) | first chunk ~3.4 → ~1.1 s |
+| First-clause flush, en (18–32 char window) | TTFO ~4.6 → ~3.2 s |
+| First-clause flush, zh (full-width punctuation only) | long-opener turns 4.78 → 3.08 s |
+| LLM provider pin | LLM hop 1.64 → 0.80 s median (zh), tail eliminated |
+| TensorRT render path (enables §5's video-master sync) | per-segment render 389 → 255 ms |
 
 # 5. Audio–Visual Synchronization
 
