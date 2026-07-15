@@ -2143,3 +2143,37 @@ free that reports 165 MiB when you expected 1,800 is not "partially working", it
 object died (the one whose inner attr you nulled) and which didn't (the one you only unbound a name from).
 And when a del "doesn't work", check who else holds a reference **including the enclosing frame's locals** —
 an isolated repro that frees fine proves it's a liveness problem, not an allocator problem.
+
+## P51 — per-frame audio coupling (proto 2): the server now DECLARES what each frame is, ending two heuristics ✅ SHIPPED (2026-07-15, 24th session)
+
+**Not a bug fix — a structural closure of two shipped ones.** The steady-mode client paired voice to video by
+*inference*: frame `i` gets the audio up to `i/fps` (index arithmetic), and a held/duplicate frame was detected
+by comparing bytes with `_vbuf[-1]` (P39's heuristic, resting on "genuine consecutive renders are never
+byte-identical"). Both worked, but both were the client GUESSING what the server already knew. P47.3 (the fps
+split-brain) showed where that class of guessing ends up.
+
+**Change (idea mined from OpenAvatarChat's MuseTalk handler, `docs/research/ttfo-sub-1.5s.md` follow-up):** every
+server→client ws frame can carry a 16-byte header — `MTF2` magic, `kind` (0 = real render, 1 = held re-send,
+2 = idle/neutral), `audio_pos` (cumulative REAL 16k samples of the turn covered once this frame shows;
+speech_end zero-pad excluded). The client releases voice up to `audio_pos/16000` when it emits that frame — the
+pairing is the server's own account of what it consumed, so **an fps disagreement can no longer shift the
+audio↔lip mapping, and a held frame is a declared fact instead of a byte-compare guess**. OpenAvatarChat couples
+the literal audio bytes into the frame packet; we translated it to *metadata* because our delivered voice is the
+original 24 kHz TTS audio and the server only sees a 16 kHz lip-sync copy — bytes-in-packet would have downgraded
+the heard voice.
+
+**Compatibility:** opt-in negotiation (`"proto": 2` in the client config, `{"type":"proto","v":2}` ack; the
+client resets to proto 1 per reconnect so an older server downgrades cleanly). Clients that never ask — the
+offline harnesses `_capture.py` / `_drive_frames.py` / `_capture_synced.py` and the archive tests — get the
+bare-frame wire byte-identical. The P10 audio-cap stays for proto 1 only (a proto-2 `audio_pos` can never exceed
+audio the client already buffered: `_abuf.append` happens in the same `process_frame` call that queues the feed).
+
+**Verified:** proto2 probe — 69 real frames, kinds {0,1,2}, final pos == fed samples EXACTLY (90970/90970);
+`_drive_frames` (proto 1) unchanged (162/163 = audio×fps −1); preflight + all four archive regressions PASS
+(`_sync_routing`, `_screech_repro`, `_interrupt_flush`, `_frame_deficit`); live measure ×3 with proto 2 active —
+TTFO 3.56/6.53*/3.61s vs baseline 3.69/3.84/2.53s (*the 6.53 was a 3.93s Groq LLM tail spike, avatar rows
+normal), 12 fps steady, freeze ≤121 ms, `[avatar timing]` end drift ±0.04s, held/dup counter still sane (4 =
+lead-prime). **Awaiting the user's live eye on /studio/ (P19: the probe passes what the eye rejects).**
+
+**Lesson:** when one side of a wire infers what the other side knows, the inference is a bug that hasn't
+happened yet. The cheapest fix for a heuristic is a protocol field.

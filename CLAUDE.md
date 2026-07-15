@@ -425,10 +425,20 @@ render path — it runs AFTER TRT init + free-torch + GPU-composite (2026-07-15;
 before them, warming the torch UNet/VAE that `MUSETALK_FREE_TORCH` was about to free while
 leaving the TRT engines' first execution cold for the first real turn). The wire contract:
 
-- Client → server: a `config` json, `speech_start`/`speech_end`/`reset` json, and
-  binary **16 kHz mono PCM** chunks (the TTS audio, resampled client-side).
+- Client → server: a `config` json (incl. `"proto": 2` — see below), `speech_start`/`speech_end`/`reset` json,
+  and binary **16 kHz mono PCM** chunks (the TTS audio, resampled client-side).
 - Server → client: binary RGB frame buffers at a steady fps, plus
   `video_start`/`video_clock{frames}`/`video_end` markers (counting only *real* rendered frames).
+- **proto 2 (2026-07-15, P51 — the live default between pipeline and server):** when the client's config asks
+  `"proto": 2` and the server acks `{"type":"proto","v":2}`, every binary frame is prefixed with a 16-byte
+  header (`MTF2` | kind u8 | audio_pos u64): kind 0 = real render / 1 = held re-send / 2 = idle-neutral, and
+  `audio_pos` = cumulative REAL 16k samples of the turn covered once that frame shows. The steady client then
+  releases voice paired to `audio_pos` (the server's own account of what it rendered) instead of `i/fps` index
+  arithmetic, and held frames are declared instead of byte-compare-guessed (P39). An fps mismatch can no longer
+  shift the audio↔lip mapping. Clients that never ask (offline harnesses `_capture.py`/`_drive_frames.py`/
+  `_capture_synced.py`) keep the bare-frame wire byte-identical. Header carries a *position*, not audio bytes —
+  the delivered voice stays the original 24 kHz TTS audio (bytes-in-packet would downgrade it to the 16 kHz
+  lip-sync copy).
 
 **A/V sync default = `steady`** (video-master): the voice is buffered and released **paced to the
 real frames the server reports rendering**, so the voice waits when the render stalls and never
