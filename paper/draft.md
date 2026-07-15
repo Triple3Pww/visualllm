@@ -140,7 +140,69 @@ untouched.
 
 # 5. Audio–Visual Synchronization
 
-<!-- Task 10 -->
+![Fig. 3. Proto-2 coupling under steady (video-master) sync. Every frame declares its kind and
+the cumulative audio position it covers; the client releases voice only up to the position of
+the last real frame shown, so a render stall pauses the voice instead of letting it drift
+ahead.](figures/proto2_sync.svg)
+
+## 5.1 Why synchronization is the hard problem
+
+TTS produces audio faster than real time, and WebRTC will happily deliver it immediately. The
+renderer, however, shares its GPU with the TTS language model and cannot guarantee its frame
+rate under contention. If audio is the master (`live` mode in our system), the voice starts
+instantly and the lips trail by whatever the renderer is behind — under load, visibly. If video
+is the master, the voice must be paced to the frames that were *actually rendered*; done
+naively — pairing audio to frames by index arithmetic (`frame i` covers `i/fps` seconds) — the
+mapping silently breaks whenever the server and client disagree about the frame rate, or when
+the server re-sends a held frame to keep the picture alive during a stall. We shipped and then
+removed exactly such a heuristic layer: byte-comparing frames to *guess* whether one was a held
+re-send, and index arithmetic that an fps misconfiguration could shift without any error
+surfacing.
+
+## 5.2 The frame declares itself
+
+Our current design (Fig. 3) makes the coupling explicit. When the client requests protocol
+version 2 at connection time (acknowledged by the server; older peers keep the bare-frame wire
+format), every binary frame is prefixed with a 16-byte header: a magic tag, a *kind* byte —
+0 = real render, 1 = held re-send, 2 = idle — and a 64-bit *audio position*: the cumulative
+count of real 16 kHz samples of the current turn that are covered once this frame is shown.
+
+The steady-mode client then implements one rule: release buffered voice up to the audio
+position of the last real frame displayed. Held and idle frames are declared, not guessed, and
+advance nothing. Because the position is the renderer's *own account* of what it has rendered,
+a frame-rate mismatch between the processes structurally cannot shift the audio-to-lip mapping
+— the failure mode is gone, not merely handled. This translates OpenAvatarChat's
+audio-bytes-in-packet coupling [@openavatarchat] into metadata: coupling bytes would tie the
+delivered voice to the renderer's 16 kHz working copy, whereas positions let the browser
+receive the original 24 kHz TTS audio.
+
+Two consequences follow. A synced *start*: the voice is held until a small cushion of lip
+frames (14 at 12 fps) is rendered, so speech never begins on a frozen face — this cushion is a
+deliberate latency cost, visible in §4's waterfall, and doubles as the shock absorber for
+mid-turn render hiccups. And a graceful *stall*: if the renderer falls behind, the voice pauses
+and resumes rather than drifting out of sync (the `live` fallback mode inverts the tradeoff:
+instant voice, best-effort lips).
+
+## 5.3 Keeping the renderer at frame rate
+
+Video-master sync is only viable if stalls are rare, which on a shared GPU means the render
+path must hold its budget *under TTS contention*. Porting MuseTalk's UNet and VAE to TensorRT
+[@tensorrt] cut the per-segment render cost from ~389 ms to ~255 ms (8-frame segments), the
+difference between drifting seconds behind on long turns and holding ≥12 fps under load. Two
+non-obvious details mattered: cuDNN autotuning (`cudnn.benchmark`) had to be disabled because
+the turn-start segment's distinct tensor shape triggered a ~16 s re-autotune spike on the first
+segment of *every* turn; and per-segment frame counts use ceiling (not floor) sizing so a frame
+rate that does not divide the audio rate cannot systematically shorten the video against the
+audio.
+
+## 5.4 Verifying synchronization
+
+The header also makes sync *testable*: at end of turn, the last frame's audio position must
+equal the total samples fed — an exact invariant (verified: 90,970 of 90,970 samples in the
+live probe), not a statistical score. Offline capture of the delivered stream shows end-of-turn
+audio/video drift within ±0.04 s. §7 discusses why instrument-level checks like these are
+necessary but not sufficient — final acceptance of every synchronization change in this system
+is a human watching the live avatar.
 
 # 6. Evaluation
 
