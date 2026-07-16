@@ -54,6 +54,14 @@ class SherpaStreamingSTTService(STTService):
         kwargs.setdefault(
             "settings", STTSettings(model="sherpa-onnx-streaming-zipformer-zh-en", language=None, extra={})
         )
+        # ttfs_p99_latency = post-speech-end delay until the FINAL transcript is ready. The turn
+        # strategy (Smart Turn) waits this long after deciding the turn is over, to let a slow
+        # streaming STT's final land -- pure pre-answer dead time. Sherpa yields its final
+        # TranscriptionFrame *synchronously* with the endpoint/VADUserStopped (it is already in hand
+        # at the turn boundary), so its real ttfs is ~0. The base default (1.0s, a cloud-STT guess)
+        # was adding ~1s to every turn's pre-t0 wait -- measured in the mic-to-ear Capture segment.
+        # 0.1s (non-zero, to avoid the stop_secs>=ttfs "collapse" path) trims that ~0.9s.
+        kwargs.setdefault("ttfs_p99_latency", 0.1)
         super().__init__(sample_rate=sample_rate, **kwargs)
         import sherpa_onnx
 
@@ -76,13 +84,13 @@ class SherpaStreamingSTTService(STTService):
         self._stream = self._rec.create_stream()
         self._speaking = False
         # Pause decoding while the bot speaks (avoids transcribing the avatar's own voice as a
-        # phantom turn) ONLY when echo-guard is on. Under the default steady sync the screech fix
-        # pins BOT_VAD_STOP_FALLBACK_SECS=600, so the audio-gap BotStoppedSpeakingFrame never
-        # fires -> the pause would get STUCK True after the first bot turn (the greeting) and drop
-        # every later mic frame (docs/PROBLEMS-AND-FIXES.md P11, same mechanism as the echo-guard
-        # mute). echo-guard is default OFF and only valid with live sync (where BotStopped fires
-        # reliably), so gating on it keeps the mic always-live under steady -- the documented
-        # barge-in/headphones tradeoff -- and never strands the pause.
+        # phantom turn) ONLY when echo-guard is on. Historical reason for the gate: under steady
+        # sync BotStoppedSpeakingFrame never fired (P11) so the pause would get STUCK True after
+        # the first bot turn and drop every later mic frame. That blocker is FIXED (P53,
+        # 2026-07-15: the avatar client holds TTSStoppedFrame until the voice drains, so
+        # BotStopped fires at true end of speech even under steady) -- but the gate stays,
+        # matching echo-guard's own posture: default OFF (barge-in/headphones baseline), and
+        # un-gating deserves its own live test, not a ride-along. docs/PROBLEMS-AND-FIXES.md P11/P53.
         self._pause_while_bot_speaks = pause_while_bot_speaks
         self._bot_speaking = False
         self._last_partial = ""
