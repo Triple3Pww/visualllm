@@ -141,6 +141,9 @@ class MuseTalkVideoService(FrameProcessor):
         self._video_active = False    # between video_start and video_end
         self._unsynced = False        # fallback engaged this turn
         self._fallback_task: asyncio.Task | None = None
+        self._feed_first = None       # first PCM of the turn actually sent ([barge] trace)
+        self._flush_t0 = None         # barge-in window open time + frames it discarded ([barge] log)
+        self._flush_dropped = 0
         self._flushing = False        # barge-in flush: DROP every incoming server frame until the
         #   next turn's TTSStartedFrame. On an InterruptionFrame the audio queue is drained and the
         #   server told to reset, but frames it already rendered are still in flight on the ws (and
@@ -296,6 +299,17 @@ class MuseTalkVideoService(FrameProcessor):
                 if kind == "audio":
                     pcm, dur = payload
                     await self._ws.send(pcm)
+                    # Split the turn-start delay at its ONE ambiguous seam: did WE hold the audio
+                    # (burst budget / pacing / queue backlog), or did the server hold the frames?
+                    # The profiler already showed the GPU flat and a ~1.9s gap between segments on
+                    # a spiked turn, i.e. the renderer was STARVED -- this says who starved it.
+                    if self._feed_first is None:
+                        self._feed_first = _t = asyncio.get_running_loop().time()
+                        if self._t_audio_first is not None:
+                            logger.info(
+                                f"[barge] first PCM on the wire +{(_t - self._t_audio_first)*1000:.0f}ms "
+                                f"after the turn's first TTS chunk (burst_left={self._burst_remaining:.2f}s "
+                                f"qdepth={self._feed_q.qsize()})")
                     if self._burst_remaining > 0:
                         self._burst_remaining -= dur   # BURST: skip the pace so the renderer can
                         #   start the opening frames immediately (kills the ~2s startup starve)
@@ -304,6 +318,7 @@ class MuseTalkVideoService(FrameProcessor):
                 else:
                     if kind == "speech_start":
                         self._burst_remaining = self._burst_s   # reset the burst budget per turn
+                        self._feed_first = None                 # re-arm the per-turn feed trace
                     await self._ws.send(json.dumps({"type": kind}))
             except asyncio.CancelledError:
                 break
@@ -382,6 +397,7 @@ class MuseTalkVideoService(FrameProcessor):
         if self._flushing:
             # Post-interrupt: an old-turn frame still draining from the server (ws + out_q). Drop it
             # entirely -- do not count it, buffer it, or forward it as idle. Cleared on next TTSStarted.
+            self._flush_dropped += 1
             return
         # HELD/dup detection: the server re-sends the last frame during a render underflow (or
         # the lead-prime). A held frame is not new lip motion, so it must neither count as
@@ -731,6 +747,14 @@ class MuseTalkVideoService(FrameProcessor):
             self._cancel_fallback()
             self._reset_turn()
             self._flushing = True   # drop in-flight server frames until the next turn starts
+            # Barge-in is the BASELINE (ALLOW_INTERRUPTIONS=1) and the whole path was silent, so a
+            # barge-in that costs the user latency looked identical to one that did not. Measured
+            # 2026-07-16: ~1 in 4 close-following turns has its first frame land +1.7s late while
+            # the GPU stays flat (per-segment cost identical), i.e. the server renders on time and
+            # THIS flush window drops the frames. These 2 lines make the window's cost visible.
+            self._flush_t0 = asyncio.get_running_loop().time()
+            self._flush_dropped = 0
+            logger.info("[barge] interrupt -> flush ON (dropping server frames until next TTSStarted)")
             await self.push_frame(frame, direction)
 
         elif isinstance(frame, TTSAudioRawFrame):
@@ -782,6 +806,10 @@ class MuseTalkVideoService(FrameProcessor):
                 self._held_tts_stop = None
                 await self.push_frame(sf, sd)
             self._reset_turn()
+            if self._flushing:   # close the barge-in window: how long, and how much it discarded
+                held = asyncio.get_running_loop().time() - (self._flush_t0 or 0.0)
+                logger.info(f"[barge] flush OFF at TTSStarted: window={held:.2f}s "
+                            f"dropped={self._flush_dropped} server frames")
             self._flushing = False   # new turn: stop dropping frames (end the post-interrupt flush)
             if self._dump_pcm:
                 self._pcm_dump = bytearray()

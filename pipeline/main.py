@@ -357,6 +357,82 @@ def _configure_webrtc_video_bitrate() -> None:
     )
 
 
+def _install_send_trace() -> None:
+    """Attribute the measured "transport + encode + network" row instead of guessing at it.
+
+    That row is a RESIDUAL in scripts/measure -- (browser recv - jitter) - bot_started -- so every
+    unmodelled delay in the span lands in it. Measured 2026-07-16: 0.41s through a real browser AND
+    0.33s through the aiortc probe, which has no NetEq, no rAF and no analyser -- so it is real and
+    upstream of the browser, not instrument bias. But its physics floor is ~0.03s (a 10ms track
+    tick + 20ms Opus packetization + a same-box hop), and pipecat's side should be <=10ms BY
+    CONSTRUCTION: BotStartedSpeaking fires one chunk BEFORE write_audio_frame (base_output.py), and
+    RawAudioTrack paces on an absolute 10ms grid anchored at connect, with backpressure
+    (write_audio_frame awaits the future add_audio_bytes only resolves once the chunk has drained).
+    So ~0.25s has no mechanism yet. The surviving hypothesis is loop contention -- the ONE asyncio
+    loop also carries aiortc's RTP, the pipeline and the MuseTalk websocket pump (P47.2) -- and
+    turn start is exactly when it is busiest. This MEASURES that rather than assuming it, because
+    a confident mechanism that never met a probe is what P31/P33 cost us.
+
+    Logs one [send-trace] per idle->speaking transition (and per >0.3s mid-turn stall resume,
+    which steady mode can produce):
+      queue_wait -- queued -> actually emitted by recv(), for the turn's FIRST real chunk. This is
+                    the whole question: ~10ms means the delay is downstream in aiortc/encode/net;
+                    ~200ms means the loop did not wake the track and the fix is offloading.
+      late_now   -- that emitting tick's lateness vs the track's OWN deadline (>0 = loop was late)
+      late_max   -- worst lateness over the preceding ~1s of ticks, for context
+    MEASURE_SEND_TRACE=1 arms it; unset/0 leaves the live path completely untouched."""
+    if (os.getenv("MEASURE_SEND_TRACE", "0") or "0").strip().lower() not in ("1", "true", "yes"):
+        return
+    try:
+        from pipecat.transports.smallwebrtc.transport import RawAudioTrack
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"send-trace skipped (RawAudioTrack import: {e!r}).")
+        return
+    if getattr(RawAudioTrack, "__send_traced", False):
+        return
+    from collections import deque
+
+    _orig_add, _orig_recv = RawAudioTrack.add_audio_bytes, RawAudioTrack.recv
+
+    def _traced_add(self, audio_bytes: bytes):
+        # A turn starts when real audio arrives after a silence gap. Can't key on an empty queue:
+        # write_audio_frame's backpressure drains it between EVERY 40ms chunk, so that would arm
+        # ~25x/sec. Sync (returns the future the caller awaits) -- keep it sync.
+        now = time.time()
+        if now - getattr(self, "_st_last_real", 0.0) > 0.3 and getattr(self, "_st_queued", None) is None:
+            self._st_queued = now
+        return _orig_add(self, audio_bytes)
+
+    async def _traced_recv(self):
+        # Sample lateness BEFORE _orig_recv sleeps on that same deadline, or we'd read it as 0.
+        late_now = 0.0
+        if self._timestamp > 0:
+            late_now = time.time() - (self._start + self._timestamp / self._sample_rate)
+            hist = getattr(self, "_st_late", None)
+            if hist is None:
+                hist = self._st_late = deque(maxlen=100)   # ~1s of 10ms ticks
+            hist.append(late_now)
+        had_audio = bool(self._chunk_queue)   # else _orig_recv emits auto-silence
+        depth = len(self._chunk_queue)
+        frame = await _orig_recv(self)
+        if had_audio:
+            q = getattr(self, "_st_queued", None)
+            if q is not None:
+                late_max = max(getattr(self, "_st_late", None) or [0.0])
+                logger.info(
+                    f"[send-trace] queue_wait={time.time() - q:.3f}s late_now={late_now:+.3f}s "
+                    f"late_max={late_max:+.3f}s depth={depth}"
+                )
+                self._st_queued = None
+            self._st_last_real = time.time()
+        return frame
+
+    RawAudioTrack.add_audio_bytes = _traced_add
+    RawAudioTrack.recv = _traced_recv
+    RawAudioTrack.__send_traced = True
+    logger.info("[send-trace] armed (MEASURE_SEND_TRACE=1): per-turn audio send-path trace.")
+
+
 # All <head> patches for the served /client page collect here and ONE middleware injects
 # them all. Why a shared list: each patch as its own middleware would race to serve the
 # index (the outermost one wins and the others' patches silently vanish); a single
@@ -1046,6 +1122,8 @@ if __name__ == "__main__":
     # nothing. The two that are real FEATURES (jitter buffer + speaker route) now live in the
     # static client, fed by GET /client/ice-config; the other four were one-off diagnostics.)
     _configure_webrtc_video_bitrate()
+    # Attribute the "transport" row's unexplained ~0.25s (no-op unless MEASURE_SEND_TRACE=1).
+    _install_send_trace()
     # Serve the custom studio client at /studio/ (additive; /client stays the fallback).
     # /nimbus/ was a second, ~740-line verbatim JS copy of this page (theme-only diff) and was
     # removed 2026-07-14 -- /studio/ is now the single custom client for every avatar preset.
