@@ -105,6 +105,18 @@ def build_turn(lines, bi, target_s=3.0):
     return turn
 
 
+def smart_turn_trace(lines, t0):
+    """The Smart-Turn end-of-turn verdicts around this turn, as (offset_s_from_t0, verdict).
+    Lets a REAL turn show its pre-t0 cost directly: how many times the model said INCOMPLETE
+    (kept waiting) before COMPLETE, and when. Clip-independent -- works on human speech."""
+    out = []
+    for dt, txt in lines:
+        d = (dt - t0).total_seconds()
+        if -12 <= d <= 1 and "End of Turn result" in txt:
+            out.append((round(d, 3), "COMPLETE" if "COMPLETE" in txt else "INCOMPLETE"))
+    return out
+
+
 def _pick_beacon(lines, target_epoch=None, max_gap=6.0):
     """Pick THIS turn's [client-playout] beacon. Match by the beacon's own `recv` epoch being
     closest to `target_epoch` (the turn's bot-start = when audio should reach the browser) -- this

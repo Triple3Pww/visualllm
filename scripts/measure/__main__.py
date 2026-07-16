@@ -88,6 +88,9 @@ def main():
     ap.add_argument("--offline-capture", action="store_true",
                     help="also drive the MuseTalk server directly for a clean lip offset")
     ap.add_argument("--offline-wav", default="output/reply_concise.wav")
+    ap.add_argument("--observe", action="store_true",
+                    help="don't drive turns -- parse the last N REAL turns you just spoke on "
+                         "/studio/?measure=1 (real human speech + real browser playout)")
     ap.add_argument("--compare", nargs=2, type=int, metavar=("A", "B"),
                     help="diff two run-history rows by index (e.g. -2 -1)")
     ap.add_argument("--machine", default="this box (RTX 5060 Ti, Blackwell)")
@@ -98,8 +101,12 @@ def main():
         report.compare_runs(*args.compare)
         return
 
-    print(f"[1/3] driving {args.turns} turns through the live pipeline...")
-    path_kind, captures = asyncio.run(_drive(args))
+    if args.observe:
+        print(f"[1/3] observe: parsing the last {args.turns} REAL turns (no driving)...")
+        path_kind, captures = "observe", []
+    else:
+        print(f"[1/3] driving {args.turns} turns through the live pipeline...")
+        path_kind, captures = asyncio.run(_drive(args))
 
     print("[2/3] parsing pipeline.log for the driven turns...")
     lines = logparse.parse_lines()
@@ -121,7 +128,7 @@ def main():
         # the probe and browser paths (each turn logs 'User started/stopped speaking').
         capture, onset_rel = None, None
         us = turn.get("user_started")
-        if us is not None:
+        if us is not None and not args.observe:   # observe: human speech length unknown -> no clip
             cap = round((-us) - sdur, 3)
             capture = cap if cap >= 0 else None
         if path_kind == "probe" and k < len(captures):
@@ -148,7 +155,8 @@ def main():
     keys = ANCHOR_KEYS + ["capture"]
     agg = aggregate_turns(anchor_dicts, keys)
     med = agg["median"]
-    rows = build_waterfall(med, playout_source=("browser-audio" if path_kind == "browser" else "est"),
+    has_beacon = any(a.get("playout") is not None for a in anchor_dicts)
+    rows = build_waterfall(med, playout_source=("browser-audio" if has_beacon else "est"),
                            capture=med.get("capture"))
     last = turns_raw[-1]
     stage_medians = {r["stage"]: r["cum"] for r in rows if r["status"] == "ok"}
@@ -170,6 +178,21 @@ def main():
     report.write_outputs(rep)
     report.append_history(rep, {k: os.getenv(k) for k in report.ENV_KNOBS})
     report.print_summary(rep)
+
+    # Pre-t0 detail (clip-independent): the Smart-Turn verdict timeline for the last turn, so a
+    # REAL human turn's end-of-turn cost is visible (how long it deliberated + the ttfs wait).
+    trace = logparse.smart_turn_trace(lines, last["t0"])
+    if trace:
+        print("Smart-Turn end-of-turn trace (last turn, offset from t0 = user-stopped):")
+        for off_s, verdict in trace:
+            print(f"    {off_s:+6.2f}s  {verdict}")
+        comps = [o for o, v in trace if v == "COMPLETE" and o <= 0.05]
+        comp = max(comps) if comps else None   # the COMPLETE that actually ended THIS turn
+        if comp is not None:
+            incs = sum(1 for o, v in trace if v == "INCOMPLETE" and o <= comp)
+            print(f"  -> turn-ending COMPLETE at {comp:+.2f}s, then {-comp:.2f}s (STT ttfs wait) to t0. "
+                  f"INCOMPLETE polls before it = {incs}.")
+        print()
 
 
 if __name__ == "__main__":
