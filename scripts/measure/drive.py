@@ -174,3 +174,67 @@ async def run_browser_turns(mic_wav, n_turns, lead=2.0, tail=6.0):
     except Exception as e:  # noqa: BLE001
         print(f"  [browser] driver error ({e!r}); falling back to the headless probe.")
         return False
+
+
+# ----------------------------------------------------------------- optional offline lip offset
+async def offline_capture(mic_wav: str, fps: int):
+    """Drive the MuseTalk server directly -> mp4 WITH a video track -> a clean lip offset.
+    Runs AFTER the probe disconnected (the server is single-client). Returns {ms, corr} or None."""
+    import json
+    import subprocess
+    import wave
+
+    import websockets
+
+    out_mp4 = str(ROOT / "output" / "measure_offline.mp4")
+    silent = str(ROOT / "output" / "measure_offline_silent.mp4")
+    with wave.open(mic_wav, "rb") as w:
+        sr = w.getframerate(); a = np.frombuffer(w.readframes(w.getnframes()), np.int16)
+    if sr != 16000:
+        a = np.interp(np.linspace(0, len(a) - 1, int(len(a) * 16000 / sr)),
+                      np.arange(len(a)), a).astype(np.int16)
+    frames = []
+    try:
+        async with websockets.connect("ws://localhost:8002/stream", max_size=None) as ws:
+            async def reader():
+                try:
+                    while True:
+                        m = await ws.recv()
+                        if isinstance(m, (bytes, bytearray)):
+                            frames.append(bytes(m))
+                except Exception:
+                    pass
+            rt = asyncio.create_task(reader())
+            await ws.send(json.dumps({"type": "config", "fps": fps}))
+            await ws.send(json.dumps({"type": "speech_start"}))
+            ch = int(16000 * 0.02)
+            for i in range(0, len(a), ch):
+                await ws.send(a[i:i + ch].tobytes())
+                await asyncio.sleep(0.02)
+            await ws.send(json.dumps({"type": "speech_end"}))
+            await asyncio.sleep(2.0)
+            rt.cancel()
+    except Exception as e:  # noqa: BLE001
+        print(f"  offline-capture skipped ({e!r})")
+        return None
+    if len(frames) < 10:
+        print("  offline-capture: too few frames"); return None
+    import cv2
+    side = int(round((len(frames[0]) / 3) ** 0.5))
+    vw = cv2.VideoWriter(silent, cv2.VideoWriter_fourcc(*"mp4v"), fps, (side, side))
+    for fb in frames:
+        arr = np.frombuffer(fb, np.uint8).reshape(side, side, 3)
+        vw.write(cv2.cvtColor(arr, cv2.COLOR_RGB2BGR))
+    vw.release()
+    ffmpeg = r"E:\miniconda3\envs\tts\Library\bin\ffmpeg.exe"
+    try:
+        subprocess.run([ffmpeg, "-y", "-i", silent, "-i", mic_wav, "-c:v", "libx264",
+                        "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", out_mp4],
+                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:  # noqa: BLE001
+        print(f"  offline-capture mux failed ({e!r})"); return None
+    off, corr, err = lip_offset_from_mp4(out_mp4, fps)
+    if err:
+        print(f"  offline lip offset unavailable ({err})"); return None
+    print(f"  offline capture: {len(frames)} frames -> {out_mp4}")
+    return dict(ms=round(off * 1000), corr=round(corr, 2))
