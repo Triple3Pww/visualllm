@@ -32,6 +32,30 @@ def test_onset_all_silence_returns_none():
     assert answer_onset_epoch([(1.0, 0.0), (1.1, 0.0), (1.2, 0.0)], 0.0) is None
 
 
+def test_onset_is_not_dragged_late_by_a_loud_later_passage():
+    """Onset must anchor on AUDIO ARRIVING, not on the reply getting loud.
+
+    The threshold was 18% of the WHOLE post-t0 window's peak, so a loud passage LATER in the
+    answer raised the bar retroactively and pushed the reported onset hundreds of ms late.
+    That time then billed to 'Transport + encode + network' -- a row whose real floor is ~30ms.
+    Measured live 2026-07-16 on one turn: 0.271s reported vs 0.116s of actual transport (a
+    0.154s attack-envelope bias), and a reply with loud late dynamics drove the same row to a
+    physically impossible 3.37s on a loopback hop. The old square-wave tests could not catch
+    this: they step 0.0 -> 0.6, which clears ANY fraction of the peak.
+    """
+    t0, dt = 0.0, 0.02
+    samples = (
+        [(t0 + i * dt, 0.0) for i in range(10)]                 # silence: 0.00 -> 0.20s
+        + [(0.20 + i * dt, 0.10) for i in range(40)]            # quiet opening word @ +0.20s
+        + [(1.00 + i * dt, 1.00) for i in range(40)]            # loud passage later: peak = 1.0
+    )
+    onset = answer_onset_epoch(samples, t0)
+    # The audio arrived at +0.20s. Anchoring on 18% of the 1.0 peak misses the 0.10 opening
+    # entirely and reports +1.00s -- 0.8s of pure fiction attributed to the network.
+    assert onset is not None
+    assert abs(onset - 0.20) < 1e-6, f"onset dragged to +{onset:.2f}s by the later loud passage"
+
+
 def test_waterfall_deltas_telescope_to_total():
     anchors = dict(llm_recv=0.0, llm_ttfb=0.68, tts_recv=1.05, tts_ttfb=2.45,
                    bot_started=2.75, client_arrival=2.97, playout=3.12)

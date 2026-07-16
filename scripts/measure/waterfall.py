@@ -21,13 +21,30 @@ _WATERFALL_STAGES = [
 ANCHOR_KEYS = [s[1] for s in _WATERFALL_STAGES]
 
 
-def answer_onset_epoch(samples, t0_epoch, guard=0.15, thresh_frac=0.18, run=3):
-    """First SUSTAINED energetic audio frame after t0 = the answer reaching the client.
+def answer_onset_epoch(samples, t0_epoch, guard=0.15, thresh_frac=0.02, run=3):
+    """First SUSTAINED audio frame after t0 = the answer ARRIVING at the client.
 
     samples: list of (arrival_epoch, rms). Frames at/after t0_epoch+guard are considered, so the
     greeting (well before t0) and inter-turn silence are skipped; the threshold is a fraction of
     the post-t0 peak, and `run` consecutive frames must clear it so a lone spike doesn't trigger.
     Returns the onset epoch (same clock as the log's t0), or None.
+
+    thresh_frac detects PRESENCE (audio vs digital silence), NOT loudness -- this is an arrival
+    anchor, and the caller bills everything before it to "Transport + encode + network", a row
+    whose physics floor is ~30ms. It was 0.18 (2026-07-16): 18% of the WHOLE reply's peak, so a
+    loud passage LATER in the answer raised the bar retroactively and dragged the reported onset
+    late. Measured live on one turn: 0.271s reported vs 0.116s of real transport (a 0.154s
+    attack-envelope bias), and a reply with loud late dynamics drove the same row to 3.37s -- on
+    a loopback hop, i.e. ~100x the floor. The bias was content-dependent, which is why that row
+    "varied" 0.27-0.91s across turns and read as network jitter.
+
+    0.02 sits far above the noise floor (inter-turn audio measures a true digital 0.0000: the
+    send track emits exact-zero silence when idle) and far below speech level, so it triggers on
+    the first real signal instead of waiting out the first word's attack. Kept as a FRACTION, not
+    an absolute: the probe scores rms on int16 samples (peak ~2.7e3) while the browser beacon
+    scores it normalized (peak ~1.0), and only a fraction ports across both. `run` still rejects
+    a lone spike. NOTE: runs recorded before this change measured the old anchor, so that row is
+    not comparable across the 2026-07-16 commit -- `--compare` will show a step it did not earn.
     """
     win = [(t, r) for (t, r) in samples if t >= t0_epoch + guard]
     if len(win) < run:
