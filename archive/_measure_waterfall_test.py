@@ -125,6 +125,15 @@ def test_aggregate_ignores_none_anchors():
     assert abs(agg["median"]["tts_ttfb"] - 2.2) < 1e-6    # None dropped
 
 
+def test_history_append_and_read(tmp_path, monkeypatch):
+    import scripts.measure.report as rep
+    monkeypatch.setattr(rep, "HISTORY", tmp_path / "h.jsonl")
+    rep.append_history({"meta": {"when": "2026-07-16 12:00", "turns": 5, "e2e_median": 2.9,
+                                 "stage_medians": {"LLM first token": 0.7}}}, {"LANGUAGE": "zh"})
+    rows = rep.read_history()
+    assert rows[-1]["e2e_median"] == 2.9 and rows[-1]["env"]["LANGUAGE"] == "zh"
+
+
 def main():
     for fn in list(globals().values()):
         if callable(fn) and getattr(fn, "__name__", "").startswith("test_"):

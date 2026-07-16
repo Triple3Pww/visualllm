@@ -73,7 +73,7 @@ def build_turn(lines, bi, target_s=3.0):
 
     win = [(dt, txt) for dt, txt in lines if -3 <= (dt - t0).total_seconds() <= 60]
     user_started = llm_ttfb = render = bot_stopped = None
-    sentences, tts_ttfb = [], []
+    sentences, tts_ttfb, tts_proc = [], [], []
     for dt, txt in win:
         if "User started speaking" in txt and user_started is None:
             user_started = off(dt)
@@ -84,6 +84,8 @@ def build_turn(lines, bi, target_s=3.0):
             sentences.append((off(dt), m1.group(1)))
         if "CosyVoiceTTSService" in txt and "TTFB:" in txt and dt >= t0:
             tts_ttfb.append((off(dt), float(re.search(r"TTFB: ([\d.]+)s", txt).group(1))))
+        if "CosyVoiceTTSService" in txt and "processing time:" in txt and dt >= t0:
+            tts_proc.append(off(dt))
         if render is None and "[render] first-frame" in txt and dt >= t0:
             render = off(dt)
         if "Bot stopped speaking based on TTSStoppedFrame" in txt:
@@ -93,7 +95,7 @@ def build_turn(lines, bi, target_s=3.0):
                 llm_recv=llm_recv if llm_recv is not None else 0.0,
                 llm_ttfb=llm_ttfb, render=render, bot_stopped=bot_stopped,
                 tts_recv=sentences[0][0] if sentences else None,
-                tts_ttfb=tts_ttfb, sentences=sentences)
+                tts_ttfb=tts_ttfb, tts_proc=tts_proc, sentences=sentences)
     return turn
 
 
