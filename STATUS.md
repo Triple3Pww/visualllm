@@ -20,11 +20,30 @@ The waterfall is now **~11 stages from the true mic moment to the ear**, each ta
   number), and **run-history** (`output/measure_history.jsonl`) + `--compare A B` for "did this change help?".
 The HTML timeline (`docs/workflow-timeline.html`) gains the lever column, source tags, the capture row, a
 degradation card, and an end-to-end sparkline. **`pipeline/metrics.py` (TtfoMeter) still UNTOUCHED** — the
-waterfall is derived in `scripts/measure/`. Verified live (probe path, real stack): capture 1.46s, LLM/TTS/
-transport all measured, e2e 3.78s; 17 unit tests pass; HTML checked in headless Chromium (no console errors).
-**To light up the render + real-browser rows: RESTART the avatar + pipeline** (the running processes predate the
-`[render] line + beacon endpoint + `/studio` beacon), then `python -m scripts.measure --turns 5`. UNCOMMITTED-run
-artifacts (`measure_data.js`) regenerate each run. Spec/plan: `docs/superpowers/{specs,plans}/2026-07-16-*`._
+waterfall is derived in `scripts/measure/`. 17 unit tests pass; HTML checked in headless Chromium (no console
+errors). Spec/plan: `docs/superpowers/{specs,plans}/2026-07-16-*`.
+
+**AND IT IMMEDIATELY PAID FOR ITSELF — P54, a full second nobody could see.** The harness's new pre-t0
+Capture segment exposed ~1.0s of dead wait on EVERY turn: after Smart Turn v3 says `COMPLETE`, the turn
+strategy waits `ttfs_p99_latency` for the STT's final transcript, and **sherpa never declared one** → pipecat's
+**1.0s cloud-STT default** — while sherpa's final transcript is *already in hand* (emitted synchronously with
+the endpoint). Fix = one line, `kwargs.setdefault("ttfs_p99_latency", 0.1)` in `sherpa_stt.py`. **`COMPLETE→t0`
+1.0s → 0.09s, verified across probe + 5 real human turns.** Content is unaffected (the wait is entirely
+post-transcript). `VAD_STOP_SECS` was NOT the lever — under `ALLOW_INTERRUPTIONS=1` the log shows
+`stop_secs 0.0`; Smart Turn owns the boundary. Full write-up: `docs/PROBLEMS-AND-FIXES.md` **P54**.
+
+**THE SYNTHETIC MIC LIED (again — P19/P33's rule, now in the other direction).** The clip
+`_zh_q_def.wav` has a 0.74s comma pause, so Smart Turn (which re-polls once per VAD pause) said INCOMPLETE
+twice → an apparent **~1.6s** pre-t0 cost. **On 5 REAL human turns: 0 INCOMPLETE polls, every single turn.**
+The ~1.9s "interval" is no constant — it is just the spacing of the clip's pauses. So: **judge pre-t0 from
+`--observe` on real speech, never from the driven clip.** New `--observe` mode parses the last N turns you
+actually spoke on `/studio/?measure=1` (no driving) and prints the Smart-Turn verdict trace.
+
+**THE REAL NUMBERS (5 real human turns, real mic + real browser playout) — full per-turn matrix +
+what-to-attack-next in `docs/LATENCY-MATRIX.md`:** median mic-to-ear **2.91s** = LLM 0.69 + TTS **0.93**
+(the biggest row) + render 0.56 + transport 0.41 + jitter 0.13 + playout 0.06; STT→LLM and lead-hold both
+measure **0.00**. Pre-t0 is now ~0.1s. Next lever = the TTS first chunk (confirm `COSYVOICE_FIRST_PIECE`
+actually fires on the en path). Live stack was restarted via the config panel and is healthy on this code._
 
 _Last updated: 2026-07-15 (**27th session — two root-cause fixes from the "hardcode vs root cause" audit.**
 

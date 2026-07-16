@@ -176,6 +176,15 @@ VAD only supplies the speech segmentation it runs on. So `VAD_STOP_SECS` *shapes
 it. And none of it ever appears in TTFO, whose **t0 IS the turn-end** — it is latency the user feels but the metric
 cannot see. (Log quirk: on the FIRST connection of a process that `VAD:` line goes to stdout only — the file sink
 attaches later — so look for it on a subsequent connection.)
+**The pre-t0 lever that ACTUALLY paid (2026-07-16, P54) is `ttfs_p99_latency`, NOT the VAD.** After Smart Turn returns
+`COMPLETE`, the strategy still waits `ttfs_p99_latency - stop_secs` for the STT's final transcript (it short-circuits
+only on `TranscriptionFrame.finalized=True`, which sherpa's/Deepgram's streaming path never sets). Sherpa declared no
+value → pipecat's **1.0s cloud-STT default** (`ttfs_p99_latency not set, using default 1.0s` in the log) → a flat **1.0s
+of dead wait every turn**, though sherpa emits its final transcript *synchronously with the endpoint* (already in hand).
+Fixed by `kwargs.setdefault("ttfs_p99_latency", 0.1)` in `sherpa_stt.py` (non-zero avoids the `stop_secs>=ttfs` collapse
+path): `COMPLETE→t0` **1.0s → 0.09s**; content unaffected (the wait is entirely POST-transcript, so it delays only WHEN
+the turn fires, never WHAT it contains). If you swap STT, declare its REAL measured value — the default is a guess about
+someone else's service, billed to you every turn. `docs/PROBLEMS-AND-FIXES.md` P54 · matrix: `docs/LATENCY-MATRIX.md`.
 
 **Removed 2026-07-14 (dead-code audit): the `moss` / `elevenlabs` / `deepgram` TTS branches and the
 `funasr` STT branch.** None had ever been selected -- the stack has always been Deepgram STT ->
@@ -370,8 +379,16 @@ python -m scripts.preflight
 # __main__.py (orchestration). Drives N turns, writes output/measure_report.json + docs/measure_data.js
 # (docs/workflow-timeline.html auto-uses it) + appends output/measure_history.jsonl.
 python -m scripts.measure --turns 5                                # real Chromium (true browser E+F) + fallback probe
+python -m scripts.measure --observe --turns 5                      # DON'T drive: parse the last N turns YOU just spoke
 python -m scripts.measure --no-browser --turns 3 --offline-capture # headless probe: precise capture + arrival, est playout
 python -m scripts.measure --compare -2 -1                          # diff the last two history runs (did a change help?)
+#   PRE-t0 vs POST-t0: TTFO's stopwatch STARTS at t0 (user-stopped), so it can NEVER see the cost of
+#   DECIDING t0. Felt delay = pre-t0 + post-t0. That blind spot hid a full second (P54). The measured
+#   real-turn matrix + what-to-attack-next lives in `docs/LATENCY-MATRIX.md` (median mic-to-ear 2.91s).
+#   JUDGE PRE-t0 ONLY FROM `--observe` ON REAL SPEECH: the synthetic clip's comma pause makes Smart Turn
+#   re-poll (it re-runs once per VAD pause) and INVENTS a ~1.6s pre-t0 cost real speech does not have
+#   (5 real turns: 0 INCOMPLETE polls). `--observe` leaves Capture blank on purpose (human speech length
+#   unknown -- it refuses to fake it) and prints the Smart-Turn verdict trace instead.
 #   The ~11-stage WATERFALL runs from the true MIC moment to the user's EAR, each row tagged with its
 #   SOURCE and the .env LEVER that moves it:
 #     Capture (speech-end -> t0: VAD hangover + Smart-Turn end-of-turn)  [driver]  <- VAD_STOP_SECS

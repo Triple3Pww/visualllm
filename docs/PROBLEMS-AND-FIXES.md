@@ -94,7 +94,8 @@ unfixable bug inside pipecat's non-live write path." **That boundary table was w
 runs that didn't time-align, plus per-frame RMS false positives from sample-misalignment). The
 two "rejected fixes" it spawned — a CosyVoice `bytes(chunk)` yield-copy and a MuseTalk
 `copy.copy(frame)`/`frame.audio=bytes(...)` snapshot — were aimed at a *frame-aliasing* theory that
-isn't the cause. **Both have been removed** (the real fix is `_align_even` below); do NOT re-add them.
+isn't the cause. **Both have been removed** (the real fix was `_align_even` below — since P52, the
+producer-side carry in `run_tts`); do NOT re-add them.
 The misleading per-chunk-RMS debug logs (`[ms-push h]`, `[pf-in]`, `[cb-yield]`) that produced the
 false positives were also removed.
 
@@ -141,6 +142,12 @@ was insufficient:
    or any future one — can only ever drop an even (whole-sample) gap = at worst an inaudible click,
    **never** the half-sample screech. This is what makes the screech impossible by construction.
    (`steady` is now the default in `.env`.)
+
+> **UPDATE 2026-07-15 (P52): `_align_even` is REMOVED.** The odd bytes it repaired are now fixed at
+> their single source — `cosyvoice_tts.py::run_tts` carries the dangling byte across `iter_chunked()`
+> reads, so every `TTSAudioRawFrame` is whole-sample at creation and the transport's running total
+> stays even by construction, one stage earlier. Fix 1 (the timeout raise) STAYS. Live-eye verified
+> with the guard bypassed before removal.
 
 **Verified.**
 - Deterministic regression test `scripts/_screech_repro_test.py`: (a) short timeout + mid-turn gap →
@@ -288,7 +295,12 @@ one frame of look-ahead, which only binds at end-of-turn (mid-turn the binding c
 count) and which TTS — running ahead of real-time — has already buffered. Verified with a deterministic
 repro (a 13.56 s turn stranded **1** audio chunk to the drain before, **0** after) and on the live path.
 
-## P11 — With echo-guard on, voice stops triggering after the first turn (must type) ✅ FIXED (default flipped, 2026-06-23)
+## P11 — With echo-guard on, voice stops triggering after the first turn (must type) ✅ FIXED (default flipped, 2026-06-23; **root cause fixed 2026-07-15 — see P53**)
+
+> **2026-07-15 update:** the mechanism below is now FIXED at its root (P53): the avatar client holds the
+> `TTSStoppedFrame` until the turn's voice fully drains, so `BotStoppedSpeaking` fires at true end of
+> speech and the stuck-mute state machine can no longer arise. `ECHO_GUARD=1` under steady awaits a live
+> ear-check before being trusted; the default stays `0`.
 
 **Symptom.** Speaking a turn produced no response — the user had to type into the client for it to
 work. Only after a bot turn; the first interaction could work, then the mic went dead.
@@ -1672,6 +1684,11 @@ pcm = _to_16k_mono_pcm(data, sr, ch) if data else b""
 
 `self._srv_carry` is initialised in `__init__` and reset in `_reset_turn()`.
 
+> **UPDATE 2026-07-15 (P52): `_srv_carry` is REMOVED.** The odd buffers it carried are now fixed at
+> their single source (`cosyvoice_tts.py::run_tts` producer-side alignment — see P52), so frames reach
+> this branch whole-sample. `_to_16k_mono_pcm`'s odd-drop remains as a crash guard only and should
+> never fire; if it ever does, fix the PRODUCER (a dropped byte here is exactly this bug again).
+
 **Verified live** (drove a real turn with `MUSETALK_DUMP_PCM=1`, compared the avatar-bound PCM against `resample_poly` of
 the delivered 24k voice): peak xcorr **0.008 -> 0.969 @ lag 0.000s**; ZCR 0.453 -> **0.185** (target 0.189); envelope dyn
 range 0.4 -> **8.8 dB** (target 8.8); quiet/peak 0.349 -> **0.040** (target 0.043); RMS 13531 -> **4089** (target 4113); the
@@ -2190,3 +2207,140 @@ sync" — the P19 gate is passed in the direction that matters, and this is the 
 
 **Lesson:** when one side of a wire infers what the other side knows, the inference is a bug that hasn't
 happened yet. The cheapest fix for a heuristic is a protocol field.
+
+## P52 — the odd-byte class (P3 screech, P34 crash, P40 noise) fixed at its ONE source; both consumer patches removed ✅ SHIPPED (2026-07-15, 26th session)
+
+**Not a new bug — the root-cause closure of three shipped ones.** P3 (`_align_even`), P40 (`_srv_carry`) and
+the P34 trim crash were all the same defect surfacing at different consumers: `TTSAudioRawFrame`s with **odd
+byte counts** — half a sample — flowing through a pipeline whose every consumer assumes whole int16 samples.
+Each incident was patched where it bled. Nobody had asked where the odd bytes come FROM.
+
+**Root cause (traced, then measured live).** The CosyVoice server only ever writes whole int16 samples
+(`pcm.tobytes()` of an int16 array — always even; probe: total stream bytes even). But raw PCM over HTTP is a
+BYTE stream: chunked-transfer framing + TCP re-segmentation land buffer boundaries mid-sample, and the client
+read in `cosyvoice_tts.py::run_tts` — `resp.content.iter_chunked(960)` — yields whatever slice is buffered,
+propagating those boundaries straight into frames. Measured against the live server: `iter_any()` showed
+**4 odd-length arrivals in 9 buffers** for one short zh utterance; `iter_chunked(960)` yielded **3 mid-stream
+odd chunks + an odd final** — several latent half-sample shift points per turn, every turn. So the invariant
+"audio frames are whole samples" was broken at the single byte-stream→frame boundary and repaired N times
+downstream. (Irony: pipecat's own `stream_audio_frames_from_iterator` does the align-and-carry at the source —
+`tts_service.py:883` — our hand-rolled read loop just didn't use the pattern.)
+
+**Fix — restore the invariant at the producer (`cosyvoice_tts.py::run_tts`):** carry the dangling byte across
+`iter_chunked()` reads; every frame yielded is even. ~4 lines, covers JaiTTS too (same client). A final
+dangling byte at stream end is sub-sample and dropped (the same accepted tradeoff the old guards made).
+
+**Removed as now-redundant (user-directed, after a live test with both BYPASSED passed his eye):**
+`_align_even`/`_odd_carry` (P3's guard) and `_srv_carry` (P40's guard) in `musetalk_video.py`. Kept:
+P3's fix 1 (`BOT_VAD_STOP_FALLBACK_SECS` raise — a different problem: the discard TRIGGER), and
+`_to_16k_mono_pcm`'s 2-line odd-drop demoted to a pure crash guard (`np.frombuffer` raises on odd input;
+it should never fire — if it does, fix the producer). Stale-comment fix in the same pass: that helper
+blamed "pipecat's resampler" for the odd buffers — false; pipecat 1.3.0's TTSService resampler only runs
+inside `stream_audio_frames_from_iterator`, which this client never calls. The odd bytes were ours.
+
+**Verified:** live probe pre-fix = odd chunks mid-stream (above); post-fix, the REAL `CosyVoiceTTSService.run_tts`
+driven 5× against the live server = **1,602 frames, zero odd-length**; `scripts.preflight` PASS; pipeline
+restarted; **the user live-tested with both consumer guards bypassed and confirmed clean** — then the guards
+were deleted. NOTE: `archive/_screech_repro_test.py` part (b) mirrors `_align_even` and now documents a
+removed mechanism; part (a) (the timeout raise) still describes live code.
+
+**Lesson:** three multi-session incidents, one origin. When the same class of corruption keeps surfacing at
+different consumers, stop patching consumers and ask where the invariant is *supposed* to be established.
+A raw byte stream (HTTP/TCP) never preserves message boundaries — the reader that turns bytes into typed
+frames owns re-establishing them.
+
+---
+
+## P53 — BotStopped never fired under steady sync (the P11 root cause) ✅ FIXED (2026-07-15, probe-verified; echo-guard live test pending)
+
+**Symptom.** Under `steady` sync, pipecat's `BotStoppedSpeakingFrame` fired **mid-turn** and then never
+again: the log showed `Bot stopped speaking based on TTSStoppedFrame` → `Bot started speaking` **1 ms
+later**, with nothing ever closing the turn. Everything keyed on bot-stopped was broken: the echo-guard
+mic mute stuck muted after the first turn (P11's "must type" bug), sherpa's bot-pause had to be gated off,
+and the only documented remedy was "use headphones."
+
+**Root cause (ordering, not state).** The transport fires bot-stopped when `TTSStoppedFrame` reaches its
+audio queue. Under steady, `MuseTalkVideoService` **holds the voice** in `_abuf` (released later, paced to
+rendered frames) but forwarded the `TTSStoppedFrame` **immediately** — so the transport saw
+`[some audio, TTSStopped, ...the rest of the held audio]`: stop fired early, the late audio re-fired
+bot-started, and with the P3 screech fix's `BOT_VAD_STOP_FALLBACK_SECS=600` no gap-fallback ever closed it.
+P11 treated this as unfixable and flipped `ECHO_GUARD=0`; the actual defect was one frame released out of
+order.
+
+**Fix (`local_services/musetalk_video.py`).** Hold the `TTSStoppedFrame` exactly like the voice it
+describes: if the turn still has un-released audio (or video active), stash it (`_held_tts_stop`) and
+release it from **`_drain_audio`** — the single choke point every turn-drain path funnels through
+(`video_end`, the marker-loss fallback, the proto-1 bare-frame fallback) — so the transport sees
+`[all audio..., TTSStopped]` in true playback order and bot-stopped fires once, at REAL end of speech.
+On `InterruptionFrame` the held stop is **dropped** (`_reset_turn`): the transport emits its own
+bot-stopped on interruption, and forwarding ours later would fire a bogus mid-turn stop into the next
+turn. A stale held stop (server died before `video_end`) is flushed by the next `TTSStarted` so the old
+turn still closes. `live`/unsynced paths are byte-identical (stop still passes straight through).
+
+**Verified.** (1) `archive/_tts_stop_order_test.py` — drives the real `MuseTalkVideoService` with a fake
+downstream: pre-fix `stop@1` before the released audio (the bug), post-fix stop lands after the last
+audio frame; interrupt drops the held stop; dead-server flushes it before the next turn. (2) Live probe
+(`_zh_q_def.wav`): `Bot started speaking` at first audio → `[avatar timing]` (turn drain, audio 1.86 s)
+→ `Bot stopped speaking based on TTSStoppedFrame` **2 ms after the drain**, no phantom re-start; TTFO
+unchanged (2.48 s OK). Pre-fix pathology captured in the same log 20 min earlier for contrast.
+
+**Consequences.** `ECHO_GUARD=1` (half-duplex mute) is no longer mechanically broken under steady — the
+mute strategy's unmute signal now exists. Default stays `0` (barge-in is the P44 baseline, and headphones
+remain the norm); **flip it only after a live echo-guard session confirms the mute/unmute cycle by ear**
+(the probe can't judge a stuck mic). The `BOT_VAD_STOP_FALLBACK_SECS=600` raise **STAYS** — it still
+guards the buffered voice against a mid-turn render-stall discard (see P3/P52); this fix removes its
+last cost, not its purpose. sherpa's echo-guard gating (`sherpa_stt.py`) is unchanged but its blocker
+is gone if wanted later.
+
+**Lesson.** A signal that "never fires" under one mode is usually not a missing feature but a frame
+released out of order somewhere upstream. And a 3-workaround chain hanging off one disabled safety net
+(600 s timeout → broken mute → headphones rule) is the smell that the root cause was never actually
+fixed — each layer was priced separately and nobody re-added the bill.
+
+---
+
+## P54 — the invisible pre-t0 second: sherpa never declared `ttfs_p99_latency` -> a flat 1.0s wait every turn ✅ FIXED (2026-07-16, 28th session, live-verified over 5 real human turns)
+
+**Symptom.** Nothing looked wrong: `[TTFO]` reported a healthy ~2.2-2.6s and PASSed the 3s target. But the
+new mic-to-ear harness (`scripts/measure/`) measured a **pre-t0 Capture segment of ~1.6s** — latency the
+user sits through and TTFO structurally cannot see (its stopwatch STARTS at t0 = user-stopped). So the real
+felt delay was ~3.2s while the metric proudly said 2.2s.
+
+**Root cause (two independent things, only ONE of them real).** The Capture segment decomposed into:
+
+1. **~1.0s of pure dead wait, REAL and fixable.** Under `ALLOW_INTERRUPTIONS=1` the turn boundary is called
+   by `TurnAnalyzerUserTurnStopStrategy` (Smart Turn v3), NOT by `VAD_STOP_SECS` (the log even shows
+   `stop_secs 0.0` — the VAD knob everyone reaches for barely moves this). After Smart Turn returns
+   `COMPLETE`, the strategy still waits `ttfs_p99_latency - stop_secs` for the STT's final transcript
+   (`turn_analyzer_user_turn_stop_strategy.py:186-197`), short-circuiting early ONLY if a
+   `TranscriptionFrame` arrives with `finalized=True` (line 205). `SherpaStreamingSTTService` never declared
+   `ttfs_p99_latency`, so pipecat fell back to its **1.0s default** (a conservative cloud-STT guess) and
+   logged `ttfs_p99_latency not set, using default 1.0s`. But sherpa yields its final `TranscriptionFrame`
+   **synchronously with the endpoint** (same `if is_endpoint:` block as `VADUserStoppedSpeakingFrame`,
+   `sherpa_stt.py:127-131`) — the transcript is ALREADY IN HAND at the turn boundary. It just isn't flagged
+   `finalized`, so the short-circuit never fired and every turn ate the full 1.0s waiting for something that
+   had already arrived. Proven in the log: `COMPLETE 33.713 -> t0 34.693` with **zero log lines between**.
+2. **~1.9s x2 of Smart-Turn deliberation — NOT REAL, a synthetic-mic artifact.** Smart Turn re-runs once per
+   VAD-detected pause (`_handle_vad_user_stopped_speaking` -> `analyze_end_of_turn()`); the ~1.9s spacing is
+   no constant anywhere (its params are `STOP_SECS=3`, `PRE_SPEECH_MS=500`, `MAX_DURATION=8`) — it is simply
+   **the spacing of the pauses in the driving clip**. `_zh_q_def.wav` has a 0.74s comma pause mid-utterance
+   (silence map: 0.84-2.38 speech | 2.38-3.12 PAUSE | 3.12-4.34 speech), so the model correctly said
+   INCOMPLETE twice before COMPLETE. **On 5 REAL human turns: 0 INCOMPLETE polls, every turn** — a natural
+   ending resolves on the first poll. The scary number was the test clip lying.
+
+**Fix (`local_services/sherpa_stt.py`, one line).** `kwargs.setdefault("ttfs_p99_latency", 0.1)` — declare
+sherpa's true post-speech finalization latency (~0). Non-zero on purpose: `0` would trip the
+`stop_secs >= ttfs` "timeout collapsed to 0s" path. Cannot truncate the question: the wait is entirely AFTER
+the final transcript is committed, so it only delays when the turn FIRES, never what it contains.
+
+**Verified live.** `COMPLETE -> t0` gap **1.0s -> 0.09-0.11s**, stable across turns (probe + 5 real human
+turns: 0.11/0.10/0.10/0.00/0.09s). Warm TTFO 2.53s PASS; preflight PASS. Real-turn matrix (see
+`docs/LATENCY-MATRIX.md`): median end-to-end **2.91s** mic-to-ear on real speech + real browser playout.
+
+**Lessons.** (1) **A metric that starts its clock at t0 can never see the cost of deciding t0.** TTFO was
+green while a full second of felt delay sat just outside its window — the harness existed to make exactly
+this visible, and it found it on the first real run. (2) **The probe lies in BOTH directions** (P19/P33's rule
+again): the synthetic clip INVENTED a 1.6s pre-t0 cost that real speech does not have, while hiding nothing.
+Trace to a mechanism, then confirm with the real input — never optimize a number you have not traced.
+(3) A library default is a guess about YOUR service; an undeclared capability is a bill you pay silently
+every turn.
