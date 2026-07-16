@@ -63,9 +63,10 @@ FRAME_MAGIC = b"MTF2"
 def _to_16k_mono_pcm(audio: bytes, in_rate: int, channels: int) -> bytes:
     """Resample int16 PCM to 16 kHz mono for the MuseTalk server."""
     if len(audio) & 1:
-        audio = audio[:-1]  # pipecat's resampler can hand us an odd-length buffer; int16
-        #                     needs an even byte count or np.frombuffer raises. Drop the
-        #                     stray byte (sub-sample, inaudible) instead of dropping the chunk.
+        audio = audio[:-1]  # should never fire: run_tts aligns frames at the producer. Kept as
+        #                     a crash guard only -- int16 needs an even byte count or np.frombuffer
+        #                     raises. (If odd buffers ever reappear, fix the PRODUCER: a dropped
+        #                     byte here half-sample-shifts the stream = the P40 noise.)
     a = np.frombuffer(audio, dtype=np.int16)
     if a.size == 0:
         return b""
@@ -146,6 +147,14 @@ class MuseTalkVideoService(FrameProcessor):
         #   its out_q); without this they arrive with _video_active=False and get forwarded as IDLE
         #   animation -> the avatar keeps lip-moving with NO voice, and any that land after the next
         #   video_start bleed into the new turn. Set True on interrupt, cleared on the next TTSStarted.
+        # Held end-of-speech marker (P53, the P11 fix). Under steady the voice is HELD here and
+        # released paced to rendered frames, but the TTSStoppedFrame used to sail straight through
+        # -- so the transport fired BotStoppedSpeaking MID-turn, the held audio released after it
+        # re-fired BotStartedSpeaking, and (with the screech fix's BOT_VAD_STOP_FALLBACK_SECS=600)
+        # no BotStopped ever followed: echo-guard's mic mute keyed on it -> mic STUCK MUTED (P11).
+        # Fix: hold the stop frame and release it from _drain_audio, AFTER the turn's voice has
+        # fully gone downstream, so BotStopped fires exactly once at TRUE end of speech.
+        self._held_tts_stop: tuple[Frame, FrameDirection] | None = None
 
         # --- per-turn A/V timing instrumentation (logs audio-vs-avatar offset + lip drift) ---
         self._t_audio_first: float | None = None   # loop.time() of first voice chunk this turn
@@ -154,14 +163,10 @@ class MuseTalkVideoService(FrameProcessor):
         self._vframes = 0                           # real lip-synced frames this turn
         self._aud_dur = 0.0                         # seconds of voice this turn
         self._last_offset_log = 0.0                 # throttle for the continuous offset trace
-        self._odd_carry = b""                       # anti-screech: dangling odd byte carried between
-        #   downstream audio frames so the PCM stays whole-sample (see _align_even)
-        self._srv_carry = b""                       # SAME guard for the AVATAR-bound feed. TTS hands us
-        #   odd-byte buffers; _to_16k_mono_pcm used to DROP the stray byte, so the next buffer started
-        #   half a sample late and every int16 after it was assembled from the wrong two bytes -> the
-        #   server got loud broadband NOISE. MuseTalk lip-syncs off a Whisper of that waveform, so the
-        #   mouth flapped in a generic wordless pattern and never closed for pauses (voice was fine --
-        #   _align_even protects the downstream copy only). Carry the byte instead of dropping it.
+        # (The _odd_carry/_srv_carry whole-sample guards that used to live here are GONE: the
+        #  P3/P40 odd-byte class is now fixed at its single source -- cosyvoice_tts.run_tts
+        #  carries the dangling byte across iter_chunked() reads, so every TTSAudioRawFrame
+        #  arrives whole-sample. Verified live 2026-07-15. PROBLEMS-AND-FIXES P3/P40.)
         # EVIDENCE (viseme-mismatch hunt): server re-sends the LAST frame (byte-identical HELD/dup) on
         # every tick it underflows mid-turn; the client can't tell it from a real frame -> it lands in
         # _vbuf and shifts the audio<->lip mapping. Count held dups vs the server's REAL rendered count.
@@ -398,6 +403,11 @@ class MuseTalkVideoService(FrameProcessor):
             now = asyncio.get_running_loop().time()
             if self._t_vid_first is None:
                 self._t_vid_first = now
+                # First real rendered frame of the turn. Log the intra-avatar render latency
+                # (first voice chunk -> first frame back) so the mic-to-ear waterfall has a real
+                # 'Avatar render' anchor instead of bundling it into the steady lead-hold.
+                if self._t_audio_first is not None:
+                    logger.info(f"[render] first-frame +{(now - self._t_audio_first) * 1000:0.0f}ms")
             self._t_vid_last = now
             self._vframes += 1
             # Continuous (delivery-side) offset: real-time voice elapsed vs lip-video delivered.
@@ -531,12 +541,20 @@ class MuseTalkVideoService(FrameProcessor):
             )
 
     async def _drain_audio(self):
-        """Release any audio left after the last rendered frame (tail of the turn)."""
+        """Release any audio left after the last rendered frame (tail of the turn), then the
+        held TTSStoppedFrame (P53): it must reach the transport AFTER the turn's voice so
+        BotStoppedSpeaking fires at true end of speech, not mid-turn (the P11 stuck-mute).
+        Every turn-drain path funnels here (video_end, the marker-loss fallback, the proto-1
+        bare-frame fallback), so the release can't be missed."""
         async with self._lock:
             while self._aidx < len(self._abuf):
                 _e, af, ad = self._abuf[self._aidx]
                 self._aidx += 1
                 await self.push_frame(af, ad)
+            if self._held_tts_stop is not None:
+                sf, sd = self._held_tts_stop
+                self._held_tts_stop = None
+                await self.push_frame(sf, sd)
 
     async def _play_close_fade(self, last_bytes: bytes, rest_bytes: bytes):
         """Free-run a pixel cross-dissolve (last spoken frame -> rest pose) at fps so the mouth
@@ -577,10 +595,13 @@ class MuseTalkVideoService(FrameProcessor):
         self._vframes = 0
         self._aud_dur = 0.0
         self._last_offset_log = 0.0
-        self._odd_carry = b""
-        self._srv_carry = b""
         self._held_dups = 0
         self._server_real = 0
+        # Drop a still-held stop marker (P53). Reached on InterruptionFrame -- correct to DROP
+        # there: pipecat's transport emits its own BotStopped on interruption, and forwarding
+        # ours later would fire a bogus mid-turn BotStopped into the NEXT turn. The TTSStarted
+        # path flushes it BEFORE calling this, so a normal turn never loses its stop here.
+        self._held_tts_stop = None
 
     def _log_turn_timing(self):
         """Log this turn's audio-vs-avatar timing: how long after the voice the lips started,
@@ -632,32 +653,13 @@ class MuseTalkVideoService(FrameProcessor):
             except Exception:  # noqa: BLE001
                 pass
 
-    def _align_even(self, frame: TTSAudioRawFrame) -> None:
-        """SAMPLE-ALIGNMENT GUARD (the real steady-screech root-cause fix).
-
-        The screech was an ODD-byte misalignment: pipecat's output transport clears its internal
-        `_audio_buffer` (bytearray()) on `_bot_stopped_speaking` -- fired by a >3s render-stall gap
-        OR by the per-turn TTSStoppedFrame. If the bytes accumulated there are an ODD count, the
-        discard shifts every following int16 sample by half a sample -> loud broadband noise to the
-        end of the turn. The odd count comes from CosyVoice's LAST chunk per utterance, which
-        `iter_chunked` can hand back at an odd length.
-
-        Fix at the source of truth: make EVERY audio frame we push downstream an even (whole-sample)
-        byte count, carrying any dangling odd byte to the next frame so the PCM stream stays exactly
-        contiguous. Then the transport's running total is always even, so any buffer-clear can only
-        ever drop an even (whole-sample) gap -- at worst an inaudible click, NEVER the screech.
-        Carry is per-connection and reset each turn (a dangling final byte is inaudible)."""
-        data = self._odd_carry + frame.audio
-        if len(data) & 1:
-            self._odd_carry = data[-1:]
-            data = data[:-1]
-        else:
-            self._odd_carry = b""
-        frame.audio = data
+    # (The _align_even() whole-sample guard that used to sit on push_frame is GONE -- the odd
+    #  bytes it repaired are fixed at their source now (cosyvoice_tts.run_tts carries the byte
+    #  across iter_chunked() reads), so the pipecat transport's audio buffer total stays even
+    #  and its discard-on-stall can never half-sample-shift the stream. P3 anti-screech history:
+    #  docs/PROBLEMS-AND-FIXES.md P3; the BOT_VAD_STOP_FALLBACK_SECS raise in main.py STAYS.)
 
     async def push_frame(self, frame: Frame, direction: FrameDirection = FrameDirection.DOWNSTREAM):
-        if direction == FrameDirection.DOWNSTREAM and isinstance(frame, TTSAudioRawFrame):
-            self._align_even(frame)   # keep the downstream PCM whole-sample (anti-screech guard)
         if direction == FrameDirection.DOWNSTREAM and isinstance(frame, OutputImageRawFrame):
             self._note_emit()         # freeze watchdog: a video frame is leaving downstream
         if self._dump_deliv and self._deliv_active and direction == FrameDirection.DOWNSTREAM:
@@ -666,7 +668,7 @@ class MuseTalkVideoService(FrameProcessor):
             elif isinstance(frame, TTSAudioRawFrame):
                 self._deliv_sr = getattr(frame, "sample_rate", self._deliv_sr) or self._deliv_sr
                 self._deliv_ch = getattr(frame, "num_channels", self._deliv_ch) or self._deliv_ch
-                self._deliv_a.extend(frame.audio)   # exact delivered voice (post _align_even)
+                self._deliv_a.extend(frame.audio)   # exact delivered voice
         await super().push_frame(frame, direction)
 
     def _note_emit(self):
@@ -741,15 +743,10 @@ class MuseTalkVideoService(FrameProcessor):
             # ALWAYS feed the server REAL-TIME-PACED (via _feed_q) so the renderer can't build a
             # backlog from CosyVoice's faster-than-real-time output (the "voice finishes but the
             # avatar keeps going" lag). Pacing keeps the server's queue ~empty either mode.
-            # Keep the server-bound PCM whole-sample ACROSS chunks: TTS hands back odd-byte buffers,
-            # and dropping the stray byte (the old behaviour, inside _to_16k_mono_pcm) shifted every
-            # following int16 by one byte -> the avatar was fed NOISE and its mouth flapped wordlessly.
-            # Carry the remainder into the next chunk, exactly like _align_even does downstream.
-            stride = 2 * ch
-            data = self._srv_carry + frame.audio
-            keep = len(data) - (len(data) % stride)
-            self._srv_carry = data[keep:]
-            data = data[:keep]
+            # Frames arrive whole-sample: cosyvoice_tts.run_tts aligns at the producer (the P40
+            # "avatar fed NOISE, mouth flaps wordlessly" bug was odd-byte frames + a dropped
+            # stray byte here; fixed at the source 2026-07-15, the _srv_carry patch removed).
+            data = frame.audio
             pcm = _to_16k_mono_pcm(data, sr, ch) if data else b""
             if pcm:
                 self._feed_q.put_nowait(("audio", (pcm, dur)))
@@ -766,9 +763,9 @@ class MuseTalkVideoService(FrameProcessor):
                 # together. No drift, no end cut. (See _advance / _emit_pair: each frame's
                 # audio_pos defines the audio released with it.)
                 # The mid-speech "screech" that steady used to hit is NOT a held-frame problem --
-                # it was pipecat discarding a partial (odd) audio buffer; fixed by _align_even (every
-                # downstream frame kept whole-sample) + the BOT_VAD_STOP_FALLBACK_SECS raise in
-                # main.py. So we just buffer the frame as-is here.
+                # it was pipecat discarding a partial (odd) audio buffer; fixed at the source
+                # (run_tts keeps every frame whole-sample) + the BOT_VAD_STOP_FALLBACK_SECS raise
+                # in main.py. So we just buffer the frame as-is here.
                 self._audio_clock_s += dur
                 async with self._lock:
                     self._abuf.append((self._audio_clock_s, frame, direction))
@@ -776,6 +773,14 @@ class MuseTalkVideoService(FrameProcessor):
 
         elif isinstance(frame, TTSStartedFrame):
             self._cancel_fallback()
+            if self._held_tts_stop is not None:
+                # Safety net (P53): the previous turn's video_end never came (server died / ws
+                # dropped mid-turn), so its held stop was never drained. Release it BEFORE the
+                # new turn so the transport still closes the old turn (BotStopped) and the
+                # upcoming audio opens a fresh one -- otherwise echo-guard's mute would stick.
+                sf, sd = self._held_tts_stop
+                self._held_tts_stop = None
+                await self.push_frame(sf, sd)
             self._reset_turn()
             self._flushing = False   # new turn: stop dropping frames (end the post-interrupt flush)
             if self._dump_pcm:
@@ -793,7 +798,18 @@ class MuseTalkVideoService(FrameProcessor):
             self._feed_q.put_nowait(("speech_end", None))
             if self._dump_pcm and self._pcm_dump:
                 self._write_pcm_dump()
-            await self.push_frame(frame, direction)
+            # P53 (the P11 fix): under steady the voice is still HELD in _abuf when this
+            # arrives, so forwarding it now makes the transport fire BotStopped mid-turn and
+            # the later-released audio re-fire BotStarted with nothing to close it (the
+            # echo-guard stuck-mute). Hold it; _drain_audio pushes it after the last voice.
+            held = False
+            if self._sync and not self._unsynced:
+                async with self._lock:
+                    if self._video_active or self._aidx < len(self._abuf):
+                        self._held_tts_stop = (frame, direction)
+                        held = True
+            if not held:
+                await self.push_frame(frame, direction)
 
         else:
             await self.push_frame(frame, direction)
