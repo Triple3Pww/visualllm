@@ -2,7 +2,9 @@
 Run: python -m archive._measure_waterfall_test  (or: pytest archive/_measure_waterfall_test.py)"""
 from datetime import datetime
 
-from scripts.measure import answer_onset_epoch, build_waterfall, parse_playout_beacon
+from scripts.measure import (
+    aggregate_turns, answer_onset_epoch, build_waterfall, parse_playout_beacon,
+)
 
 
 def test_onset_ignores_greeting_and_silence():
@@ -77,6 +79,50 @@ def test_parse_playout_beacon_offset():
         (datetime.fromtimestamp(1751800000.5), '[client-playout] {"ev":"audio-onset","t":1751800000123}'),
     ]
     assert parse_playout_beacon(lines, t0) == 0.123
+
+
+def test_capture_offsets_every_downstream_cum():
+    anchors = dict(llm_recv=0.0, llm_ttfb=0.68, tts_recv=1.05, tts_ttfb=2.45,
+                   render=2.60, bot_started=2.75, client_arrival=2.97, jitter=3.05, playout=3.12)
+    rows = build_waterfall(anchors, playout_source="browser-audio", capture=0.70)
+    cap = [r for r in rows if r["stage"].startswith("Capture")][0]
+    assert abs(cap["delta"] - 0.70) < 1e-6 and abs(cap["cum"] - 0.70) < 1e-6
+    total = [r for r in rows if r["status"] == "total"][0]["cum"]
+    assert abs(total - (3.12 + 0.70)) < 1e-6           # capture shifts the whole sum
+    ok = [r for r in rows if r["status"] == "ok"]
+    assert abs(sum(r["delta"] for r in ok) - total) < 1e-6
+
+
+def test_capture_absent_is_unknown_and_keeps_t0_relative_total():
+    anchors = dict(llm_recv=0.0, llm_ttfb=0.68, tts_recv=1.05, tts_ttfb=2.45,
+                   bot_started=2.75, client_arrival=2.97, playout=3.12)
+    rows = build_waterfall(anchors, playout_source="browser", capture=None)
+    cap = [r for r in rows if r["stage"].startswith("Capture")][0]
+    assert cap["status"] == "unknown" and cap["delta"] is None
+    total = [r for r in rows if r["status"] == "total"][0]["cum"]
+    assert abs(total - 3.12) < 1e-6                     # no capture -> t0-relative, unchanged
+
+
+def test_new_stages_carry_levers_and_sources():
+    rows = build_waterfall(dict(llm_recv=0.0, render=2.6, jitter=3.05, playout=3.12))
+    by = {r["stage"]: r for r in rows}
+    assert "lever" in by["Avatar render (first frame)"]
+    assert by["Browser jitter buffer"]["source"] == "browser-stats"
+
+
+def test_aggregate_median_p95_and_fresh_warm():
+    turns = [dict(llm_ttfb=t) for t in [0.6, 0.7, 0.8, 0.9, 1.6, 1.7]]
+    agg = aggregate_turns(turns, ["llm_ttfb"])
+    assert abs(agg["median"]["llm_ttfb"] - 0.85) < 1e-6   # median of 6 = mean of 0.8,0.9
+    assert agg["p95"]["llm_ttfb"] >= 1.6
+    assert abs(agg["fresh"]["llm_ttfb"] - 0.65) < 1e-6    # turns 0-1 median
+    assert abs(agg["warm"]["llm_ttfb"] - 1.65) < 1e-6     # turns >=4 median
+
+
+def test_aggregate_ignores_none_anchors():
+    turns = [dict(tts_ttfb=None), dict(tts_ttfb=2.0), dict(tts_ttfb=2.4)]
+    agg = aggregate_turns(turns, ["tts_ttfb"])
+    assert abs(agg["median"]["tts_ttfb"] - 2.2) < 1e-6    # None dropped
 
 
 def main():
