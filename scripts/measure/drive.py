@@ -40,14 +40,27 @@ def _audio_rms(frame):
 
 
 def speech_duration(mic_wav):
+    """ENERGETIC span (s) of the raw question clip: first-to-last 20ms window above a noise floor.
+    Using the energetic span (not the file length, which may include silence padding in the clip)
+    makes the log-derived capture = (t0 - 'User started speaking') - this ~= the VAD stop-hangover
+    + Smart-Turn end-of-turn decision (the pre-t0 cost). Robust to leading/trailing clip silence."""
     with wave.open(mic_wav, "rb") as w:
-        return w.getnframes() / float(w.getframerate())
-
-
-def speech_end_epoch(mic_wav, lead, play_start_epoch):
-    """When the user's audio goes silent, in epoch seconds: playback starts at play_start_epoch
-    and the wav is [lead silence | speech | tail silence]."""
-    return play_start_epoch + lead + speech_duration(mic_wav)
+        sr, ch = w.getframerate(), w.getnchannels()
+        a = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
+    if a.size == 0:
+        return 0.0
+    if ch > 1:
+        a = a.reshape(-1, ch)[:, 0]
+    a = a.astype(np.float64)
+    win = max(1, int(sr * 0.02))
+    n = a.size // win
+    if n < 2:
+        return a.size / sr
+    rms = np.sqrt((a[:n * win].reshape(n, win) ** 2).mean(axis=1) + 1e-9)
+    active = np.where(rms > 0.05 * rms.max())[0]
+    if active.size < 2:
+        return a.size / sr
+    return (active[-1] - active[0] + 1) * win / sr
 
 
 # ----------------------------------------------------------------- headless aiortc probe

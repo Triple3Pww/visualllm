@@ -40,17 +40,22 @@ def build_turn(lines, bi, target_s=3.0):
     # t0 = 'User stopped speaking' (the TTFO turn-end); 'Generating chat' is the SEPARATE
     # llm_recv anchor (STT finalize + context assembly), so that segment is measured, not
     # collapsed. Fall back to Generating-chat, then bot-start, if the turn-end line is absent.
-    t0 = t0_gen = question = None
+    t0 = t0_gen = us_start = question = None
     for dt, txt in lines[:bi][::-1]:
         if t0 is None and "User stopped speaking" in txt:
             t0 = dt
         if t0_gen is None and "Generating chat from context" in txt:
             t0_gen = dt
+        # This turn's speech start: the last 'User started speaking' at/before t0 (found only
+        # once t0 is located so a prior turn's start can't be grabbed). Scanned here, not in the
+        # +/-window below, because a long utterance starts well before the window's -3s bound.
+        if us_start is None and t0 is not None and "User started speaking" in txt and dt <= t0:
+            us_start = dt
         if question is None:
             qm = re.search(r"'role': 'user', 'content': '(.*?)'\}\]", txt)
             if qm:
                 question = qm.group(1)
-        if t0 and t0_gen and question:
+        if t0 and t0_gen and us_start and question:
             break
     if t0 is None:
         t0 = t0_gen if t0_gen is not None else bot_started_t
@@ -71,12 +76,11 @@ def build_turn(lines, bi, target_s=3.0):
         r = off(t0_gen)
         llm_recv = r if r >= 0 else 0.0
 
+    user_started = off(us_start) if us_start is not None else None
     win = [(dt, txt) for dt, txt in lines if -3 <= (dt - t0).total_seconds() <= 60]
-    user_started = llm_ttfb = render = bot_stopped = None
+    llm_ttfb = render = bot_stopped = None
     sentences, tts_ttfb, tts_proc = [], [], []
     for dt, txt in win:
-        if "User started speaking" in txt and user_started is None:
-            user_started = off(dt)
         if "OpenAILLMService" in txt and "TTFB:" in txt and llm_ttfb is None:
             llm_ttfb = (off(dt), float(re.search(r"TTFB: ([\d.]+)s", txt).group(1)))
         m1 = re.search(r"run_tts:\d+ - CosyVoice TTS \[(.*)\]", txt)

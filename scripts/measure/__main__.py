@@ -106,15 +106,21 @@ def main():
     turns_raw = [logparse.build_turn(lines, i) for i in idxs[-n:]]
 
     jb_est_s = float(os.getenv("CLIENT_JITTER_BUFFER_MS", "400") or 400) / 1000.0
+    sdur = drive.speech_duration(args.mic)   # the wav's real speech length
     anchor_dicts, pm, offline_lip = [], {}, None
     for k, turn in enumerate(turns_raw):
-        # capture is precise only on the probe path (known play-start); browser loop -> unknown.
+        # Capture = pre-t0 cost, straight from the log: (t0 - 'User started speaking') is the span
+        # the VAD perceived; subtract the wav's real speech length and what remains is the VAD
+        # stop-hangover + Smart-Turn end-of-turn decision. No wall-clock guessing (a pre-connect
+        # time.time() is seconds off because of ICE setup + the greeting), and it works on BOTH
+        # the probe and browser paths (each turn logs 'User started/stopped speaking').
         capture, onset_rel = None, None
-        if path_kind == "probe" and k < len(captures):
-            ps, awall = captures[k]
-            se = drive.speech_end_epoch(args.mic, args.lead, ps)
-            cap = round(turn["t0_epoch"] - se, 3)
+        us = turn.get("user_started")
+        if us is not None:
+            cap = round((-us) - sdur, 3)
             capture = cap if cap >= 0 else None
+        if path_kind == "probe" and k < len(captures):
+            _ps, awall = captures[k]
             onset = answer_onset_epoch(awall, turn["t0_epoch"]) if awall else None
             onset_rel = round(onset - turn["t0_epoch"], 3) if onset is not None else None
         beacon = logparse.parse_beacon_full(lines, turn["t0"])
