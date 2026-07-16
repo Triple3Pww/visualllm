@@ -1,6 +1,58 @@
 # VisualLLm — Project Status & Next Steps
 
-_Last updated: 2026-07-15 (**25th session — PER-FRAME AUDIO COUPLING (proto 2) shipped, the client's sync guessing
+_Last updated: 2026-07-16 (**28th session — remade the measure system into a detailed mic-to-ear latency harness.**
+
+`scripts/measure.py` is now a package `scripts/measure/` (entry `python -m scripts.measure` unchanged):
+`logparse.py` (per-turn anchors), `waterfall.py` (stage table + median/p95 + fresh/warm), `drive.py`
+(headless probe + Playwright real-Chromium), `report.py` (writers + run-history + `--compare`), `__main__.py`.
+The waterfall is now **~11 stages from the true mic moment to the ear**, each tagged with its SOURCE and the
+`.env` LEVER that moves it. New vs before:
+- **Pre-t0 Capture segment** (VAD hangover + Smart-Turn end-of-turn) — the felt latency TTFO's t0 can't see.
+  Derived from the log: `(t0 - 'User started speaking') - the wav's energetic speech length`. NOT a pre-connect
+  `time.time()` (ICE + greeting skew it seconds). Works on both paths.
+- **REAL browser output delay** (jitter buffer + decode + device playout), reversing the 2026-07-14 removal but
+  done right: a `[client-playout]` beacon in the static `/studio` page (`?measure=1`) AND a Playwright real-Chromium
+  auto-driver (wav as fake mic) both land timings in `pipeline.log` on the pipeline clock. `--no-browser` falls
+  back to the probe + a jitter-buffer estimate. Min-RTT clock handshake for a remote browser.
+- **Avatar render** anchor from a new `[render] first-frame` log line (`musetalk_video.py`), instead of bundling
+  it in the lead-hold.
+- **N turns per run** → per-stage median + p95 + a fresh(1-2)-vs-warm(≥5) split (the session-degradation as a
+  number), and **run-history** (`output/measure_history.jsonl`) + `--compare A B` for "did this change help?".
+The HTML timeline (`docs/workflow-timeline.html`) gains the lever column, source tags, the capture row, a
+degradation card, and an end-to-end sparkline. **`pipeline/metrics.py` (TtfoMeter) still UNTOUCHED** — the
+waterfall is derived in `scripts/measure/`. Verified live (probe path, real stack): capture 1.46s, LLM/TTS/
+transport all measured, e2e 3.78s; 17 unit tests pass; HTML checked in headless Chromium (no console errors).
+**To light up the render + real-browser rows: RESTART the avatar + pipeline** (the running processes predate the
+`[render] line + beacon endpoint + `/studio` beacon), then `python -m scripts.measure --turns 5`. UNCOMMITTED-run
+artifacts (`measure_data.js`) regenerate each run. Spec/plan: `docs/superpowers/{specs,plans}/2026-07-16-*`._
+
+_Last updated: 2026-07-15 (**27th session — two root-cause fixes from the "hardcode vs root cause" audit.**
+
+**(1) P53 — BotStopped now fires at TRUE end of speech under steady (the P11 root cause).** The avatar client
+(`musetalk_video.py`) forwarded `TTSStoppedFrame` immediately while the voice was still held → the transport fired
+BotStopped mid-turn, the held audio re-fired BotStarted, and (fallback at 600s) nothing ever closed it — the whole
+ECHO_GUARD/P11 stuck-mute chain. Fix: hold the stop frame and release it from `_drain_audio` after the turn's voice
+drains; drop on interruption (transport emits its own); flush a stale one at the next TTSStarted. Verified:
+`archive/_tts_stop_order_test.py` (3 scenarios, failed pre-fix), preflight PASS, live probe — `Bot stopped speaking
+based on TTSStoppedFrame` 2ms after the turn drain, no phantom re-start, TTFO 2.48s OK. **ECHO_GUARD=1 under steady is
+now mechanically sound but wants a live ear-test before anyone trusts it; default stays 0.** The
+`BOT_VAD_STOP_FALLBACK_SECS=600` raise STAYS (still guards buffered voice against a stall discard).
+
+**(2) launch.ps1 heals a stale WSL IP in `COSYVOICE_URL` (`Sync-CosyVoiceUrl`).** The WSL NAT IP changes on
+`wsl --shutdown`; a stale .env value = silently mute bot. The launcher now reconciles against live `wsl hostname -I`
+on every start, rewriting only the IP inside that one line (comment/CJK/UTF-8-no-BOM preserved; localhost left alone
+for the Windows fallback). Verified on the shipped function via AST-extract: fake-IP heal, idempotent, parse clean.
+
+Uncommitted, on `chore/cleanup-and-tts-merge`._
+
+_Previous: 26th session — ODD-BYTE ROOT CAUSE FIXED AT THE PRODUCER (P52): `cosyvoice_tts.run_tts`
+now carries the dangling byte across `iter_chunked()` reads, so every `TTSAudioRawFrame` is whole-sample at creation.
+The two consumer-side patches it obsoletes — `_align_even`/`_odd_carry` (P3) and `_srv_carry` (P40) — are REMOVED
+from `musetalk_video.py` (user-directed, after a live test with both bypassed: ✅ live eye passed). Evidence: the raw
+HTTP stream has 3–4 odd-length chunks per utterance MID-STREAM (live probe); post-fix, 5 runs × real `run_tts` =
+1,602 frames, zero odd. This supersedes session 25's "deliberately KEPT" verdict on those two guards below.**
+
+_Previous: 25th session — PER-FRAME AUDIO COUPLING (proto 2) shipped, the client's sync guessing
 layer DELETED, warmup fixed, and the user's LIVE EYE confirmed sync. Branch `chore/cleanup-and-tts-merge`, 9 commits
 ahead, NOT pushed. P51.**
 
@@ -29,7 +81,8 @@ the P39 byte-compare, the `i/fps` pairing, the P10 audio-cap (unneeded by constr
 exceed voice already buffered — `_abuf.append` happens in the same `process_frame` call that queues the feed), and the
 `video_clock` release-heartbeat (diagnostic-only marker now). A bare frame inside a synced turn = an older server →
 LOUD `_unsynced` fallback instead of silent mis-pairing. **Deliberately KEPT (different problems, not pairing
-guesses):** `_align_even`/`_odd_carry` (P3), `_srv_carry` (P40), ceil sizing (P9), lead-prime + burst feed, interrupt
+guesses):** `_align_even`/`_odd_carry` (P3), `_srv_carry` (P40) _(both since REMOVED in session 26 — superseded by
+the P52 producer-side fix, see the header)_, ceil sizing (P9), lead-prime + burst feed, interrupt
 flush (P44), close crossfade (P12), the `sync_with_audio`/`video_out_is_live` transport coupling. Gates: preflight +
 all 4 archive regressions PASS; measure ×3 avatar rows best of day (lead-hold 0.56/0.65/1.76s, lips +0.44s, end drift
 ±0.04s). **✅ THE USER'S LIVE EYE CONFIRMED: "still sync" — this is the verified sync baseline now (P19 gate passed).**
@@ -459,7 +512,9 @@ sample late and every int16 after it was assembled from the wrong two bytes. Mus
 waveform**, so Whisper heard static — no words, no consonants, **no pauses** — and the mouth flapped in a continuous generic
 pattern. **Fix:** carry the remainder across chunks (aligned to `2*channels`), `self._srv_carry`. Measured live, avatar-bound
 PCM vs the true voice: **peak xcorr 0.008 → 0.969 @ lag 0.000s**, ZCR 0.453→0.185, envelope dyn range 0.4→8.8 dB,
-quiet/peak 0.349→0.040. Watch `output/FIXED_live_avatar.mp4`.
+quiet/peak 0.349→0.040. Watch `output/FIXED_live_avatar.mp4`. _(Since superseded: session 26 fixed the odd bytes at
+their SOURCE — `cosyvoice_tts.run_tts` carries the byte across `iter_chunked()` reads — and removed both `_srv_carry`
+and `_align_even`; P52.)_
 
 **P41 (a real, separate bug — NOT the reported symptom).** The pump emitted `video_start` only on `playing:False→True`, so a
 `speech_start` arriving while the previous segment still drained swallowed it; the client (which resets its buffer on
@@ -1398,6 +1453,8 @@ Two real avatar-timing bugs and the steady-mode screech, all fixed and measured:
    redundant), AND `musetalk_video.py::_align_even` carries any dangling odd byte between downstream
    frames so the PCM stays whole-sample (any buffer clear can then only drop an even gap). Verified by
    `archive/_screech_repro_test.py` + byte-identical pre/post-transport audio. See PROBLEMS-AND-FIXES P3.
+   _(Since superseded: session 26 moved the whole-sample guarantee to the producer — `cosyvoice_tts.run_tts`
+   — and removed `_align_even`; the timeout raise stays. P52.)_
 
 ## ⭐ CosyVoice on vLLM (TTFB 3.4s → ~1.1s) — the real lip-lag fix
 
@@ -1467,7 +1524,7 @@ pipecat 1.3.0, so `video_out_is_live = not config.avatar_sync_with_audio`. One f
 - `local_services/musetalk_server/app.py` — MuseTalk GPU server (ws, frame-clock `pump()` markers,
   single-client session guard, watchdog).
 - `local_services/musetalk_video.py` — Pipecat client for the MuseTalk server; owns the
-  frame-clocked A/V sync (`_feed_q` pacing, `_align_even` anti-screech guard).
+  frame-clocked A/V sync (`_feed_q` pacing).
 - `local_services/cosyvoice_tts.py` — CosyVoice streaming TTS client (also reused by `TTS_PROVIDER=moss`).
 - `local_services/moss_server/app.py` — MOSS-TTS-Realtime streaming server (same wire contract as cosy).
 - `local_services/config_panel/` — the web config panel (`server.py` + `index.html`, `:7870`).

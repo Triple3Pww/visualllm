@@ -29,7 +29,10 @@ A/V-sync architecture decision (read it before touching sync).**
 **TTS note:** CosyVoice runs its autoregressive LLM on **vLLM inside WSL Ubuntu**
 (`cosyvllm` conda env on the Blackwell 5060 Ti) — this cut first-chunk latency ~3.4s→~1.1s, the root
 cause of the avatar lip-lag. The pipeline reaches it via `COSYVOICE_URL` set to the **WSL IP**, NOT
-`localhost` (WSL2's localhost relay buffers the streaming audio ~2s). Run it with
+`localhost` (WSL2's localhost relay buffers the streaming audio ~2s). That IP changes on
+`wsl --shutdown`, so **`launch.ps1` auto-heals a stale `.env` value against the live `wsl hostname -I`
+on every start** (`Sync-CosyVoiceUrl`, 2026-07-15); only manual non-launcher starts still need a
+hand-update. Run it with
 `bash /mnt/e/Claude/VisualLLm/tts/cosyvoice-server/run_vllm_server.sh` in WSL. The original Windows `tts`-env
 PyTorch server is the fallback (set `COSYVOICE_URL=http://localhost:8001` + start it). Full build
 notes + gotchas: the `project-visualllm-cosyvoice-vllm` memory.
@@ -196,7 +199,8 @@ needs that relaunch, NOT just the pipeline Restart. `docs/superpowers/plans/2026
 default; `live` = audio-master, voice instant + lips trail ~0.75s, can never pause. The old
 **steady "screech" is FIXED** — it was pipecat discarding the partial audio buffer after a >3s
 render-stall gap (`BOT_VAD_STOP_FALLBACK_SECS`); see `docs/PROBLEMS-AND-FIXES.md` P3 +
-`main.py::_relax_bot_vad_stop_timeout` and `musetalk_video.py::_align_even`. Remaining steady
+`main.py::_relax_bot_vad_stop_timeout` and the producer-side sample alignment in
+`cosyvoice_tts.py::run_tts` (P52 — replaced the old `_align_even` consumer patch). Remaining steady
 tradeoff: under a long render stall the voice briefly **pauses** then resumes clean — switch to
 `live` if that pause is worse than the lip trail), `MUSETALK_FPS` (**14** now (the user's pick); a divisor
 of 16000 (8/10/16/20/25) makes frame count = audio length exactly, but the server's `samples_for_frames`
@@ -334,6 +338,7 @@ below are still the way to run/debug a single stage.
 # 1. CosyVoice TTS server (DEFAULT = vLLM in WSL, TTFB ~1.1s) -- NOW IN THIS REPO at tts/cosyvoice-server/
 wsl -d Ubuntu -e bash -c "bash /mnt/e/Claude/VisualLLm/tts/cosyvoice-server/run_vllm_server.sh"   # serves :8001 in WSL
 #    Then set .env COSYVOICE_URL to the WSL IP (NOT localhost — WSL2 relay buffers the stream): `wsl hostname -I`.
+#    (launch.ps1 heals a stale WSL IP automatically on every start — Sync-CosyVoiceUrl; manual starts don't.)
 #    FALLBACK = Windows PyTorch server (slower, TTFB ~3.4s), set COSYVOICE_URL=http://localhost:8001 :
 #      E:\miniconda3\envs\tts\python.exe -m uvicorn app:app --host 0.0.0.0 --port 8001
 #    (COSYVOICE_PACE_RATE is UNSET -> code default 0 = pacing OFF; the Windows server needs SSL_CERT_FILE=<certifi> —
@@ -358,24 +363,32 @@ python -m local_services.config_panel.server               # edit .env + restart
 # Verify every fragile import resolves WITHOUT keys/network (Pipecat drift check):
 python -m scripts.preflight
 
-# Avatar A/V test tooling (headless, no browser; close any /client tab first — server is single-client):
-# UNIFIED harness (PREFER THIS): one command = WebRTC probe + pipeline.log parse + offline capture ->
-# output/measure_report.json + docs/measure_data.js (docs/workflow-timeline.html auto-uses it on reload).
-python -m scripts.measure --offline-capture                        # full turn timeline + handoffs + metrics
-#   measure.py ALSO reports a per-stage LATENCY WATERFALL to the user's EAR (not just server-side [TTFO]):
-#   it stitches the same-box probe arrival onto the log's t0 (t0.timestamp() == the probe's time.time()) so
-#   the last mile (transport + WebRTC encode + network, then browser jitter/playout) is measured, summing to a
-#   true end-to-end. Last mile = the HEADLESS always-on source: the audio pump records (epoch, rms) per frame,
-#   and the first sustained energetic frame after t0 is the answer reaching the client (the `probe` row); the
-#   browser-playout row is then an ESTIMATE (arrival + CLIENT_JITTER_BUFFER_MS).
-#   (The real-browser `--from-browser` / `CLIENT_PLAYOUT_PROBE` beacon was REMOVED 2026-07-14 with the /client
-#   <head> patches -- it only ever injected into the prebuilt page, which MUSETALK_SPLIT=1 makes unsupported,
-#   so it could never fire on /nimbus or /studio anyway.)
-#   Missing/pre-t0 anchors render `unknown` (never a fake/negative latency); a staleness guard blanks the client
-#   arrival if the last [TTFO] turn is older than duration+tail+15s. NOTE: synthetic-mic drives can VAD-split the
-#   wav's internal pause -> the LLM row shows `unknown`; a real human turn populates it. `pipeline/metrics.py`
-#   (the TtfoMeter) is deliberately UNTOUCHED -- the waterfall is derived in measure.py.
-#   (the two tools below are what measure.py wraps; run them standalone only for one-off debugging)
+# Avatar A/V test tooling (close any /studio tab first — server is single-client):
+# UNIFIED mic-to-ear latency harness (PREFER THIS). Now a PACKAGE at scripts/measure/ (entry
+# `python -m scripts.measure` unchanged): logparse.py (per-turn anchors), waterfall.py (stage
+# table + median/p95 + fresh/warm), drive.py (probe + Playwright), report.py (writers + history),
+# __main__.py (orchestration). Drives N turns, writes output/measure_report.json + docs/measure_data.js
+# (docs/workflow-timeline.html auto-uses it) + appends output/measure_history.jsonl.
+python -m scripts.measure --turns 5                                # real Chromium (true browser E+F) + fallback probe
+python -m scripts.measure --no-browser --turns 3 --offline-capture # headless probe: precise capture + arrival, est playout
+python -m scripts.measure --compare -2 -1                          # diff the last two history runs (did a change help?)
+#   The ~11-stage WATERFALL runs from the true MIC moment to the user's EAR, each row tagged with its
+#   SOURCE and the .env LEVER that moves it:
+#     Capture (speech-end -> t0: VAD hangover + Smart-Turn end-of-turn)  [driver]  <- VAD_STOP_SECS
+#       = (t0 - 'User started speaking') - the wav's energetic speech length. PRE-t0 latency the TTFO
+#         metric can't see; log-derived, works on both paths. NOT from a pre-connect clock (ICE+greeting skew).
+#     STT-finalize | LLM TTFB | LLM->TTS flush | TTS TTFB | Avatar render | steady lead-hold   [log]
+#     Transport+encode+network  [probe = headless arrival]
+#     Browser jitter buffer [browser-stats = getStats] | Browser decode+playout [browser-audio = WebAudio onset]
+#   REAL browser output delay via TWO paths (the 2026-07-14 removal of the /client beacon is REVERSED, done right):
+#     * auto: `--turns N` drives a real headless Chromium (Playwright) with the wav as a fake mic on
+#       /studio/?measure=1; its beacon POSTs jitter/onset -> pipeline.log `[client-playout]` line.
+#     * human: open /studio/?measure=1 yourself (incl. remote); the same beacon fires (min-RTT clock sync).
+#     Both land on the pipeline clock; `--no-browser` falls back to the probe (F row becomes an estimate).
+#   Avatar-render row needs the `[render] first-frame` log line (musetalk_video.py) -> RESTART the avatar+
+#   pipeline to pick it up. Missing/pre-t0/negative anchors render `unknown` (never a fake latency).
+#   `pipeline/metrics.py` (the TtfoMeter) is deliberately UNTOUCHED -- the waterfall is derived in scripts/measure/.
+#   (the two tools below are lower-level; run them standalone only for one-off debugging)
 python -m scripts._webrtc_probe --mic output/q_ai.wav --lead 8     # drives a turn, records + metrics
 E:\miniconda3\envs\musetalk\python.exe -m local_services.musetalk_server._capture output/q_ai.wav  # offline mp4
 # A/V-SYNCED offline capture (keeps ONLY real video_start..video_end frames, auto-detects frame size):
@@ -462,12 +475,16 @@ the values equal — this closed the silent-failure mode, it did not make a mism
 
 ## Environment constraints / gotchas (READ before debugging the avatar)
 
-- **The avatar-bound audio MUST stay whole-sample — carry the odd byte, never drop it** (`musetalk_video.py`,
-  `docs/PROBLEMS-AND-FIXES.md` **P40**). Audio is int16 (2 bytes/sample) and the TTS hands back **odd-byte** buffers. The
-  downstream (heard) copy is protected by `_align_even`; the avatar-bound feed is protected by `self._srv_carry`. Drop that
-  byte and every following int16 is assembled from the wrong two bytes → the server gets **loud broadband noise**, and since
-  MuseTalk lip-syncs off a **Whisper of the waveform**, the mouth flaps in a generic wordless pattern that never closes for
-  pauses (the voice still sounds perfect — that's the trap). This was THE multi-session "live lipsync is bad" bug.
+- **PCM sample alignment is enforced at the PRODUCER — keep it there** (`cosyvoice_tts.py::run_tts`,
+  `docs/PROBLEMS-AND-FIXES.md` **P40/P52**). Audio is int16 (2 bytes/sample), the server writes whole samples, but
+  HTTP-chunk/TCP boundaries land mid-sample and aiohttp's `iter_chunked()` propagates them (measured live: several
+  odd-length chunks per utterance, mid-stream). `run_tts` carries the dangling byte across reads so every
+  `TTSAudioRawFrame` it yields is whole-sample — the ONE place the invariant is restored (2026-07-15; the old
+  consumer-side patches `_align_even`/`_srv_carry` are removed, live-eye verified). If odd buffers ever reappear, fix
+  the producer, never drop a byte downstream: a dropped byte assembles every following int16 from the wrong two bytes
+  → the avatar server gets **loud broadband noise**, and since MuseTalk lip-syncs off a **Whisper of the waveform**,
+  the mouth flaps in a generic wordless pattern that never closes for pauses (the voice still sounds perfect — that's
+  the trap). This was THE multi-session "live lipsync is bad" bug.
 - **Debugging the avatar's mouth: your reference must not share the suspect input** (P40 metrology). Three sessions were
   lost to tests that could not fail. "Delivered frames == offline render, byte-identical" only proves the render is
   **deterministic** — feed both sides the same corrupt PCM and it passes. An offline render fed a voice captured off
@@ -561,8 +578,9 @@ the values equal — this closed the silent-failure mode, it did not make a mism
     the last poll returned, and `transcriptSeq` only advances once a response lands — so one >200 ms browser main-thread
     hitch sends the next poll out with the STALE `since`, the server returns the same rows to both, and both render them
     (**identical duplicate bubbles**). Keep the `polling` in-flight flag AND the `it.seq > transcriptSeq` skip.
-  **Not a bug, but it looks like one:** on SPEAKERS the live mic transcribes the avatar's own voice (`ECHO_GUARD=0`,
-  P11-broken under steady) → junk "user" turns (`奶奶有皮革戀愛`) → a junk query bubble + a real extra reply, and under
+  **Not a bug, but it looks like one:** on SPEAKERS the live mic transcribes the avatar's own voice (`ECHO_GUARD=0`
+  baseline; `=1` is mechanically fixed since P53 but not yet ear-tested) → junk "user" turns (`奶奶有皮革戀愛`) → a
+  junk query bubble + a real extra reply, and under
   `ALLOW_INTERRUPTIONS=1` it truncates the bot mid-sentence. Use headphones. Duplicate bubbles with IDENTICAL text = the
   poll race (P46); a gibberish second query bubble = mic echo.
 - **AVATAR PRESETS (2026-07-11).** Because one GPU runs one avatar, `/studio/` shows whichever **preset**
@@ -585,13 +603,16 @@ the values equal — this closed the silent-failure mode, it did not make a mism
 - Keep stage factories single-provider and thin; config is `.env`-driven only.
 - Comments state the *why* (latency, a Pipecat quirk, a hardware constraint) — match that voice.
 - Accepted tradeoffs (see `STATUS.md`): echo-guard defaults OFF (`ECHO_GUARD=0`, barge-in — use
-  headphones) because the half-duplex mute (`=1`) is broken under the default `steady` sync (mic
-  stuck-muted after a turn, `docs/PROBLEMS-AND-FIXES.md` P11); `=1` is valid only with
-  `MUSETALK_SYNC_MODE=live`. **`ALLOW_INTERRUPTIONS` (default `1` = BASELINE since P44, was live `.env`
+  headphones; the P44 baseline). The old steady-sync blocker for `=1` (P11 stuck-mute — no BotStopped
+  ever fired) is **FIXED at the root (P53, 2026-07-15)**: the avatar client holds the per-turn
+  `TTSStoppedFrame` until the voice fully drains, so BotStoppedSpeaking fires at true end of speech
+  under steady (probe + log verified; `archive/_tts_stop_order_test.py` is the regression proof).
+  `=1` under steady is now mechanically sound but **not yet live-ear-verified** — test a real
+  echo-guard session before relying on it. **`ALLOW_INTERRUPTIONS` (default `1` = BASELINE since P44, was live `.env`
   `0` under P37):** `0` = the bot always finishes its reply (user speech during playback never cancels
   it; typed turns queue politely). `1` = a mid-reply interruption **flushes the current turn clean**.
   This flips the turn-START strategies' `enable_interruptions` (the barge-in broadcast) — NOT the
-  P11-broken mic mute, so it is safe under steady. **Two interrupt fixes shipped under it (P44):** (a) a
+  echo-guard mic mute (P11, root-cause-fixed by P53), so it is safe under steady. **Two interrupt fixes shipped under it (P44):** (a) a
   clean-FLUSH — on the pipecat `InterruptionFrame` the avatar client drops in-flight server frames
   (`_flushing`, `musetalk_video.py`) and the MuseTalk server drains its `out_q` on `reset`
   (`app.py`, reuses the `seg_restart` path), so the avatar no longer keeps lip-moving silently / leaks
