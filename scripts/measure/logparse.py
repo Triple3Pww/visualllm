@@ -117,6 +117,59 @@ def smart_turn_trace(lines, t0):
     return out
 
 
+def select_driven_turns(turns, drive_start, want):
+    """The turns THIS run actually drove -- newest `want` of them.
+
+    Why this exists: find_turn_indices scans the WHOLE log (every turn ever run, going back
+    days), so taking `idxs[-want:]` silently BORROWS turns from earlier sessions whenever the
+    driver registers fewer than `want` [TTFO] lines. The failure is invisible and it backfills
+    with STALE, usually WORSE turns (an older session is likelier to be degraded), reported as a
+    fresh measurement. Measured 2026-07-16: a driver that produced 4 turns had a 5th backfilled
+    from a pipeline process 2 minutes older, and its render (2.20s vs the run's 0.51s) was read
+    as a "cold start" that never happened. Worst case: the driver fails against an idle stack and
+    the tool reports yesterday's turns with no warning at all.
+
+    drive_start=None (the --observe path) keeps everything -- there the pre-existing turns ARE
+    the subject. The caller is expected to say so out loud when fewer than `want` survive.
+    """
+    if drive_start is not None:
+        turns = [t for t in turns if t.get("t0_epoch", 0.0) >= drive_start]
+    return turns[-want:] if want else turns
+
+
+def interrupted_turns(turns):
+    """Turns whose reply was still going when the NEXT turn began (`turns` must be time-ordered).
+
+    A turn that speaks to completion logs 'Bot stopped speaking based on TTSStoppedFrame'; one the
+    next turn interrupts never does, so a missing bot_stopped is the overlap signature. Overlapped
+    turns are NOT measuring the system: the interrupt starves the renderer and inflates the
+    Avatar-render and transport rows. Measured 2026-07-16 on this stack: render 0.5s -> 2.17s under
+    overlap, deterministic enough to look exactly like the documented session-degradation bug --
+    and it was not it, it was the driver's own loop period.
+
+    ONLY turns with a successor can be judged. The FINAL turn of a run routinely lacks a bot-stop
+    because the driver disconnected mid-reply -- nothing came after it, so nothing interrupted it.
+    Flagging that would fire the warning on every run and train the reader to ignore it.
+    (Caveat: a reply longer than logparse's ~60s post-t0 window would also read as 'no bot-stop'.
+    At ~50s replies there is headroom, but a slower/wordier model could false-positive here.)
+    """
+    return [t for t in turns[:-1] if t.get("bot_stopped") is None]
+
+
+def reply_seconds(turns):
+    """Longest reply the bot actually SPOKE, from the turns that finished (None if none did).
+
+    This is the number the browser driver's loop period must clear (--blead + speech + --btail),
+    and it is measured rather than assumed because it depends on the model + prompt: on this
+    stack replies run ~50s, so the 32s --btail default guarantees every turn interrupts the
+    previous one. Interrupted turns are excluded -- their length is the interrupt, not the reply.
+    """
+    xs = [t["bot_stopped"] - t["bot_started"] for t in turns
+          if t.get("bot_stopped") is not None and t.get("bot_started") is not None
+          and t["bot_stopped"] > t["bot_started"]]
+    return max(xs) if xs else None
+
+
 def _pick_beacon(lines, target_epoch=None, max_gap=6.0):
     """Pick THIS turn's [client-playout] beacon. Match by the beacon's own `recv` epoch being
     closest to `target_epoch` (the turn's bot-start = when audio should reach the browser) -- this

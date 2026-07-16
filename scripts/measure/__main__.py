@@ -101,11 +101,15 @@ def main():
         report.compare_runs(*args.compare)
         return
 
+    # drive_start bounds which log turns belong to THIS run (None = --observe, where the turns
+    # the user already spoke ARE the subject). Taken before driving so nothing races it.
+    drive_start = None
     if args.observe:
         print(f"[1/3] observe: parsing the last {args.turns} REAL turns (no driving)...")
         path_kind, captures = "observe", []
     else:
         print(f"[1/3] driving {args.turns} turns through the live pipeline...")
+        drive_start = time.time()
         path_kind, captures = asyncio.run(_drive(args))
 
     print("[2/3] parsing pipeline.log for the driven turns...")
@@ -114,8 +118,19 @@ def main():
     if not idxs:
         raise SystemExit("No [TTFO ...] line in pipeline.log -- did a turn complete? "
                          "(Is the stack up, and did the driver reach it?)")
-    n = min(args.turns, len(idxs))
-    turns_raw = [logparse.build_turn(lines, i) for i in idxs[-n:]]
+    # Scan a WIDER window than we want, then keep only the turns this run drove: some driven
+    # turns never register a [TTFO], and the old `idxs[-want:]` quietly made up the difference
+    # with turns from earlier sessions (see logparse.select_driven_turns).
+    cand = [logparse.build_turn(lines, i) for i in idxs[-(args.turns + 5):]]
+    turns_raw = logparse.select_driven_turns(cand, drive_start, args.turns)
+    if not turns_raw:
+        raise SystemExit(
+            f"Drove {args.turns} turn(s) but NONE registered a [TTFO] line after the run "
+            f"started -- refusing to report earlier turns as this run. Is the stack up (:7860 "
+            f"and :8002), and did the driver reach it? (Use --observe to read pre-existing turns.)")
+    if drive_start is not None and len(turns_raw) < args.turns:
+        print(f"  NOTE: drove {args.turns}, but only {len(turns_raw)} registered a [TTFO] -- "
+              f"reporting those {len(turns_raw)}, NOT padding from earlier sessions.")
 
     jb_est_s = float(os.getenv("CLIENT_JITTER_BUFFER_MS", "400") or 400) / 1000.0
     sdur = drive.speech_duration(args.mic)   # the wav's real speech length
@@ -178,6 +193,36 @@ def main():
     report.write_outputs(rep)
     report.append_history(rep, {k: os.getenv(k) for k in report.ENV_KNOBS})
     report.print_summary(rep)
+
+    # OVERLAP GUARD (browser driver). The loop period MUST clear the bot's reply or every turn
+    # interrupts the previous one -- which starves the renderer and inflates Avatar-render +
+    # transport, looking exactly like a system regression. --btail documented this invariant but
+    # nothing enforced it, and the 32s default does not hold on this stack (replies run ~50s):
+    # measured 2026-07-16, btail=32 gave render 0.47/0.48/0.52/**2.17**/0.50 while btail=58 gave
+    # a flat 0.44-0.52 minutes later, same stack. A whole session was spent chasing that spike.
+    if path_kind == "browser":
+        bad = logparse.interrupted_turns(turns_raw)
+        longest = logparse.reply_seconds(turns_raw)
+        period = args.blead + (sdur or 0.0) + args.btail
+        if bad:
+            # Only suggest a number we can DEFEND. With every turn interrupted, no reply ever
+            # finished, so its true length is unknown -- and a guess derived from the (too short)
+            # current period just lands short again, sending the reader round the loop twice.
+            if longest is not None:
+                fix = (f"Re-run with --btail {longest + 8.0 - args.blead - (sdur or 0.0):.0f} "
+                       f"(period must clear the {longest:.0f}s reply).")
+            else:
+                fix = ("No turn ever finished speaking, so the reply length is UNKNOWN -- raise "
+                       "--btail until turns stop being interrupted, then read it off this line.")
+            print(f"  !! OVERLAP: {len(bad)}/{len(turns_raw) - 1} judgeable turns never logged a "
+                  f"bot-stop, so the next turn INTERRUPTED them. Loop period is ~{period:.0f}s"
+                  + (f", the bot speaks for {longest:.0f}s." if longest else ".")
+                  + f"\n     Interrupted turns do NOT measure the system (the renderer starves ->"
+                  f" the Avatar-render + transport rows inflate). Treat the rows above as suspect."
+                  f"\n     {fix}")
+        elif longest is not None and period < longest + 3:
+            print(f"  NOTE: loop period ~{period:.0f}s barely clears the {longest:.0f}s reply -- "
+                  f"raise --btail if turns start overlapping.")
 
     # Pre-t0 detail (clip-independent): the Smart-Turn verdict timeline for the last turn, so a
     # REAL human turn's end-of-turn cost is visible (how long it deliberated + the ttfs wait).

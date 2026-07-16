@@ -3,8 +3,69 @@ Run: pytest archive/_measure_logparse_test.py -v"""
 from datetime import datetime
 
 from scripts.measure.logparse import (
-    build_turn, find_turn_indices, parse_beacon_full, parse_playout_beacon,
+    build_turn, find_turn_indices, interrupted_turns, parse_beacon_full, parse_playout_beacon,
+    reply_seconds, select_driven_turns,
 )
+
+
+def test_select_driven_turns_drops_turns_from_an_earlier_session():
+    """The window must not silently borrow turns this run never drove.
+
+    find_turn_indices scans the WHOLE log, so `idxs[-n:]` backfills from earlier sessions
+    whenever the driver registers fewer than N [TTFO] lines -- reporting stale, usually WORSE
+    turns as a fresh measurement. Measured 2026-07-16: a driver that produced 4 turns had a
+    5th backfilled from a pipeline process 2 minutes older; its render (2.20s vs the run's
+    0.51s) was read as a cold start that never happened.
+    """
+    drive_start = 1000.0
+    turns = [dict(t0_epoch=900.0, tag="stray"),      # a previous session -> must be dropped
+             dict(t0_epoch=1001.0, tag="a"),
+             dict(t0_epoch=1002.0, tag="b")]
+    got = select_driven_turns(turns, drive_start, want=5)
+    assert [t["tag"] for t in got] == ["a", "b"]     # 2 real turns, NOT padded with the stray
+
+
+def test_select_driven_turns_keeps_everything_when_observing():
+    """--observe has no driver: the pre-existing turns ARE the subject, so nothing is dropped."""
+    turns = [dict(t0_epoch=900.0, tag="x"), dict(t0_epoch=901.0, tag="y")]
+    assert [t["tag"] for t in select_driven_turns(turns, None, want=5)] == ["x", "y"]
+
+
+def test_select_driven_turns_returns_only_the_newest_want():
+    turns = [dict(t0_epoch=float(1000 + i), tag=str(i)) for i in range(6)]
+    assert [t["tag"] for t in select_driven_turns(turns, 999.0, want=2)] == ["4", "5"]
+
+
+def test_interrupted_turns_are_those_whose_reply_never_finished():
+    """A turn that speaks to completion logs a bot-stop; one the NEXT turn cuts off never does.
+
+    Overlapped turns do not measure the system -- the interrupt starves the renderer. Measured
+    2026-07-16: render 0.5s -> 2.17s under overlap, which read exactly like the documented
+    session-degradation bug and was not it.
+    """
+    turns = [dict(bot_started=2.0, bot_stopped=None),   # cut off by the turn after it
+             dict(bot_started=2.0, bot_stopped=50.0),
+             dict(bot_started=2.0, bot_stopped=None)]   # LAST turn: see below
+    assert interrupted_turns(turns) == [turns[0]]
+
+
+def test_last_turn_without_a_bot_stop_is_not_called_interrupted():
+    """The final turn routinely lacks a bot-stop because the DRIVER disconnected mid-reply.
+
+    Nothing came after it, so nothing interrupted it -- only a turn with a successor can be
+    judged. Flagging it would fire the overlap warning on every single run and train the reader
+    to ignore it, which is worse than not warning at all.
+    """
+    assert interrupted_turns([dict(bot_started=2.0, bot_stopped=None)]) == []
+    assert interrupted_turns([]) == []
+
+
+def test_reply_seconds_is_the_longest_completed_reply():
+    turns = [dict(bot_started=2.0, bot_stopped=52.0),   # 50s -- the real reply length here
+             dict(bot_started=2.0, bot_stopped=12.0),
+             dict(bot_started=2.0, bot_stopped=None)]   # interrupted -> not a reply length
+    assert reply_seconds(turns) == 50.0
+    assert reply_seconds([dict(bot_started=2.0, bot_stopped=None)]) is None
 
 
 def _mk(lines_text):
