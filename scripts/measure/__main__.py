@@ -55,10 +55,13 @@ def _anchors_for_turn(turn, capture, beacon, onset_rel, jb_est_s):
         capture=capture,
     )
     if beacon:  # browser path: REAL transport arrival + jitter buffer + playout
-        recv, jit = beacon.get("recv"), beacon.get("jitter")
-        a["client_arrival"] = recv
-        a["jitter"] = (recv + jit) if (recv is not None and jit is not None) else None
-        a["playout"] = beacon.get("onset")
+        # recv/onset are tapped at the POST-jitter-buffer decoded stream (WebAudio), so they already
+        # INCLUDE the jitter buffer. Decompose: transport arrival = recv - jitter (packet on the
+        # wire before buffering); jitter-buffer end = recv; playout (decode + device) = onset.
+        recv, jit, onset = beacon.get("recv"), beacon.get("jitter"), beacon.get("onset")
+        a["client_arrival"] = (recv - jit) if (recv is not None and jit is not None) else recv
+        a["jitter"] = recv
+        a["playout"] = onset if onset is not None else recv
     else:       # probe path: measured arrival, ESTIMATED playout (arrival + configured jitter ms)
         a["client_arrival"] = onset_rel
         a["jitter"] = None
@@ -78,7 +81,9 @@ def main():
     ap.add_argument("--tail", type=float, default=28.0)
     ap.add_argument("--duration", type=float, default=40.0)
     ap.add_argument("--blead", type=float, default=2.0, help="browser fake-mic lead silence")
-    ap.add_argument("--btail", type=float, default=6.0, help="browser fake-mic tail silence (turn gap)")
+    ap.add_argument("--btail", type=float, default=32.0,
+                    help="browser fake-mic tail silence: the loop period (lead+speech+tail) MUST "
+                         "exceed the bot's reply length or turns overlap/interrupt each other")
     ap.add_argument("--fps", type=int, default=14)
     ap.add_argument("--offline-capture", action="store_true",
                     help="also drive the MuseTalk server directly for a clean lip offset")
@@ -123,7 +128,10 @@ def main():
             _ps, awall = captures[k]
             onset = answer_onset_epoch(awall, turn["t0_epoch"]) if awall else None
             onset_rel = round(onset - turn["t0_epoch"], 3) if onset is not None else None
-        beacon = logparse.parse_beacon_full(lines, turn["t0"])
+        # Match the beacon to THIS turn by proximity of its recv epoch to this turn's bot-start
+        # (when the voice reaches the browser) -- robust to looped/overlapping browser turns.
+        target = turn["t0_epoch"] + (turn["bot_started"] or 0.0)
+        beacon = logparse.parse_beacon_full(lines, turn["t0"], target)
         anchor_dicts.append(_anchors_for_turn(turn, capture, beacon, onset_rel, jb_est_s))
 
     # Receiver-side metrics + optional lip offset come from the LAST probe capture (browser -> {}).

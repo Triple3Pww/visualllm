@@ -52,9 +52,11 @@ def build_turn(lines, bi, target_s=3.0):
         if us_start is None and t0 is not None and "User started speaking" in txt and dt <= t0:
             us_start = dt
         if question is None:
-            qm = re.search(r"'role': 'user', 'content': '(.*?)'\}\]", txt)
-            if qm:
-                question = qm.group(1)
+            # The LAST user message in the context (each dict ends '}'); non-greedy per message so
+            # a multi-turn accumulated context isn't swallowed whole (the '}]'-anchored regex did).
+            qs = re.findall(r"'role': 'user', 'content': '(.*?)'\}", txt)
+            if qs:
+                question = qs[-1]
         if t0 and t0_gen and us_start and question:
             break
     if t0 is None:
@@ -103,34 +105,47 @@ def build_turn(lines, bi, target_s=3.0):
     return turn
 
 
-def _latest_beacon(lines, t0):
-    """Return the parsed json of the last [client-playout] line at/after t0-1s, or None."""
-    for dt, txt in reversed(lines):
+def _pick_beacon(lines, target_epoch=None, max_gap=6.0):
+    """Pick THIS turn's [client-playout] beacon. Match by the beacon's own `recv` epoch being
+    closest to `target_epoch` (the turn's bot-start = when audio should reach the browser) -- this
+    survives looped/overlapping browser turns where a broad time window mis-assigns a later turn's
+    beacon. target_epoch=None -> the last beacon (the single-turn / test case). None if no beacon is
+    within max_gap of the target."""
+    cands = []
+    for _dt, txt in lines:
         if "[client-playout]" not in txt:
             continue
-        if (dt - t0).total_seconds() < -1.0:
-            break
         m = re.search(r"\[client-playout\]\s*(\{.*\})", txt)
-        if m:
-            try:
-                return json.loads(m.group(1))
-            except ValueError:
-                continue
-    return None
+        if not m:
+            continue
+        try:
+            cands.append(json.loads(m.group(1)))
+        except ValueError:
+            continue
+    if not cands:
+        return None
+    if target_epoch is None:
+        return cands[-1]
+
+    def gap(b):
+        r = b.get("recv") if b.get("recv") is not None else b.get("onset", b.get("t"))
+        return abs(r / 1000.0 - target_epoch) if r is not None else 1e18
+    best = min(cands, key=gap)
+    return best if gap(best) <= max_gap else None
 
 
-def parse_playout_beacon(lines, t0):
-    """Onset offset (s) from the latest beacon; accepts old {'t':ms} or new {'onset':ms}."""
-    b = _latest_beacon(lines, t0)
+def parse_playout_beacon(lines, t0, target_epoch=None):
+    """Onset offset (s) from this turn's beacon; accepts old {'t':ms} or new {'onset':ms}."""
+    b = _pick_beacon(lines, target_epoch)
     if not b:
         return None
     ms = b.get("onset", b.get("t"))
     return None if ms is None else round(ms / 1000.0 - t0.timestamp(), 6)
 
 
-def parse_beacon_full(lines, t0):
+def parse_beacon_full(lines, t0, target_epoch=None):
     """All beacon fields, t0-relative seconds. jitter/rtt are durations (ms -> s)."""
-    b = _latest_beacon(lines, t0)
+    b = _pick_beacon(lines, target_epoch)
     if not b:
         return None
     base = t0.timestamp()
