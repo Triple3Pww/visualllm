@@ -149,9 +149,11 @@
     <div class="ttfo">
       <small>Time&#8209;to&#8209;first&#8209;output</small>
       <b id="m-ttfo">3.19s</b>
-      <small>target &lt; 8s <span class="pill" id="m-pass">PASS</span></small>
+      <small>target &lt; 3s <span class="pill" id="m-pass">PASS</span></small>
     </div>
   </div>
+
+  <div id="sparkbox" style="display:flex;gap:12px;align-items:center;margin-top:10px"></div>
 
   <div class="legend" id="legend"></div>
 
@@ -160,7 +162,7 @@
     <div class="chart-inner" id="chart"></div>
   </div>
   <p class="sub" style="margin-top:10px">t = 0 is the instant the user <b>stops</b> speaking (the
-  &lt;8s stopwatch starts here). The shaded band is the TTFO window. Hover any bar or dot for the
+  &lt;3s stopwatch starts here). The shaded band is the TTFO window. Hover any bar or dot for the
   why. Notice the <span style="color:var(--llm)">LLM</span>,
   <span style="color:var(--tts)">TTS</span> and <span style="color:var(--avatar)">avatar</span>
   lanes <i>overlap</i> — that is the whole trick. Hollow rings (◯) mark where a node
@@ -199,10 +201,13 @@
 
   <h2>Where the time goes — to the user's ear</h2>
   <div class="grid3" id="waterfall"></div>
-  <p class="sub" style="margin-top:10px">Each card is one stage's cost; the stages add up from
-  t0 (user stopped speaking) to the moment the browser plays the first sound.
-  <b>log</b> = pipeline clock · <b>probe</b> = headless client arrival ·
-  <b>browser</b>/<b>est.</b> = real speaker playout or a jitter-buffer estimate. A
+  <p class="sub" style="margin-top:10px">Each card is one stage's cost (median over the turns), and
+  every card names the <b>.env lever</b> that moves it — this is the map for minimizing latency. The
+  stages add up from the true <b>mic</b> moment (speech goes silent, the <i>Capture</i> row, before t0)
+  to the moment the browser plays the first sound. Source tags:
+  <b>driver</b> = known wav speech-end · <b>log</b> = pipeline clock · <b>probe</b> = headless client
+  arrival · <b>browser-stats</b> = real getStats jitter buffer · <b>browser-audio</b> = real WebAudio
+  playout onset · <b>est</b> = jitter-buffer estimate (no real browser this run). A
   <span style="color:var(--warn)">warn</span> card = that stage's anchor was missing this run.</p>
 
   <h2>How it felt on the wire (probe, receiver-side)</h2>
@@ -218,7 +223,7 @@
     (hard-refresh). All numbers above come from that one run.</div>
     <div style="margin-top:6px">Sources of truth: <a href="../STATUS.md">STATUS.md</a> ·
     <a href="../WORKFLOW.md">WORKFLOW.md</a> · <a href="./workflow-diagram.md">workflow-diagram.md</a>
-    (topology). Avatar A/V sync = <b>live / audio-master</b> (voice never freezes; lips best-effort).</div>
+    (topology). Avatar A/V sync = <b>steady / video-master</b> (default; synced start, voice paced to real frames).</div>
     <div style="margin-top:6px;color:#4a5668">Note: the lip-offset metric is a mouth-motion×audio
     cross-correlation; it's flagged <b>LOW-CONF</b> when the correlation is weak (the 256px mouth
     signal is noisy) — trust it only at corr ≥ 0.3. The voice-path timings don't depend on it.</div>
@@ -479,11 +484,42 @@ function buildWaterfall(){
     const sub = r.status==='total' ? 'end-to-end, user hears'
               : (r.cum!=null ? 'cum '+r.cum.toFixed(2)+'s' : 'anchor missing')
                 + (r.source ? ' · '+r.source : '');
-    card.innerHTML=`<div class="k">${r.stage}</div>`+
+    const srcTag = r.source ? `<span class="stag" style="color:var(--dim);float:right">${r.source}</span>` : '';
+    const lever = (r.lever && r.status!=='total')
+      ? `<div class="n" style="color:var(--dim);margin-top:3px">lever: ${r.lever}</div>` : '';
+    card.innerHTML=`<div class="k">${r.stage}${srcTag}</div>`+
       `<div class="v${tag}">${val}</div>`+
-      `<div class="n">${sub}</div>`;
+      `<div class="n">${sub}</div>`+lever;
     el.appendChild(card);
   });
+}
+
+// ---------- fresh-vs-warm session-degradation callout + run-history sparkline ----------
+function buildDegradation(){
+  if(!_M || !_M.meta || !_M.meta.fresh || !_M.meta.warm) return;
+  const el=document.getElementById('waterfall'); if(!el) return;
+  const f=_M.meta.fresh, w=_M.meta.warm;
+  const pick=o=> (o.playout!=null?o.playout:(o.bot_started!=null?o.bot_started:null));
+  const fe=pick(f), we=pick(w); if(fe==null||we==null) return;
+  const d=we-fe, cls=d>0.2?'tag-bad':(d>0.05?'tag-warn':'tag-ok');
+  const card=document.createElement('div'); card.className='card';
+  card.innerHTML=`<div class="k">Session degradation</div>`+
+    `<div class="v ${cls}">${(d>=0?'+':'')+d.toFixed(2)}s</div>`+
+    `<div class="n">warm (turn ≥5) − fresh (turn 1-2), at the last measured stage</div>`;
+  el.appendChild(card);
+}
+function buildSparkline(){
+  if(!_M || !_M.meta || !_M.meta.history) return;
+  const h=_M.meta.history.filter(x=>x.e2e_median!=null); if(h.length<2) return;
+  const box=document.getElementById('sparkbox'); if(!box) return;
+  const W=260,H=40,pad=4, xs=h.map((_,i)=>i), ys=h.map(x=>x.e2e_median);
+  const mn=Math.min(...ys), mx=Math.max(...ys), sx=(W-2*pad)/(h.length-1), sy=(H-2*pad)/((mx-mn)||1);
+  const pts=h.map((x,i)=>`${(pad+i*sx).toFixed(1)},${(H-pad-(x.e2e_median-mn)*sy).toFixed(1)}`).join(' ');
+  box.innerHTML=`<span class="lbl" style="color:var(--dim)">end-to-end, last ${h.length} runs</span>`+
+    `<svg width="${W}" height="${H}" style="display:block">`+
+    `<polyline points="${pts}" fill="none" stroke="var(--deliver)" stroke-width="2"/>`+
+    `<circle cx="${pad+(h.length-1)*sx}" cy="${H-pad-(ys[ys.length-1]-mn)*sy}" r="3" fill="var(--deliver)"/>`+
+    `</svg><span class="lbl" style="color:var(--mut)">${mn.toFixed(2)}s – ${mx.toFixed(2)}s</span>`;
 }
 
 function buildHandoffs(){
@@ -523,7 +559,7 @@ function setHL(id,on){
 }
 
 applyMeta(); buildLegend(); buildChart(); buildHandoffs(); buildEvents(); buildMetrics();
-buildWaterfall();
+buildWaterfall(); buildDegradation(); buildSparkline();
 </script>
 </body>
 </html>
