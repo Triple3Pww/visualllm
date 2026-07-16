@@ -78,7 +78,9 @@ async def run_bot(transport: BaseTransport, conn=None) -> None:
     context = LLMContext([{"role": "system", "content": config.system_prompt}])
     # Two independent, optional tweaks to the user aggregator, both via LLMUserAggregatorParams:
     #   * Echo-guard (ECHO_GUARD=1): mute the mic while the bot speaks (half-duplex) via
-    #     AlwaysUserMuteStrategy. BROKEN under steady sync (P11) -> default OFF.
+    #     AlwaysUserMuteStrategy. Its steady-sync blocker (P11 stuck-mute) is root-cause-fixed
+    #     (P53: the avatar client holds TTSStopped until the voice drains, so the unmute signal
+    #     now fires at true end of speech); default stays OFF pending a live ear-test.
     #   * No-interrupt (ALLOW_INTERRUPTIONS=0): the bot always finishes its turn; user speech
     #     during playback never cancels it. Done by turning OFF `enable_interruptions` on the
     #     default turn-START strategies (the flag that broadcasts the barge-in), keeping the
@@ -290,7 +292,13 @@ def _relax_bot_vad_stop_timeout() -> None:
 
     The constant is read as a module global at `_next_frame()` call time (once per session, when the
     audio task starts), so patching the module attribute before the client connects takes effect.
-    Knob: `BOT_VAD_STOP_FALLBACK_SECS` (seconds; <=0 leaves pipecat's 3s default)."""
+    Knob: `BOT_VAD_STOP_FALLBACK_SECS` (seconds; <=0 leaves pipecat's 3s default).
+
+    Cost history: disabling the gap-fallback used to ALSO kill the BotStoppedSpeaking signal under
+    steady (the P11 stuck-mute -- nothing else ever fired it). That cost is gone since P53: the avatar
+    client holds the per-turn TTSStoppedFrame until the voice fully drains, so bot-stopped now fires
+    from the TTSStopped path at true end of speech. This raise keeps its one remaining job: a mid-turn
+    render stall can't discard buffered voice."""
     try:
         secs = float(os.getenv("BOT_VAD_STOP_FALLBACK_SECS", "600") or "600")
     except ValueError:
@@ -600,6 +608,26 @@ def _ensure_client_patch_middleware() -> bool:
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"[say] failed: {e!r}")
                 return HTMLResponse("error", status_code=500)
+        # Studio playout beacon (?measure=1). The /studio page -- or a Playwright real-Chromium
+        # driver -- POSTs its measured browser-output timings here; we land them in pipeline.log as
+        # a single [client-playout] json line so scripts.measure reads them on the pipeline's one
+        # clock (same mechanism the offline probe arrival uses). GET returns the server epoch for
+        # the client's NTP-style min-RTT clock-offset handshake (needed only for a remote browser).
+        if request.url.path == "/client/measure-beacon":
+            import json as _json
+            import time as _time
+            if request.method == "POST":
+                try:
+                    from log_setup import ensure_file_sink
+                    ensure_file_sink("pipeline")
+                    body = _json.loads((await request.body())[:2000] or b"{}")
+                except Exception:  # noqa: BLE001
+                    body = {}
+                logger.info(f"[client-playout] {_json.dumps(body)}")
+                return HTMLResponse('{"ok":true}', media_type="application/json")
+            return HTMLResponse(
+                _json.dumps({"serverEpochMs": _time.time() * 1000.0}),
+                media_type="application/json", headers={"Cache-Control": "no-store"})
         # Client bootstrap config for the STATIC custom client (/studio). It is served as a
         # plain file, so it can't get a <head> RTCPeerConnection wrapper the way the prebuilt
         # /client page can -- it fetches this instead, before building the peer connection.
@@ -612,6 +640,7 @@ def _ensure_client_patch_middleware() -> bool:
         # here is what makes those knobs real again for /studio.
         if request.method == "GET" and request.url.path == "/client/ice-config":
             import json as _json
+            import time as _time
             servers = list(_ice_config_js)
             if _cf_turn_enabled:  # append a FRESH Cloudflare relay (short-lived creds)
                 cf_js, _ = _cloudflare_turn()
@@ -623,8 +652,13 @@ def _ensure_client_patch_middleware() -> bool:
                 _jb = 0
             _spk = (os.getenv("CLIENT_FORCE_SPEAKER", "1") or "1").lower() not in (
                 "0", "false", "no", "off")
+            # measureBeacon: whether /studio should run the ?measure=1 playout beacon at all;
+            # serverEpochMs: the client's clock-offset reference for the min-RTT handshake.
+            _beacon = (os.getenv("MEASURE_BEACON", "1") or "1").lower() not in (
+                "0", "false", "no", "off")
             return HTMLResponse(
-                _json.dumps({"iceServers": servers, "jitterBufferMs": _jb, "forceSpeaker": _spk}),
+                _json.dumps({"iceServers": servers, "jitterBufferMs": _jb, "forceSpeaker": _spk,
+                             "measureBeacon": _beacon, "serverEpochMs": _time.time() * 1000.0}),
                 media_type="application/json",
                 headers={"Cache-Control": "no-store"},
             )
