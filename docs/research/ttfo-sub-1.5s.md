@@ -7,8 +7,10 @@ fill-rate-bound) => 2.7-3.1s. Target < 1.5s. Web-swept last 12 months (agent run
 ## OUTCOME (end of 2026-07-15 session) — both engine swaps measured, both LOST to the tuned stack
 - #1 Cerebras LLM: tail win only (no scout on OpenRouter; gpt-oss-120b 0.94s median vs Groq 1.08s
   but Groq spikes to 2.55s). **User skipped** — not worth changing the P21 model baseline.
-- #3 vLLM-Omni TTS: 1.32s vs our 1.035s — per-request ref re-processing is structural. **Closed;
-  track upstream for ref caching** (would be ~0.83s FLAT, stddev 0.02).
+- #3 vLLM-Omni TTS: 1.32s vs our 1.035s — per-request ref re-processing is structural. **Closed.**
+  ~~track upstream for ref caching (would be ~0.83s FLAT)~~ → **RETESTED 2026-07-16 on the merged
+  `SpeakerEmbeddingCache`: the cache buys NOTHING (1.648 inline vs 1.664 cached, same build) and the engine
+  REGRESSED to 1.648s (now ~0.6s behind us). CLOSED FOR GOOD — do not re-open on the caching argument.** §3.
 - #2 Eager end-of-turn: explained, **parked (user: not now)**. Still the strongest untouched lever
   — it's the only one that OVERLAPS two serialized costs (turn-confirm wait + LLM prefill) instead
   of shaving one, and it lives in the pre-t0 zone TTFO can't measure. Two shapes when revisited:
@@ -62,6 +64,38 @@ Probe = `scratchpad/omni_ttfb_probe.py`, same 8 openers + leo ref as `_ttfb_vari
   extremely steady. IF a ref-feature cache lands upstream (or we patch one in — the hash of the
   ref is constant per preset), realistic TTFB ≈ 0.8s flat with the full ref. That's ~0.2s + all
   the variance vs today. Track upstream; not worth carrying a fork for.
+
+#### ❌ RETESTED 2026-07-16 — the ref-cache hope is REFUTED. CLOSED for good.
+The "IF a ref-feature cache lands upstream → ~0.8s flat" hope above (and the memory correction that
+`SpeakerEmbeddingCache`/PR #2630 made it reachable "today") was **tested and is wrong**. The cache exists only
+in unreleased `main` (0.24.0 is still the latest PyPI release and has no `speaker_cache.py`); main needs vllm
+0.25.x. Installed both and ran the clean **same-build** A/B this section never did — the cache as the ONLY variable:
+
+| arm (vllm-omni main 0.25.0rc2.dev26 + vllm 0.25.1, same 8 openers, same 9.2s leo ref) | median | stddev |
+|---|---|---|
+| inline ref (control) | **1.648s** | 0.109 |
+| **registered voice (the cache path)** | **1.664s** | 0.058 |
+| registered voice, **2.5s** truncated ref | **0.630s** | 0.049 |
+
+- **The cache buys NOTHING** (1.648 vs 1.664 = noise), and the **2.5s row proves why: ref length still
+  dominates the cached path.** If the cache were hitting, clip length could not matter. It is wired in
+  (`cosyvoice3.py:291-332`), the voice registers, `Speaker cache ready` logs — and it changes nothing.
+- **The engine REGRESSED**: inline 1.319s (0.24.0) → 1.648s (0.25.1), i.e. now ~0.6s BEHIND our 1.035s.
+- Both spikes ran `enforce_eager` (verified in both server logs) — eager is controlled, not a confound.
+- **The 0.630s is NOT a lever for us:** it is omni re-extracting the ref per request, work our server pays
+  ZERO times (it precomputes the prompt once). Ref length costs US only ~230 prefill tokens ≈ tens of ms, and
+  a shorter ref trades voice similarity — an EAR call, not a probe's.
+- New env walls beyond the checklist below: main needs vllm 0.25.x (`ModuleNotFoundError:
+  vllm.entrypoints.scale_out`); upgrading vllm re-installs **flashinfer**, which JIT-compiles and dies on
+  `Could not find nvcc`, while *uninstalling* it breaks vllm 0.25.1's **unguarded** import in
+  `flashinfer_sampler_supported()`. Only exit: **`VLLM_USE_FLASHINFER_SAMPLER=0`** (short-circuits before the
+  import, `topk_topp_sampler.py:38`). 0.24.0 tolerated the plain uninstall; 0.25.1 does not.
+- **If a future RELEASE ships the cache, test ONE thing first: the 2.5s-vs-9.2s ref delta.** If length still
+  matters, the cache is not hitting — stop there. Repro: `output/_start_omni.sh` + `output/_omni_*_probe.py`.
+- **Method note (the reason this needed a retest at all):** the 2026-07-15 verdict compared v3-on-omni-with-
+  inline-ref against v2-on-our-server-with-precomputed-prompt — **three variables at once** (model, engine, ref
+  path), then attributed the loss to one of them. Its own truncated-ref row contradicted it. Hold the build
+  constant and vary ONE thing; see `docs/PROBLEMS-AND-FIXES.md` P55 for the same lesson at the harness level.
 - Env gotchas paid (for a future retry): needs `s3tokenizer`; uv venv must use a MANAGED python
   (system 3.12 lacks Python.h); CC/CXX from the cosyvllm conda gcc; CUDA_HOME from the pip
   `nvidia-cuda-nvcc-cu13` wheel (`site-packages/nvidia/cu13`); uninstall flashinfer (JIT header

@@ -2344,3 +2344,82 @@ again): the synthetic clip INVENTED a 1.6s pre-t0 cost that real speech does not
 Trace to a mechanism, then confirm with the real input — never optimize a number you have not traced.
 (3) A library default is a guess about YOUR service; an undeclared capability is a bill you pay silently
 every turn.
+
+---
+
+## P55 — the transport row INVENTED ~0.2s that was never on the wire; and the harness that reported it lied 3 more ways ✅ FIXED (2026-07-16, 28th session)
+
+**Symptom.** `docs/LATENCY-MATRIX.md` ranked `transport + encode + network` at **0.41s median** — the 4th
+biggest row, and the obvious next target after TTS/LLM/render were all at their known limits. It looked like
+network jitter: 0.27 / 0.34 / 0.41 / 0.52 / **0.91**s across five turns, and once **3.37s**.
+
+**The tell, before any investigation: it was ~13x over its physics floor.** The work in that span is a 10ms
+send-track tick + 20ms Opus packetization + a same-box hop = **~0.03s**. A loopback link also cannot vary by
+640ms between turns. Any row that far over budget is the instrument, not the system.
+
+**Root cause. `answer_onset_epoch` (`scripts/measure/waterfall.py`) anchored "the audio arrived" at 18% of
+the WHOLE reply's peak.** Speech ramps rather than starting loud, so the tool sat waiting for the volume to
+rise and billed that wait to the network. Worse, the threshold scaled with the reply's LOUDEST moment, so a
+reply that got loud *later* raised the bar retroactively and dragged the reported onset further out — which
+is exactly the content-dependence that masqueraded as jitter. The row is also a **RESIDUAL**
+(`(recv - jitter) - bot_started`, `__main__.py`): nothing measures transport, so every unmodelled delay and
+every anchor error lands in it.
+
+**Measured (the decomposition, not the argument):**
+
+| what | measured | how |
+|---|---|---|
+| pipecat send path, queued -> on the wire | **0-39ms**; loop never >20ms late | `MEASURE_SEND_TRACE=1`, n=7 |
+| **real transport** (`bot_started` -> first audio at a same-box receiver) | **0.116s** | probe, n=1 |
+| harness's reported onset, same turn | 0.271s | probe, n=1 |
+| **-> pure detector bias** | **0.154s** | difference |
+
+**Fix.** `thresh_frac` **0.18 -> 0.02** — detect PRESENCE (audio vs digital silence), not loudness. Kept a
+FRACTION, not an absolute: the probe scores int16 rms (peak ~2.7e3), the browser beacon scores normalized
+(~1.0), and only a fraction ports across both. Probe row **0.33 -> 0.14s** on live turns, matching the
+0.116s hand-measurement. Regression test:
+`archive/_measure_waterfall_test.py::test_onset_is_not_dragged_late_by_a_loud_later_passage`. The old tests
+missed it because they step 0.0 -> 0.6 square waves, which clear *any* fraction of the peak.
+
+**Verdict: transport is CLOSED.** Real transport ~0.13s, floor ~0.05s. Nothing to win. Its old lever
+(`WEBRTC_VIDEO_BITRATE_MAX`) caps the **VP8 video** encoder while the voice rides a **separate Opus track** —
+it could never have moved that row, a null result forever.
+
+**Two hypotheses died on their own probes — do not re-open without new evidence:**
+- **Browser jitter buffer.** The `--no-browser` probe has no NetEq, no rAF, no analyser, and still read 0.33s.
+- **Event-loop contention** (the P47.2 shape: one loop carries RTP + pipeline + the MuseTalk pump).
+  `MEASURE_SEND_TRACE` measured it: queued->wire in 0-39ms, loop never >20ms late. Clean.
+
+**The same harness lied 3 more ways, all fixed (they corrupted 2 analyses before being caught):**
+1. **It reported turns it never drove.** `idxs[-N:]` took the last N `[TTFO]` lines from the ENTIRE log, so a
+   run that registered fewer than N silently backfilled from earlier sessions — with STALE, usually WORSE
+   turns. A stray from a different pipeline process (render 2.20s vs the run's 0.51s) was read as a "cold
+   start" that never happened. Fixed: `logparse.select_driven_turns` filters to `t0_epoch >= drive_start`,
+   reports honestly (`drove 5, only 4 registered`), and REFUSES to report if none are real.
+2. **The `--btail 32` default guaranteed the artifact its own help text warned about.** Loop period ~37s vs a
+   **50.1s** reply -> every turn interrupts the previous one, starving the renderer: render **0.5s -> 2.17s**,
+   deterministic enough to look exactly like the documented session-degradation bug. It was not.
+   btail=58 gave a flat 0.44-0.52 minutes later on the same stack. Fixed: `logparse.interrupted_turns` +
+   `reply_seconds` detect it and warn with a defensible number (or say "unknown" rather than guess).
+3. **Two rows are not measurements.** On the probe path "Browser decode + playout" is
+   `CLIENT_JITTER_BUFFER_MS/1000` echoed back in a column labelled as data; "steady lead-hold" is
+   structurally 0.00 (`bot_started` == `render`), so the 14-frame lead's real cost hides in Avatar-render.
+
+**Uncovered by the fixes (still open):** `--blead 2` is shorter than the ~5s ICE handshake, so the browser
+driver's FIRST turn is spoken to a pipeline that is not listening yet and is lost every run — that is the
+real reason every run reports "drove N, got N-1". The backfill had been hiding it behind a plausible number.
+
+**Also measured and cleared (2026-07-16): barge-in costs NOTHING.** New `[barge]` logs in
+`musetalk_video.py` (3 lines/turn, no per-frame cost; the path was previously SILENT): 5/5 interrupted turns
+ran 359-532ms, identical to clean turns, with the first PCM on the wire in **+0ms**, `burst_left=1.00s`,
+`qdepth=0`. The flush window is identical on spiked and clean turns (4.86s/58 frames vs 4.58s/55), so
+`_flushing` is exonerated too. **Residual, still open:** an intermittent **~1-in-7 +1.7s** first-frame spike,
+independent of the interrupt path (GPU flat, flush identical, feed instant). Not yet caught with the trace armed.
+
+**The lesson — P54's, in reverse, and the house rule's third face.** P54: a row HID a real second. P55: a row
+INVENTED a fifth of one. Same root cause both times — a number nobody had decomposed. P19 says "the probe
+passes what the eye rejects"; P33 ran it backwards (a measured delta -> a predicted defect the eye never saw).
+**P55 is the third face: a probe can also FAIL what the wire already delivered.** Before optimising any row,
+check it against its physics floor. Cheap decomposition that needs no new code: `--no-browser` (probe) vs the
+browser path splits browser-side from upstream; `MEASURE_SEND_TRACE=1` splits pipecat from the wire.
+Matrix: `docs/LATENCY-MATRIX.md` §Correction · next target: `docs/TTS-FIRST-CHUNK-HANDOFF.md`.

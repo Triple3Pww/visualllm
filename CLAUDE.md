@@ -385,6 +385,16 @@ python -m scripts.measure --compare -2 -1                          # diff the la
 #   PRE-t0 vs POST-t0: TTFO's stopwatch STARTS at t0 (user-stopped), so it can NEVER see the cost of
 #   DECIDING t0. Felt delay = pre-t0 + post-t0. That blind spot hid a full second (P54). The measured
 #   real-turn matrix + what-to-attack-next lives in `docs/LATENCY-MATRIX.md` (median mic-to-ear 2.91s).
+#   *** NEXT TARGET + THE ONLY ROW LEFT WITH HEADROOM: `docs/TTS-FIRST-CHUNK-HANDOFF.md` (TTS 0.93s). ***
+#   THE HARNESS LIES -- read `docs/PROBLEMS-AND-FIXES.md` P55 BEFORE trusting any row. It invented ~0.2s of
+#   "network" that was never on the wire (transport is CLOSED: ~0.13s real, at its floor -- and its listed
+#   lever WEBRTC_VIDEO_BITRATE_MAX caps VP8 VIDEO while the voice is a separate OPUS track, so it could never
+#   have moved it). Two traps that survive: `--btail` MUST exceed the bot's reply (~50s! the 32s default makes
+#   every turn interrupt the last -> the render row inflates and fakes a "session degradation" bug), and
+#   `--blead 2` < the ~5s ICE handshake so the driver's FIRST turn is LOST every run ("drove N, got N-1").
+#   The tool now warns on both instead of silently backfilling strays from older sessions.
+#   RULE THAT CAUGHT ALL 5 FALSE FINDINGS: check a row against its PHYSICS FLOOR before optimising it;
+#   13x over budget is the instrument, not the system. Then instrument the seam -- never argue.
 #   JUDGE PRE-t0 ONLY FROM `--observe` ON REAL SPEECH: the synthetic clip's comma pause makes Smart Turn
 #   re-poll (it re-runs once per VAD pause) and INVENTS a ~1.6s pre-t0 cost real speech does not have
 #   (5 real turns: 0 INCOMPLETE polls). `--observe` leaves Capture blank on purpose (human speech length
