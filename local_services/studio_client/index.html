@@ -878,6 +878,56 @@
       } catch (_) {}
     }
 
+    // ---- ?measure=1 PLAYOUT BEACON ----------------------------------------------------------
+    // Measure the REAL browser output delay (jitter buffer + decode + device playout) and POST it
+    // so scripts.measure has a true mic-to-ear number instead of an estimate. Off unless the URL
+    // has ?measure=1 AND the server allows it (MEASURE_BEACON). Same-box driver: browser Date.now()
+    // already matches the pipeline wall clock; a REMOTE browser corrects with a min-RTT handshake.
+    let MEASURE = new URLSearchParams(location.search).get('measure') === '1';
+    let clockOffMs = 0;                         // browser Date.now() - server epoch
+    let mRecvMs = null, mOnsetMs = null, mPeak = 0, mJb0 = null;   // per-turn state
+    async function syncClock() {
+      let best = 1e9;
+      for (let i = 0; i < 5; i++) {
+        const a = Date.now();
+        try {
+          const r = await fetch('/client/measure-beacon'); const j = await r.json();
+          const b = Date.now(), rtt = b - a;
+          if (rtt < best) { best = rtt; clockOffMs = (a + rtt / 2) - j.serverEpochMs; }
+        } catch (_) { break; }
+      }
+    }
+    function measureTurnStart() {               // arm a clean per-turn measurement at speech start
+      mRecvMs = null; mOnsetMs = null; mPeak = 0; mJb0 = null;
+      if (pc) pc.getStats().then(s => s.forEach(r => {
+        if (r.type === 'inbound-rtp' && r.kind === 'audio')
+          mJb0 = { d: r.jitterBufferDelay || 0, c: r.jitterBufferEmittedCount || 0 };
+      })).catch(() => {});
+    }
+    async function postBeacon() {               // at speech end: read getStats, POST one beacon
+      if (mRecvMs === null) return;
+      const recv = mRecvMs, onset = mOnsetMs;   // snapshot before any await
+      let jitterMs = 0, rttMs = 0;
+      try {
+        const s = await pc.getStats();
+        s.forEach(r => {
+          if (r.type === 'inbound-rtp' && r.kind === 'audio' && mJb0 && r.jitterBufferEmittedCount) {
+            const dc = r.jitterBufferEmittedCount - mJb0.c;   // per-turn delta = this turn's avg
+            if (dc > 0) jitterMs = 1000 * (r.jitterBufferDelay - mJb0.d) / dc;
+          }
+          if (r.type === 'candidate-pair' && r.currentRoundTripTime != null && r.nominated)
+            rttMs = 1000 * r.currentRoundTripTime;
+        });
+      } catch (_) {}
+      try {
+        fetch('/client/measure-beacon', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ recv: Math.round(recv), onset: onset && Math.round(onset),
+                                 jitterMs: Math.round(jitterMs), rttMs: Math.round(rttMs) }),
+        });
+      } catch (_) {}
+    }
+
     // Watch the bot audio energy -> flip Listening <-> Speaking (drives the equalizer).
     function watchBotAudio(stream) {
       try {
@@ -892,9 +942,14 @@
           let sum = 0;
           for (let i = 0; i < buf.length; i++) { const v = (buf[i]-128)/128; sum += v*v; }
           const rms = Math.sqrt(sum / buf.length);
+          if (MEASURE) {
+            const now = Date.now() - clockOffMs;
+            if (rms > 0.01) { if (mRecvMs === null) mRecvMs = now; mPeak = Math.max(mPeak, rms); }
+            if (mOnsetMs === null && mPeak > 0 && rms >= 0.18 * mPeak && rms > 0.02) mOnsetMs = now;
+          }
           if (rms > 0.02) { hi++; lo = 0; } else { lo++; hi = 0; }
-          if (!speaking && hi > 2) { speaking = true; setState('speaking','Speaking'); }
-          else if (speaking && lo > 12) { speaking = false; if (connected) setState('live', idleLabel()); }
+          if (!speaking && hi > 2) { speaking = true; setState('speaking','Speaking'); if (MEASURE) measureTurnStart(); }
+          else if (speaking && lo > 12) { speaking = false; if (connected) setState('live', idleLabel()); if (MEASURE) postBeacon(); }
           rafId = requestAnimationFrame(tick);
         };
         rafId = requestAnimationFrame(tick);
@@ -923,6 +978,8 @@
             if (j.iceServers && j.iceServers.length) iceCfg = { iceServers: j.iceServers };
             jitterMs = j.jitterBufferMs || 0;
             forceSpeaker = j.forceSpeaker !== false;
+            MEASURE = MEASURE && (j.measureBeacon !== false);   // server can force the beacon off
+            if (MEASURE) syncClock();                            // min-RTT clock offset (remote only)
           }
         } catch (_) {}
         await loadOverlay();   // sets _split if MUSETALK_SPLIT is on; else full-frame <video> fallback
