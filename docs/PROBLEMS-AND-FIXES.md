@@ -3,6 +3,9 @@
 A running catalogue of the real bugs hit in this system, each with the **symptom**, the
 **root cause** (how it was actually proven, not guessed), and the **fix**. Newest first.
 This is the "why is the code the way it is" reference — read it before re-litigating a fix.
+Sections whose fix AND the code it described are both gone (P7/P8/P10 deleted; P11/P13/P40
+retired 2026-07-18) are moved to **`PROBLEMS-AND-FIXES-ARCHIVE.md`** — P-numbers stay stable so
+a `(P40)` reference still resolves there.
 
 > Companion docs: `STATUS.md` (current state, source of truth) · `WORKFLOW.md` (end-to-end
 > workflow + full `.env`) · `CLAUDE.md` (conventions). Live measurement: `scripts/measure.py`.
@@ -53,6 +56,28 @@ unchanged (240 ms), so benchmark mode was pure downside here.
 
 **Verified.** first-segment GPU **16,372 ms → 346 ms**; lips-start **+5.3 s → +1.0 s**; a 13 s
 reply renders 179 frames at a steady 12 fps; server warmup **17.7 s → 1.0 s**.
+
+**Re-verified 2026-07-16 (30th session) — KEEP the flag, and here is the 2×2 the original writeup lacks.**
+Driving the same 13.56 s reply through the server (`MUSETALK_PROFILE=1`, `_drive_frames`, fps=12):
+
+| Run | Config | 1st-segment `gpu` | Frames rendered | Drift |
+|---|---|---|---|---|
+| A | `TRT=1`, `benchmark=False` *(live baseline)* | 136 ms | 162/163 | +0.36 s |
+| B | `TRT=1`, `benchmark=True` | 158 ms | 162/163 | +0.36 s |
+| C | `TRT=0`, `benchmark=False` | 470 ms | 162/163 | +0.36 s |
+| D | `TRT=0`, `benchmark=True` | **16,131 ms** | **88/163** | **−6.1 s** |
+
+Three things this settles: **(1) it is per-TURN, not first-turn** — run D spiked *twice in one reply*
+(seg 1 = 16,131 ms **and** a mid-reply shape-boundary seg = 16,223 ms), confirming cuDNN re-autotunes on
+every new shape. **(2) `steady` cannot mask it** — the render physically produced 88 of 163 frames; steady
+is video-master, so it would *pause the voice ~6 s* waiting for frames that never come (it converts a trail
+into a dead stall — it cannot manufacture render). **(3) NEW — the catastrophe is confined to the
+`MUSETALK_TRT=0` path:** under the live `TRT=1` baseline the UNet is a TRT engine (and the torch UNet is
+freed by `MUSETALK_FREE_TORCH`), so cuDNN autotune never runs on it and `benchmark=True` costs only ~0.5 s
+of turn-start whisper re-tune (787/661 ms vs 209 ms), not 16 s. **The flag therefore guards the documented
+PyTorch fallback** ("any TRT load failure falls back to PyTorch") plus that ~0.5 s — cheap, so keep it.
+**Trap for anyone "cleaning" this line:** `cudnn.benchmark` **defaults to `False`**, so *deleting* the line
+changes nothing at runtime and will look safe — you would only be deleting the guard and the reason.
 
 ---
 
@@ -190,43 +215,28 @@ every RTP packet through a stack-walking handler **on the asyncio media loop**.
 
 ---
 
-## P6 — Avatar lip-lag ~1.5–2s = CosyVoice first-chunk latency (the original TTS-latency fix) ✅ FIXED
+## P6 — CosyVoice first-chunk latency: TTS TTFB 3.4s → ~1.1s (the original TTS-latency fix) ✅ FIXED
 
-**Symptom.** Lips trailed the voice ~1.5–2 s.
+**Symptom.** The bot's voice was slow to start — a ~3 s fixed per-reply cost before the first sound.
+(The ~1.5–2 s *lip trail* that opened this investigation was the **then-default** sync mode's
+symptom; it is not steady's. Steady paces the voice to the rendered frames, so a slow first chunk
+shows up as a later **synced start**, never a trail.)
 
 **Root cause.** NOT the render (server starts lips in ~0.77 s if fed fast) but **CosyVoice's
 first-chunk latency** — the autoregressive LLM prefill+gen delivered the opening ~1.2 s of speech
 over ~1.5–3 s (~3 s fixed per-reply cost).
 
-**Fix.** Moved CosyVoice2's LLM onto **vLLM in WSL Ubuntu** (Blackwell 5060 Ti). Measured TTFB
-**3.4 s → ~1.1 s**, and it now actually streams. Pipeline reaches it at the **WSL IP** (NOT
-`localhost` — WSL2's localhost relay buffers the stream ~2 s). Full build notes:
-`project-visualllm-cosyvoice-vllm` memory + `E:\Claude\cosyvoice-local-tts\run_vllm_server.sh`.
+**Fix.** Moved CosyVoice2's LLM onto **vLLM in WSL Ubuntu** (Blackwell 5060 Ti). **The measured,
+direct win is TTS TTFB 3.4 s → ~1.1 s** (and it now actually streams). Pipeline reaches it at the
+**WSL IP** (NOT `localhost` — WSL2's localhost relay buffers the stream ~2 s). Full build notes:
+`project-visualllm-cosyvoice-vllm` memory + `tts/cosyvoice-server/run_vllm_server.sh` (the TTS
+server now lives in THIS repo; the old `E:\Claude\cosyvoice-local-tts` was retired 2026-07-14).
 
----
-
-## P7 — Locked/steady A/V sync froze the whole voice ✅ AVOIDED (design decision)
-
-**Symptom.** Earlier video-master experiments: any render stall **froze the voice too**
-(`hold=2.88s audio 2.9s video 0.0s`).
-
-**Root cause.** On a single shared GPU the render can dip below real-time; locking the voice to the
-video propagates a render stall into a voice freeze.
-
-**Decision.** Default to **`live` (audio-master)** — voice forwarded immediately, can never freeze;
-lips best-effort. (Steady was revisited this session for its synced start, but see **P3** — it has
-the separate pipecat screech bug, so `live` remains the default.)
-
----
-
-## P8 — TTS dead (avatar shows but won't talk) = ElevenLabs out of credits ✅ FIXED (fallback)
-
-**Symptom.** Replies died at the TTS stage; logged 33 s TTFB was the websocket hanging on a quota
-error.
-
-**Fix.** `TTS_PROVIDER` switch in `pipeline/stages/tts.py` — `deepgram` builds Deepgram Aura
-(English-only) as a fallback; `cosyvoice` (default) and `elevenlabs` remain. A deliberate single
-fallback switch, not a return to multi-provider branching.
+**What it actually fixes = TTFB/TTFO.** The direct, measurable effect is the TTFB drop above, which
+lowers overall time-to-first-output. In the current **`steady`** baseline the voice is paced to the
+rendered frames (synced start), so the lip-lag is ~0 *by construction* and owned by the **sync
+mode**, not by TTS speed. So read P6 as a **TTFB fix**, not a lip-lag fix (verified by mechanism,
+2026-07-16).
 
 ---
 
@@ -265,64 +275,14 @@ divide 16000** (8/10/12.5/16/20/25…); the fix makes 12 correct anyway.
 **Verified (live, fps=12).** Warmup `7 → 8 frames/segment`; a 13.56 s reply rendered **163** lip
 frames (was 141) = its full audio length, so the lips end with the voice. Deterministic repro (no
 GPU): `archive/_frame_deficit_repro_test.py` (old=142 ≈ the observed 141, new=162). Live driver:
-`scripts/_verify_frame_count.py <wav> <fps>`.
+`python -m scripts._drive_frames <wav> <fps>` — read `REAL rendered … matches audio?` (the old
+`scripts/_verify_frame_count.py` was deleted 2026-07-14).
 
----
-
-## P10 — A fraction-of-a-second of leftover audio plays ~1–2 s AFTER the turn ✅ FIXED (ceil cap, re-applied 2026-06-24)
-
-> **Status: APPLIED.** The `ceil`-the-cap fix below is live in `musetalk_video.py::_advance`. It was
-> implemented + verified, reverted-by-preference once (2026-06-23), then **re-applied 2026-06-24** when
-> the end-of-turn audio choppiness it leaves was judged worse. Verified 2→0 stranded audio chunks.
-
-**Symptom.** After the voice finished, ~1–2 s of silence, then a brief (<~0.1 s) fragment of the
-turn's audio played. Worse after `MUSETALK_END_TAIL_FRAMES` was raised to 10.
-
-**Root cause.** Steady mode releases each buffered audio chunk paired with the rendered frame whose
-time covers it (`musetalk_video.py::_advance`/`_emit_pair`). `_advance` capped the release cursor at
-`audio_cap = int(audio_clock·fps) + 1` — **`int()` = floor**. A turn's audio length is rarely a whole
-number of frames (13.56 s × 12 = 162.72), so the last real frame paired audio only up to
-`floor(162.72)/12 = 13.5 s`, stranding the final **sub-frame** (0.06 s). The same floor cap stopped
-the END_TAIL frames from releasing it, so it waited for `_drain_audio()` at the `video_end` marker —
-which the server delays by END_TAIL (10 frames = 0.83 s) + `idle_grace` (0.3 s) ≈ **1.1 s**. So the
-stranded sub-frame played ~1–2 s late as a blip. (P9's frame-count fix made the lips end on time but
-left this sub-frame remainder, which this exposed.)
-
-**Fix (applied).** `audio_cap = ceil(audio_clock·fps) + 1` (`musetalk_video.py::_advance`).
-`ceil` makes the trailing frame reachable, so the last sub-frame of audio releases paired with the
-trailing/END_TAIL frame (~one frame later, contiguous) instead of waiting for the delayed drain. Costs
-one frame of look-ahead, which only binds at end-of-turn (mid-turn the binding cap is the rendered-frame
-count) and which TTS — running ahead of real-time — has already buffered. Verified with a deterministic
-repro (a 13.56 s turn stranded **1** audio chunk to the drain before, **0** after) and on the live path.
-
-## P11 — With echo-guard on, voice stops triggering after the first turn (must type) ✅ FIXED (default flipped, 2026-06-23; **root cause fixed 2026-07-15 — see P53**)
-
-> **2026-07-15 update:** the mechanism below is now FIXED at its root (P53): the avatar client holds the
-> `TTSStoppedFrame` until the turn's voice fully drains, so `BotStoppedSpeaking` fires at true end of
-> speech and the stuck-mute state machine can no longer arise. `ECHO_GUARD=1` under steady awaits a live
-> ear-check before being trusted; the default stays `0`.
-
-**Symptom.** Speaking a turn produced no response — the user had to type into the client for it to
-work. Only after a bot turn; the first interaction could work, then the mic went dead.
-
-**Root cause (a 3-way interaction, all pre-existing).** Echo-guard uses pipecat's
-`AlwaysUserMuteStrategy`, which mutes the user on `BotStartedSpeakingFrame` and unmutes on
-`BotStoppedSpeakingFrame`. (1) In **steady** sync the voice is held/released *late* (paced to video),
-so the output transport sees audio arrive **after** the per-turn `TTSStoppedFrame` → it fires a
-**second `BotStartedSpeaking`** right after the early unmute → re-mutes the user. (2) The screech fix
-raised `BOT_VAD_STOP_FALLBACK_SECS` to 600 s, so the transport's audio-gap `BotStoppedSpeaking`
-never fires afterward. Net: after a turn the mute state machine is left `_bot_speaking=True` with no
-unmute → **mic stuck muted**, so STT gets no audio and no turn triggers. Typing bypasses the audio mute.
-Confirmed in the log: `... user is now unmuted` (on TTSStopped) immediately followed by
-`... user is now muted` while the avatar was still rendering the tail, with no unmute after.
-
-**Fix.** Flip the default to **`ECHO_GUARD=0`** (barge-in; no mute strategy, mic always live) in
-`pipeline/config.py`. Lowering `BOT_VAD_STOP_FALLBACK_SECS` was rejected (it reintroduces the P3
-screech). Verified: with `ECHO_GUARD=0` a synthesized voice turn triggered cleanly
-(`User started speaking` → LLM → `TTFO {count:1, pass:True}`) with **no** mute events. Tradeoff: the
-mic is always live → use headphones / OS echo cancellation. `ECHO_GUARD=1` remains valid **only** with
-`MUSETALK_SYNC_MODE=live`, where bot-speech framing tracks correctly. Proper half-duplex-in-steady
-support (mute on `TTSStarted`/unmute on `TTSStopped` instead of the transport frames) is a future option.
+**Re-verified 2026-07-16 — the fix is LOAD-BEARING, do not remove.** `MUSETALK_FPS=12` does NOT divide
+16000 (1333.33), so `samples_for_frames` is exactly what makes fps=12 legal. Repro re-run: OLD sizing
+still yields **7 frames/segment**, NEW yields 8 for every fps; e2e 13.5 s reply **old=142 vs new=162**.
+Live drive at the current baseline (TRT=1, fps=12): **162 rendered / 163 needed** (within the ±1
+tolerance) — the deficit has not returned.
 
 ---
 
@@ -336,9 +296,10 @@ support (mute on `TTSStarted`/unmute on `TTSStopped` instead of the transport fr
 > 1. **Rest-pose swap** (`_build_neutral_rendered`, hold a VAE-rendered closed-mouth frame): cut the
 >    *domain* pop ~45% offline but the mouth still shape-snapped in one frame. Reverted.
 > 2. **Audio-paired crossfade** (each close frame paired with a frame of trailing silence through the
->    steady `_emit_pair` path): correct in principle, but the `_advance` **audio-cap** (which stops
->    video running ahead of voice) **strands** the close frames whenever the render ran behind (video >
->    audio, common on the shared GPU) -> still snapped. So the close must NOT be audio-paired.
+>    steady `_emit_pair` path): correct in principle, but it snapped anyway. **The close cannot be
+>    audio-paired — it is structurally impossible:** a client-synthesized blend carries no `audio_pos`
+>    for `_emit_pair` to pair to, and `_drain_audio` has already released the turn's last voice, so a
+>    tagged close frame has nothing left to clock it out of the non-live transport.
 >
 > The shipped free-run delivery sidesteps both: it's the **"live during the close"** idea — video
 > free-runs for just the closing frames (it's still steady through the speech). Requires two supports:
@@ -350,6 +311,38 @@ support (mute on `TTSStarted`/unmute on `TTSStopped` instead of the transport fr
 > delivery path:** the end mouth-to-rest distance now ramps `6.04 -> 2.75 -> 1.85 -> 1.02 -> 0.31 -> 0.07`
 > over ~5 frames (snap-index 0.92 -> 0.58) instead of one 6.6 -> 0.8 step.
 
+> **RE-VERIFIED 2026-07-17 (doc-accuracy sweep) — LOAD-BEARING, KEEP.** Nominated as possibly superseded
+> by P51 (which deleted the cap this section used to credit for the free-run design). **It is not.**
+> Measured before/after
+> on the WebRTC delivery path, restarting the pipeline only (the fade is client-side) with
+> `MUSETALK_CLOSE_FADE_FRAMES` overridden in OS env (`load_dotenv()` does not override), driving the
+> fixed **greeting** turn (short, LLM-free, deterministic) and reading the received frames:
+>
+> | cell | descent | max 1-frame drop | snap-index |
+> |---|---|---|---|
+> | `fade=0` (fix REMOVED) | 14 fr | **1.63** | **0.77** |
+> | `fade=5` (shipped) | 23 fr | 0.42 | **0.16** |
+> | `fade=30` (exaggerated) | 24 fr | 0.15 | 0.09 |
+>
+> Removing it puts **77% of the close in ONE frame** — the snap is back. Every cell above was measured
+> under **`steady`** (the live baseline), so the close demonstrably DOES deliver there; what it cannot be
+> is **audio-coupled**, which is exactly why the delivery is free-run. Two stale justifications were
+> deleted from this section and from `musetalk_video.py` / `.env` / `CLAUDE.md` / `STATUS.md`: the
+> `_advance` **audio-cap** (gone since P51) and *"steady can't deliver a crossfade"* (this section's own
+> fix disproves it).
+>
+> **Two metrology traps this cost, both worth knowing (the instrument nearly returned a false "dead"):**
+> 1. **VP8 makes every decoded frame differ from every other**, so "distinct frames" and consecutive-frame
+>    deltas are ~useless here, and the codec's low-bitrate convergence on a static face *itself* looks like
+>    a ~0.5 s fade — it smears a true snap and can hide a 5-frame one.
+> 2. **The reference frame must share the codec's convergence state.** Measuring distance to the *final*
+>    settled frame made the pre-turn idle read **1.9** away from a neutral it is pixel-identical to, drowning
+>    the close. Referencing the **pre-turn idle** (same portrait, similar convergence) made the ramp obvious.
+>    The first two analyses said "identical, fix is inert" — **wrong, and it was the reference's fault.**
+>    The `fade=30` cell is what broke the tie: 2.5 s is far beyond any codec effect, so its clean 30-frame
+>    ramp proves the free-run frames genuinely reach the wire. **When a probe says "no effect," make the
+>    signal 6x bigger before believing it.**
+
 **Symptom.** When the voice finishes, the avatar's mouth doesn't ease closed — it cuts in one frame
 from the last spoken pose to the resting face. Reads as a choppy/abrupt end.
 
@@ -360,7 +353,10 @@ from the last spoken pose to the resting face. Reads as a choppy/abrupt end.
    ~4.9 from neutral, then snapped 4.9→0 in one frame at the cut. So feeding **silence** through
    MuseTalk to "ease it shut" does nothing — silence frames are still rendered, still ~4.9 from the
    photo. Only blending the **pixels** across the boundary (a crossfade) bridges it.
-2. **In steady mode the crossfade can't be DELIVERED.** A crossfade (last spoken frame → neutral) is
+2. **In steady mode an AUDIO-COUPLED crossfade can't be DELIVERED** — anything the transport must clock
+   off the **voice** dies at the close, because the voice is gone by then. (An audio-DECOUPLED close
+   delivers fine under steady: that is the shipped fix at the top of this section.)
+   A crossfade (last spoken frame → neutral) is
    smooth at the server, but steady uses pipecat's **non-live** transport, where video frames are only
    spaced out by the **real-time audio frames interleaved between them** (the audio write *is* the video
    clock; see `base_output.py` — `sync_with_audio` images go to the audio queue and a separate task
@@ -375,12 +371,12 @@ from the last spoken pose to the resting face. Reads as a choppy/abrupt end.
    - **silent-audio pairing** (one frame of silence per close frame) → the transport re-buffers/re-chunks
      audio on its own boundaries, dissolving the per-frame pairing → open mouth froze ~0.9 s then snapped.
 
-**Why it works in `live` mode.** `live` sets `video_out_is_live=True`: video runs on its **own** clock
+**Why it works in `live` mode too.** `live` sets `video_out_is_live=True`: video runs on its **own** clock
 (`_video_queue`/`_video_is_live_handler`), independent of audio. The server's crossfade frames then
-stream through at the server's rate → smooth close. So a smooth close is achievable **only** in live —
-but live trails the lips ~0.75 s behind the voice during speech, which the user rejected.
+stream through at the server's rate → smooth close — the same result the shipped free-run close gets under
+steady, but at the cost of live's ~0.75 s lip trail during speech, which the user rejected.
 
-**The 2024-era conclusion ("not deliverable in steady") was too strong — here's the seam.** The three
+**How the close DOES deliver under steady — the seam.** The three
 attempts above all tried to deliver the close while still *coupled* to the audio (burst into the
 audio-clocked image slot, or pair with silence). The seam is to deliver the close **decoupled** from
 audio: push the dissolve frames as plain untagged `OutputImageRawFrame`s paced at fps — the SAME path
@@ -391,7 +387,8 @@ preemption, delivers cleanly. Net: **steady through the speech (synced lips), vi
 the ~0.4s close.**
 
 **Why `MUSETALK_CLOSE_FADE_FRAMES=0` is still valid.** Set it to 0 (and restore `END_TAIL` > 0) for the
-old clean snap. The P10 ceil audio-blip fix is independent and kept.
+old clean snap. The end-of-turn audio-blip is independent and cannot recur: proto 2 (P51) releases the
+voice paired to each frame's `audio_pos`, so no cap can strand the trailing sub-frame.
 
 **Why a pure `live`-mode close still works too** (unchanged): `live` sets `video_out_is_live=True` so
 video always runs on its own clock — a smooth close for free, at the cost of the ~0.75s lip trail during
@@ -401,46 +398,6 @@ speech the user rejected. The free-run close above gives the same close benefit 
 (`VideoFrame.to_ndarray`) so the close can be judged on the **delivery path** (the offline server
 capture bypasses the transport and cannot see a delivery collapse). Judge the close where the browser
 sees it.
-
----
-
-## P13 — MOSS-TTS "delay between sentences" ⚠️ NOT RESOLVED (2026-06-29; streaming+eager helped TTFB but the felt latency is still bad — and got WORSE)
-
-> **HONEST STATUS (2026-06-29, end of session).** The streaming + eager changes below cut the *isolated*
-> per-request TTFB (benchmarked ~0.4 s), but **the user reports the between-sentence delay is still there
-> and overall latency is now WORSE.** So the isolated-TTFB win did NOT translate to a smooth live
-> conversation — do not trust the "fixed" framing. **Leading hypothesis (untested): CPU contention.**
-> This session also moved the **LLM onto a CPU-pinned local Ollama** and was running the memory harness,
-> the memory-sim, and the weather mock — all on CPU — while the GPU ran CosyVoice-vLLM + MuseTalk. The
-> original smooth baseline used a **cloud** LLM, leaving the CPU free. The most likely culprit is the
-> machine being CPU-saturated, not the TTS engine. **Plan: revert `.env` to the baseline (cloud LLM +
-> CosyVoice) next session and re-measure end-to-end TTFO before touching MOSS again.** The vLLM-Omni path
-> (no torch.compile, GPU-served) remains the real fix for MOSS if it's pursued.
-
-**Symptom.** With `TTS_PROVIDER=moss`, the avatar took a long beat before each sentence — felt like a
-big lag, "is it the bigger model?". (Still present after the changes below.)
-
-**Root cause (measured, not guessed).** Two separate things, neither the parameter count:
-1. **The first server was non-streaming.** It called MOSS's `inferencer.generate()` (whole sentence),
-   THEN streamed the finished PCM. Measured: time-to-first-audio **8.55 s** ≈ total wall **8.58 s** —
-   they were identical, i.e. the avatar waited for the entire sentence before any sound. (The 1.7B size
-   only makes steady-state RTF ~1.6, a minor factor.)
-2. **Once streaming, `torch.compile` recompiled per sentence-length.** The streaming rewrite
-   (`MossTTSRealtimeStreamingSession` + `AudioStreamDecoder`: push_text → decode → drain → flush) dropped
-   warm TTFB to ~0.4 s — but the **first** time it saw each new token-length it recompiled **3–40 s**, and
-   a real reply has many lengths, so the spikes landed *between sentences*.
-
-**The fix.** (a) Stream the first chunk (the rewrite above). (b) Run **eager** — the server defaults
-`TORCHDYNAMO_DISABLE=1` (override `MOSS_COMPILE=1`). Eager has **no recompiles**: every sentence is a
-consistent **~0.35–0.5 s** TTFB (vs compiled's 0.25 s warm but 3–40 s spikes). Verified across varied
-lengths: worst-case TTFB 0.53 s, zero spikes. Tradeoff: eager's long-sentence steady-state is a bit
-slower; the both-fast-and-no-spikes path is **vLLM-Omni** (MOSS supports it natively — the next step).
-
-**Install gotchas hit along the way** (all in the server docstring): MOSS's streaming codec path needs a
-**C compiler** for triton (`CC`/`CXX` → `conda install -c conda-forge gcc gxx`); `torchcodec` couldn't
-`dlopen` until **ffmpeg pinned to 7.1** (8.x is too new) + **`nvidia-npp-cu12`** installed +
-**`LD_LIBRARY_PATH`** covering torch/lib + the env lib + the `nvidia/*` pip libs. Files:
-`local_services/moss_server/app.py`.
 
 ---
 
@@ -467,49 +424,95 @@ process-management tools are pathologically slow to spawn under load. File: `loc
 
 ---
 
-## P15 — Chinese voice starts ~1s later than English ⚠️ NOT RESOLVED (2026-06-30; root cause found, fix conflicts with the avatar)
+## P15 — Shared-GPU load order + the zh first-chunk penalty ✅ BOTH RESOLVED (found 2026-06-30; re-measured 2026-07-17, 31st session)
 
-**Symptom.** Lip-sync looks fine in **English** but in **Chinese** the voice starts noticeably late and
-feels out of step ("avatar runs first"). Judged on a remote Tailscale browser (a trustworthy A/V judge,
-not the RDP window).
+**Both of this section's original claims are now measured DEAD.** It is **kept, not deleted**, because
+`launch.ps1` + `config_panel::restart_avatar` still execute the ordered restart and ~20 places cite it —
+this is the *why* for code that still runs. Read the verdicts, not the history.
 
-**Root cause (measured at the component boundary, not guessed) — it is the TTS, not the LLM or the avatar.**
-CosyVoice's time-to-first-audio is **~2.0–2.75 s for Chinese vs ~1.0–1.5 s for English** (pipeline
-`CosyVoiceTTSService TTFB` logs; consistent every turn, not a cold-start). The library's own per-segment
-log (`yield speech len X, rtf R`) shows why: the **first streaming chunk is ~4.36 s of audio for Chinese
-vs ~2 s for English at the SAME rtf (~0.5)** — a bigger opening chunk takes longer to generate before it
-is yielded. In `steady` sync this TTFB stacks on top of the ~2 s avatar render-readiness hold, so the zh
-voice starts ~4.4 s after you stop vs ~3.2 s for en. **Ruled out by experiment:** NOT text normalization
-(the `wetext`/`ttsfrd` frontend isn't installed in the WSL `cosyvllm` env → `text_frontend=''`), and NOT
-the zero_shot-vs-cross_lingual inference path (forcing zh through `inference_cross_lingual` did **not**
-change TTFB). The LLM is also ruled out (its TTFB is similar/lower for English).
+### 1. "Chinese voice starts ~1s later than English" — REFUTED
 
-**The fix that works in isolation BUT regresses the system — do NOT ship.** `COSYVOICE_FIRST_HOP=5` (the
-existing knob in `CosyVoice/cosyvoice/cli/model.py`, default `0`=25 tokens) emits the first audio after
-fewer speech tokens → zh TTFB **2.3 s → 1.25 s** (verified). But it makes CosyVoice run **many more small
-flow+vocoder GPU inferences at turn start**, which on the single shared 16 GB GPU **contend with MuseTalk's
-render and starve the avatar — lips-start jumped ~2 s → ~8 s** (much worse overall). Reverted.
+**The original 2026-06-30 claim.** CosyVoice's first-chunk TTFB was **zh ~2.0–2.75 s vs en ~1.0–1.5 s**
+(zh's first streaming chunk = ~4.36 s of audio vs en's ~2 s at the same rtf ~0.5), so the zh voice started
+~4.4 s after you stopped vs ~3.2 s for en. Ruled out at the time: text normalization, the
+zero_shot-vs-cross_lingual path, the LLM.
 
-**The real constraint.** On one GPU, **fast Chinese TTS streaming and a smooth avatar are in direct
-conflict**: anything that makes the audio come out sooner adds GPU work that starves the avatar render.
-This is the same reason `COSYVOICE_PACE_RATE` deliberately throttles voice production. A genuine fix needs
-a **dedicated avatar GPU** or a lower-contention TTS path — not a settings tweak. Left at the default
-(zh ~2.3 s TTFB) so the avatar stays smooth.
+**Re-measured 2026-07-17 at the live baseline** (v2 + CUDA graphs ON + `FIRST_HOP_ZH=0`; isolated
+`/tts/stream` via `_ttfb_variance.py --rounds 3`, n=24, MuseTalk resident):
 
-**Shared-GPU restart gotcha (learned the hard way this session).** CosyVoice's vLLM must load **before**
-MuseTalk. Restarting cosyvoice while MuseTalk already holds ~5 GB crashes vLLM with
-`ValueError: No available memory for the cache blocks` at `gpu_memory_utilization=0.3` (its runtime
-overhead ~5 GB needs the room; raising util then trips `Free memory … less than desired`). Recovery =
-restart the **whole stack in order**: stop all → start cosyvoice on the near-empty card (`run_vllm_server.sh`)
-→ then MuseTalk + pipeline via `scripts/run.ps1`. (Alternatively cap vLLM with `max_model_len` so it fits
-second — TTS sequences are short — but the ordered restart is the baseline.) Healthy VRAM with all three
-loaded ≈ **300–400 MB free**. Full detail: `project-visualllm-zh-tts-latency-gpu-contention` memory.
+| input | en08 | en12 | en16 | en20 | en26 | zh06 | zh10 | zh16 |
+|---|---|---|---|---|---|---|---|---|
+| TTFB warm median (s) | 1.02 | 1.12 | 1.60 | 2.01 | **2.22** | 1.06 | 1.48 | 1.73 |
 
-## P16 — Avatar lips drift progressively behind the voice on long turns ✅ FIXED (2026-07-01, TensorRT render is now the baseline)
+**There is no zh penalty.** The distributions fully interleave and the **slowest cases are English** (zh
+never exceeds 1.79 s; en reaches 2.25 s). What predicts TTFB is **input LENGTH, not language** — P56's law
+`TTFB = 0.648s + 25.9ms/char (zh)`. P30 already measured this on 2026-07-05 (zh 0.72–1.07 vs en 0.71–1.49)
+and wrote there: *"the fundamental zh-slow-chunk (P15) is no longer the issue."* **What killed it:** P23
+(the zh comma-only first-piece split → a shorter first input) + P27 (vLLM CUDA graphs, first chunk
+~2.0→~0.85 s). The root cause was never "zh is slow" — it was "TTFB scales with the input, and zh openers
+arrived unsplit."
 
-**Symptom.** On a **long** (multi-sentence) reply the lips fall further and further behind the voice; a
-short reply looks in step. "Frames don't equal the audio" — the delivered video runs seconds longer than
-the audio.
+**SCOPE — do not over-claim.** This refutes the **attribution**, not a whole-system gap: only the TTS was
+re-measured. If a zh-vs-en **end-to-end** TTFO gap still exists (the paper reports median zh 2.92 / en
+2.20 s), **it is not CosyVoice's first chunk** — go measure it, don't inherit this section's answer.
+
+**The `COSYVOICE_FIRST_HOP=5` "don't ship it" verdict still stands — but P22 owns it now,** with the
+correct mechanism. This section blamed GPU contention starving the render (lips-start ~2→~8 s); **P19**
+corrected that to a `lead=14` artifact, and **P22** proved live that hop=5 hurts because the small opening
+chunk fills the `MUSETALK_LEAD_FRAMES` cushion slowly (zh 4.14→3.09 s at hop 0). Live default
+`COSYVOICE_FIRST_HOP_ZH=0`. **Also dead:** this section's "same reason `COSYVOICE_PACE_RATE` deliberately
+throttles voice production" — `COSYVOICE_PACE_RATE` is **UNSET/OFF** (code default `0`, verified in the
+running server's `/proc/<pid>/environ` 2026-07-14), and P25 measured that throttle useless.
+
+### 2. Shared-GPU restart order — NO LONGER REQUIRED (kept as free insurance)
+
+**The original claim.** Restarting cosyvoice while MuseTalk already holds ~5 GB crashes vLLM with
+`ValueError: No available memory for the cache blocks` at `gpu_memory_utilization=0.3`; recovery = stop all
+→ start cosyvoice on a near-empty card → then MuseTalk. "Healthy VRAM with all three loaded ≈ **300–400 MB
+free**."
+
+**Re-measured 2026-07-17 — the crash does not reproduce at any util you would use.** vLLM was started
+**SECOND**, onto a card MuseTalk+pipeline already held (4489–4495 MiB resident, 11556 MiB free):
+
+| vLLM started second at | result |
+|---|---|
+| `util=0.07` (live default) | ✅ loads — `Available KV cache memory: 0.16 GiB` (13,856 tok), healthy, synthesizes zh |
+| `util=0.30` (**this section's crash config**) | ✅ loads — KV **3.82 GiB** (333,984 tok), startup complete, **no crash** |
+| `util=0.90` (positive control) | ❌ `ValueError: Free memory on device cuda:0 (12.98/15.93 GiB) … less than desired (0.9, 14.34 GiB)` |
+
+**Why (vLLM 0.23.0).** The budget is **`total_card × util`, and other processes are NOT charged against
+it** — MuseTalk's 4.5 GB is invisible to the KV math (15.93 GiB × 0.30 = 4.78 GiB budget − 3.82 GiB
+reported KV = **0.96 GiB**, exactly the ~0.98 GiB non-KV floor). The only gate is **`total × util ≤
+free_at_startup`**, so the wall for loading second sits at **util ≈ 0.79** — the live `0.07` clears it by
+~11×.
+
+**Honest limit.** The ORIGINAL crash could **not** be reproduced (util=0.3 loads fine today), so the
+2026-07-15 util drop 0.3→0.07 **cannot be credited** for the fix — most likely the vLLM upgrade changed the
+accounting. Whatever closed it, it is closed. The `util=0.9` positive control proves the test can still
+detect a real load failure, so the two passes are not silent.
+
+**Dead numbers, corrected.** "≈300–400 MB free" is really **9538 MB free** with all three up (16311 total /
+6513 used). vLLM's own share ≈ **2018 MiB**, not ~4–5 GB; `MUSETALK_FREE_TORCH=1` also cut MuseTalk
+5.2→3.3 GB. `util=0.3` is not the live value — `0.07` is.
+
+**What to actually do.** Keep the ordered restart — `launch.ps1` and the config panel already do it and it
+costs nothing — but treat it as **insurance, not a requirement**: it is *not* why your TTS is down. **The
+order becomes genuinely REQUIRED again only if `COSYVOICE_VLLM_GPU_UTIL` rises above ~0.75.** If the bot is
+silent, check `:8001` is up and that `Available KV cache memory` is positive — don't chase load order.
+Historical detail: `project-visualllm-zh-tts-latency-gpu-contention` memory (point-in-time; both its
+verdicts are superseded above).
+
+## P16 — Avatar lips drift progressively behind the voice on long turns ✅ FIXED (2026-07-01, TensorRT render is now the baseline) · fix RE-VERIFIED LOAD-BEARING 2026-07-17
+
+**Symptom — as first written. This is `live`/audio-master language; under the shipped `steady` baseline you
+will NOT see it.** On a **long** (multi-sentence) reply the lips fall further and further behind the voice;
+a short reply looks in step. "Frames don't equal the audio" — the delivered video runs seconds longer than
+the audio. **Under `steady` the same underflow surfaces as a *voice pause*, not a lip drift**: the voice is
+paced to the frames the server reports rendering, so it waits instead of running ahead
+(`musetalk_video.py:459` — *"holds the last real frame and the voice pauses IN SYNC (the intended steady
+tradeoff) instead of drifting"*). Same root cause, different face — do not conclude "no drift = no problem"
+under steady; look for the hold. (Same correction as **P6**, whose Symptom was also the then-default
+`live`'s.)
 
 **Root cause (measured live, driving the MuseTalk server with real WAVs at prod fps, offline — no
 CosyVoice/WebRTC).** Two things were conflated:
@@ -518,6 +521,10 @@ CosyVoice/WebRTC).** Two things were conflated:
 - The **extra** frames are the pump's **HELD/duplicate frames** — it repeats the last frame to keep the
   WebRTC track continuous whenever render dips below fps. They pad the timeline, carrying no new mouth
   movement.
+
+*(The per-segment and drift numbers in the next two paragraphs are the **2026-07-01 SIZE=256** measurement;
+the render costs and the "+3.94s under contention" figure were re-measured at the live SIZE=512/fps=12 in
+the RE-MEASURED block below — read that before quoting any number here as current.)*
 
 Per 8-frame segment on the PyTorch path: gpu 259ms + composite ~120ms ≈ **389ms** vs the 667ms real-time
 budget @12fps (~1.7× headroom). So **alone** MuseTalk barely drifts (a fixed +0.36s startup offset at any
@@ -535,6 +542,45 @@ drifted the PyTorch path +3.94s on the 13.6s reply, TRT holds the drift flat at 
 path. Next cheap lever (no 2nd GPU): the composite is CPU PIL blending (~31% of render even with TRT) —
 move it to the GPU. Structural fix remains a **dedicated avatar GPU**. Full detail:
 `project-visualllm-musetalk-trt-drift-fix` memory.
+
+**RE-MEASURED 2026-07-17 — the fix was nominated as "superseded by a later fix". It is NOT. KEEP IT.**
+2×2 of `MUSETALK_TRT` × contention at the LIVE config (SIZE=512 / SPLIT=1 / fps=12), `_drive_frames`,
+P16's own 2.88 / 5.69 / 13.56 s series:
+
+| cell | render / 8-frame seg | vs the 667 ms @12fps budget | drift @13.56 s |
+|---|---|---|---|
+| TRT=1, clean | ~171 ms | 3.9× headroom | +0.357 s |
+| TRT=0, clean | ~455 ms | 1.47× | +0.357 s |
+| TRT=1 + 100% hog | ~325 ms | 2.05× | +0.357 s |
+| TRT=0 + 100% hog | ~643 ms | **1.04×** | +0.357 s |
+| TRT=0 + **real CosyVoice** generating | ~585 ms | 1.14× | +0.357 s |
+
+**At fps=12 the drift no longer reproduces — with or without the fix, under a 100% hog OR real CosyVoice.**
+That is *not* a later fix closing the root cause: PyTorch simply **fits** the 12 fps budget now, by 4–14%.
+Do not read those five identical rows as "TRT does nothing" — they are the P1 trap (§P1: *a config whose
+value is invisible on the live path*). The mechanism is intact, and TRT is exactly what holds it off: raise
+the **fps demand** to 25 (budget 320 ms/seg, below PyTorch's 455 ms) and P16 returns in full, same code,
+same hour:
+
+| drive @ fps=25 | 2.88 s | 5.69 s | 13.56 s | held frames |
+|---|---|---|---|---|
+| TRT=1 (171 ms/seg) | +0.360 s | +0.354 s | **+0.320 s** — flat | 8 |
+| TRT=0 (455 ms/seg) | +0.640 s | +1.954 s | **+4.040 s** — scales | 101 |
+
+That reproduces the 2026-07-01 signature almost exactly (then: +0.37 / +1.35 / +3.94). **So: `MUSETALK_TRT=1`
+is not buying a drift fix at today's fps=12 — it is buying the MARGIN** (2.05× vs 1.04× under contention).
+The 1.04× cell is **24 ms/seg** from P16 returning, and it was measured with an **idle CPU**; live, the
+PyTorch path's composite is CPU PIL blending competing with STT / pipecat / WebRTC encode. Anything that
+tightens the budget — higher fps, bigger `MUSETALK_SIZE`/`BASE_MAX`, a weaker GPU (`docs/GPU-REQUIREMENTS.md`
+already rules out the PyTorch fallback for exactly this reason) — puts it back.
+
+**INSTRUMENT LIMIT found while re-measuring — read before you trust a contention test.**
+`_gpu_contention_hog.py` claimed `N=4096` "forces render < 12fps". **It does not, and `N=8192` steals no
+more than `N=4096`** (MuseTalk gpu-ms 567 vs 569 — identical). Under Windows **WDDM** the two processes
+time-slice to a ~50% floor no matter how heavy the other one is, so the hog **cannot generate the failure
+it was written to generate** — it is a control that can only pass. This is P15's lesson again from the other
+side: *a pass proves nothing unless the rig can still FAIL*, and here the rig could not. The **fps-demand**
+lever above is the positive control that works; use it. (Both harness docstrings corrected 2026-07-17.)
 
 ## P17 — Per-frame composite was CPU-bound (~31% of render even with TRT) ✅ FIXED (2026-07-01, GPU composite, opt-in)
 
@@ -625,12 +671,13 @@ and is fine at zh.
 (brought zh to 64% voiced). The pro voice makes it unnecessary, so it is **OFF by default**
 (`COSYVOICE_SILENCE_CAP_S=0`) but kept as an optional knob for a gappy voice.
 
-**Files (all in `E:\Claude\cosyvoice-local-tts`; the nested `CosyVoice/` is its own git repo):**
-`CosyVoice/cosyvoice/vllm/ras_logits_processor.py` (new), `CosyVoice/cosyvoice/cli/model.py` (register the LP),
-`CosyVoice/cosyvoice/llm/llm.py` (`top_p=0.8`), `CosyVoice/asset/pro_ref.wav` (new voice clip),
-`tts_engine.py` (pro voice defaults + the off-by-default squeeze). **Not yet git-committed.** Baseline knobs:
-`COSYVOICE_RAS_WIN` (10), `COSYVOICE_PROMPT_WAV`/`COSYVOICE_PROMPT_TEXT` (pro voice), `COSYVOICE_SILENCE_CAP_S`
-(0 = off). **Still open:** human A/V confirmation on a live call; git-commit both repos.
+**Files (now under `tts/cosyvoice-server/` after the 2026-07-14 subtree merge — P49, history preserved; the
+nested `CosyVoice/` is a gitignored vendored checkout):** `CosyVoice/cosyvoice/vllm/ras_logits_processor.py`
+(new), `CosyVoice/cosyvoice/cli/model.py` (register the LP), `CosyVoice/cosyvoice/llm/llm.py` (`top_p=0.8`),
+`CosyVoice/asset/pro_ref.wav` (new voice clip), `tts_engine.py` (pro voice defaults + the off-by-default
+squeeze). Baseline knobs: `COSYVOICE_RAS_WIN` (10), `COSYVOICE_PROMPT_WAV`/`COSYVOICE_PROMPT_TEXT` (pro
+voice), `COSYVOICE_SILENCE_CAP_S` (0 = off). The fix has been the live zh baseline for weeks (see the
+CUDA-graphs note / P33).
 
 ## P19 — TTFO tuning sweep: `COSYVOICE_FIRST_HOP` × `MUSETALK_LEAD_FRAMES` ⚠️ NO WIN — baseline `hop=0, lead=14` stands (2026-07-03)
 
@@ -808,7 +855,10 @@ offline "TRT holds drift flat at +0.36s"** — that was measured WITHOUT CosyVoi
 contention the turn-start hold is ~2.7s. Confirms (again, per P19) that this cost only appears on the LIVE full
 stack.
 
-**HANDOFF — two untried non-hardware levers (both directly attack the turn-start GPU collision):**
+**HANDOFF — two non-hardware levers (both directly attack the turn-start GPU collision). NOTE (2026-07-05):
+both were subsequently BUILT, live-A/B'd and REJECTED — see P25 (GPU stream priority was catastrophic under
+WDDM; the CosyVoice throttle was useless + unstable), which also overturns this section's turn-start-collision
+premise on the TRT baseline. The levers below are kept as the record of what was tried, not a live to-do:**
 
 - **Lever 1 — GPU stream PRIORITY (let the render cut the line).** Mark MuseTalk's render as a high-priority
   CUDA stream so its kernels preempt CosyVoice's during the collision; the avatar holds ≥12fps, CosyVoice
@@ -823,8 +873,8 @@ stack.
 
 - **Lever 3 — STAGGER the two bursts.** They collide only because both peak at the same instant; CosyVoice's
   burst is short + front-loaded. **(a) [preferred, lower risk]** throttle CosyVoice's generation nearer
-  real-time at turn start so it stops front-loading the GPU — lever on `COSYVOICE_PACE_RATE` (currently 1.3, in
-  the cosyvoice repo server), maybe a dedicated turn-start throttle, to leave the avatar's first render room; no
+  real-time at turn start so it stops front-loading the GPU — lever on `COSYVOICE_PACE_RATE` (code default `0` =
+  OFF), maybe a dedicated turn-start throttle, to leave the avatar's first render room; no
   sync surgery. **(b)** on `musetalk_video.py`, delay feeding the FIRST render segment ~150–250ms so CosyVoice's
   opening burst clears first (trade: adds that fixed delay to lip-start). Watch TTS TTFO doesn't cross the 8s
   target.
@@ -865,8 +915,8 @@ JSON — exactly where OpenRouter reads its `provider` hint. So:
   Empty = today's unpinned Gemini (safe default).
 - `.env`: `OPENROUTER_MODEL=meta-llama/llama-4-scout` + `OPENROUTER_PROVIDER_ONLY=Groq`.
 Reuses the existing OpenRouter key; fully revertible. (Verify the model is Groq-served on OpenRouter first —
-Qwen-2.5-72b 404s on Groq. `OPENROUTER_PROVIDER_ONLY` is NOT in the config-panel `_KNOWN` set, so edit `.env`
-directly, not via /save.)
+Qwen-2.5-72b 404s on Groq. `OPENROUTER_PROVIDER_ONLY` is now a curated field in the config panel — "Pin LLM
+backend" — so edit it there or in `.env`.)
 
 **Result (measured).** LLM hop **halved + tail killed**: zh 1.64→**0.80s** median (max 3.59→1.44); en
 1.07→**0.67s** (max 2.43→1.35). Isolated probe: Groq TTFT ~0.67–0.91s tight vs Gemini 1.1–1.6s + 3.6s tail.
@@ -1230,7 +1280,7 @@ or a dedicated TTS GPU. (Revises the P27 "new baseline" verdict.)
 ## P32 — CUDA graphs re-investigated (diagnose-then-fix): the two P31 mechanisms did NOT reproduce on the TTS side (2026-07-05, later 8th session)
 
 **Ask.** "Can we use graphs without the drawback?" Built an isolated first-chunk **TTS-TTFB variance** probe
-(`cosyvoice-local-tts/_ttfb_variance.py`: median/**max/stddev**, varied opener lengths × N rounds, hits the WSL IP
+(`tts/cosyvoice-server/_ttfb_variance.py`: median/**max/stddev**, varied opener lengths × N rounds, hits the WSL IP
 directly, first-sighting-vs-repeat to expose capture spikes).
 
 **Findings — both P31 mechanisms fail to reproduce in the TTS layer.** (A) *Cold-shape capture:* a FRESH graphs
@@ -1268,7 +1318,7 @@ Lesson: a green TTS-TTFB probe is not a green avatar.
 wrong); graphs OFF the zh lips match. English fine either way. NOT timing/fps — per-turn render held ~14fps in every
 graphs turn (`[avatar timing]` logs).
 
-**Root cause, MEASURED (`cosyvoice-local-tts/_zh_audio_ab.py`, same 37-char zh sentence ×5 per mode).** Graphs ON
+**Root cause, MEASURED (`tts/cosyvoice-server/_zh_audio_ab.py`, same 37-char zh sentence ×5 per mode).** Graphs ON
 alter the zh **audio**: duration median 8.92 vs 8.28s, longest internal silence 0.76 vs 0.68s, silence-frac 0.30–0.36
 vs 0.22–0.33, more run-variance. The graph-captured decode perturbs the **zh-critical RAS sampling** (P18 — RAS is
 what stops zh looping on the silence token). MuseTalk lip-syncs off a **Whisper of the actual waveform**, not the
@@ -1500,13 +1550,15 @@ probe#2 → `video frames: 420` clean; log `New WebRTC offer -- disconnecting th
 `broadcast_interruption()`), so the fix builds the default start strategies with it **off**:
 `UserTurnStrategies(start=[VADUserTurnStartStrategy(enable_interruptions=False),
 TranscriptionUserTurnStartStrategy(enable_interruptions=False)])`, keeping the default smart-turn STOP strategy. This
-is deliberately NOT the `AlwaysUserMuteStrategy` mic mute (`ECHO_GUARD`), which is broken under steady sync (P11); the
-strategy flag has no mute state machine so it's safe under steady. `main.py` now builds one shared
+is deliberately NOT the `AlwaysUserMuteStrategy` mic mute (`ECHO_GUARD`) — a distinct mechanism; the
+strategy flag has no mute state machine at all, so it was always safe under steady. (This line used to
+add "which is broken under steady sync (P11)". That was true when written, but P53 fixed it and a live
+run on 2026-07-17 confirmed the mute/unmute cycle — see P11.) `main.py` now builds one shared
 `LLMUserAggregatorParams` for echo-guard + no-interrupt. Proven live: user "started speaking" twice mid-reply → **zero**
 `broadcasting interruption` (vs one per user-start in every prior session). Residual (unfixed): with a live mic + no
 headphones, barge-in/echo speech is no longer a cut-off but can still be transcribed and answered AFTER the bot
-finishes; the proper cure is a TTS-frame-based mic mute (mute on `TTSStarted`/unmute on `TTSStopped`, P11's future
-option).
+finishes; the proper cure is the half-duplex mic mute (`ECHO_GUARD=1`), which P53 later un-broke under steady by
+fixing the `BotStopped` ordering (see P11) — the default stays `0` because barge-in is the P44 baseline.
 
 **State.** SHIPPED and **committed to `main`** (fast-forward from `feat/ttfo-first-clause-split`; main was a strict
 ancestor). Files: `pipeline/main.py` (observer + `_partial` + single-connection + no-interrupt),
@@ -1633,90 +1685,6 @@ cumulative `asyncio.sleep(dur)` to stop the feed-side render starvation at the s
 pauses). **The user's live eye is the final gate** (the recurring lesson: the probe passes what the eye rejects) — the probe
 confirms the mechanism is fixed and drift is gone, but sign-off is the user watching a real turn. UNCOMMITTED (hold-for-live
 pattern). Offline clean reference for comparison: `output/_live_turn_pcm_ref.mp4`.
-
----
-
-## P40 — THE avatar "same generic mouth pattern" bug: the lip-sync model was fed NOISE (odd-byte misalignment) ✅ SHIPPED (2026-07-10, 16th session)
-
-**Symptom (the multi-session "live lipsync is bad, offline is good" problem — the REAL one).** The live avatar's mouth
-opened and closed in roughly the same wordless pattern regardless of what was said, and never rested during pauses. The
-user was explicit, twice: *"it is not an A/V sync problem"* and *"the avatar keeps moving the same kind of mouth pattern."*
-The voice itself always sounded perfect.
-
-**Root cause.** Audio is int16: **two bytes per sample**. The TTS hands over `TTSAudioRawFrame` buffers with **odd byte
-counts** (CosyVoice's `iter_chunked` splits mid-sample). Two paths consume that audio:
-
-- **Downstream (what you HEAR)** — `_align_even()` **carries** the dangling odd byte into the next frame so the PCM stays
-  whole-sample. This is the old P3 anti-screech fix. The voice is therefore always clean.
-- **Avatar-bound (what the mouth is generated from)** — `_to_16k_mono_pcm()` **DROPPED** it: `if len(audio)&1: audio = audio[:-1]`.
-
-Drop one byte and the *next* buffer begins half a sample late. Every int16 after it is assembled from the **low byte of one
-sample and the high byte of the next** -> loud, constant, full-band noise. MuseTalk lip-syncs off a **Whisper of the
-waveform** (not the text, cf. P18/P33), so Whisper heard static: no words, no consonants, **no pauses** -> the UNet produced
-a continuous generic flap. **Voice clean, mouth garbage** — and completely independent of fps, `MUSETALK_SIZE`, GPU
-contention and A/V sync, which is why every earlier theory failed against it.
-
-**Evidence (same turn: `_delivered_voice.wav` 24k = what you hear, vs `_live_turn_pcm.wav` 16k = what the avatar gets):**
-
-| metric | aligned (correct) | 1-byte misaligned | ACTUAL avatar-bound | white noise |
-|---|---|---|---|---|
-| peak xcorr vs the true voice (any lag +-2s) | 1.0 | — | **0.008** | ~0 |
-| zero-crossing rate | 0.227 | 0.459 | **0.453** | ~0.5 |
-| envelope dynamic range | 8.8 dB | 0.9 dB | **0.4 dB** | ~0 |
-| quiet-10th-pct / peak (are there pauses?) | 0.006 | 0.517 | **0.349** | ~1 |
-| RMS | 4000 | 13876 | **13531** | — |
-
-A deliberate 1-byte shift of the true voice reproduces the avatar-bound signature almost exactly. The spectrum is the
-clincher: real speech is `-0.8 dB @0-1k` rolling off to `-38.5 dB @7-8k`; the avatar-bound audio is **flat**
-(`-8.3 / -5.8 / -6.2 / -6.2 / -9.5 dB`) — the signature of noise, not a voice.
-
-**FIX (`musetalk_video.py`, the `TTSAudioRawFrame` branch).** Carry the remainder across chunks, exactly as `_align_even`
-does downstream, aligned to a whole sample-FRAME (`2 * channels`, so stereo stays correct):
-
-```python
-stride = 2 * ch
-data = self._srv_carry + frame.audio
-keep = len(data) - (len(data) % stride)
-self._srv_carry = data[keep:]          # hold the remainder for the next chunk
-data = data[:keep]
-pcm = _to_16k_mono_pcm(data, sr, ch) if data else b""
-```
-
-`self._srv_carry` is initialised in `__init__` and reset in `_reset_turn()`.
-
-> **UPDATE 2026-07-15 (P52): `_srv_carry` is REMOVED.** The odd buffers it carried are now fixed at
-> their single source (`cosyvoice_tts.py::run_tts` producer-side alignment — see P52), so frames reach
-> this branch whole-sample. `_to_16k_mono_pcm`'s odd-drop remains as a crash guard only and should
-> never fire; if it ever does, fix the PRODUCER (a dropped byte here is exactly this bug again).
-
-**Verified live** (drove a real turn with `MUSETALK_DUMP_PCM=1`, compared the avatar-bound PCM against `resample_poly` of
-the delivered 24k voice): peak xcorr **0.008 -> 0.969 @ lag 0.000s**; ZCR 0.453 -> **0.185** (target 0.189); envelope dyn
-range 0.4 -> **8.8 dB** (target 8.8); quiet/peak 0.349 -> **0.040** (target 0.043); RMS 13531 -> **4089** (target 4113); the
-spectrum became speech-shaped. Turn healthy: `audio 19.04s video 19.08s (229 frames) end drift +-0.04s`. Watchable live
-output: `output/FIXED_live_avatar.mp4`.
-
-**RESIDUAL (open, minor).** xcorr is 0.969, not 1.0, because `_to_16k_mono_pcm` still downsamples 24k->16k with bare
-`np.interp` and **no anti-aliasing low-pass**, folding everything above 8 kHz back into the speech band (that band carries
-the consonants). Fix with a streaming `resample_poly` if the visemes still look soft. This is "words slightly smeared", not
-"static" — a different order of magnitude from the bug above.
-
-### ⚠️ METROLOGY — how this stayed hidden for THREE sessions (read before writing another avatar probe)
-
-1. **"Delivered frames == offline render, byte-identical" proves only that the RENDER IS DETERMINISTIC.** It cannot catch a
-   corrupt *input*, because the offline side was fed **the same corrupt PCM** (`_live_turn_pcm.wav`). A test whose reference
-   shares the suspect input can never fail. **Always ask what the reference is actually fed.**
-2. **The "good" offline reference was accidentally repaired audio.** Earlier prerenders were fed a voice captured off
-   **WebRTC** — i.e. the *downstream* copy, which `_align_even` had already fixed. So the reference bypassed the broken code
-   path and always looked great. The user cracked the case by noticing *"offline is bad now too"* — the first time the
-   offline render had been fed the audio the avatar actually receives.
-3. **Mouth-motion vs audio-RMS correlation is USELESS** (4th time it misled). It scored the noise-driven render `0.97x` and
-   the correct one `1.07x`; it previously scored a 1:1 offline reference as `+280 ms` out of sync. Energy != phoneme shape.
-4. **Never verify A/V sync from a WebRTC capture reconstructed by ARRIVAL time.** Under `steady`, audio is released in
-   bursts paced to the render (`hold` can exceed 30 s), so arrival-order reconstruction distorts the A/V relationship and
-   the metric measures the harness, not the system. Use the uncompressed `MUSETALK_DUMP_DELIVERED` dump.
-5. **Dead theories, all disproven by the above** — do not re-open without new evidence: fps/OOD-Whisper-stride
-   (`MUSETALK_SIZE 512->256` to reach 25 fps), held-frame stalls, shared-GPU contention, VP8/transport, segmentation/Whisper
-   context. The render was correct the whole time; it was being *told* the wrong thing.
 
 ---
 
@@ -2185,14 +2153,16 @@ the archive tests — get the bare-frame wire byte-identical (the SERVER keeps p
 
 **Follow-up (same day): the pipeline CLIENT went proto-2-only.** The superseded guessing layer was deleted
 outright per the house "an untried fallback is not a safety net" rule: the P39 byte-compare, the `i/fps`
-pairing in `_emit_pair`, the P10 audio-cap in `_advance` (a proto-2 `audio_pos` can never exceed audio the
+pairing in `_emit_pair`, the ceil audio-cap in `_advance` (a proto-2 `audio_pos` can never exceed audio the
 client already buffered: `_abuf.append` happens in the same `process_frame` call that queues the feed — so the
 cap guards nothing), and the `video_clock` release-heartbeat (it existed to un-stick cap-parked frames; the
 marker is diagnostic-only now). A bare frame arriving inside a synced turn — i.e. an older server — now trips
 a LOUD `_unsynced` fallback (voice forwarded immediately, frames free-run) instead of silently mis-pairing.
 `git revert` restores the dual-path client if ever needed. Still load-bearing and deliberately UNTOUCHED:
-`_align_even`/`_odd_carry` (P3), `_srv_carry` (P40), ceil segment sizing (P9), lead-prime + burst feed,
-interrupt flush (P44), close crossfade (P12), the `sync_with_audio`/`video_out_is_live` transport coupling.
+ceil segment sizing (P9), lead-prime + burst feed, interrupt flush (P44), close crossfade (P12), the
+`sync_with_audio`/`video_out_is_live` transport coupling. (The odd-byte guards `_align_even`/`_srv_carry`
+were untouched this session but P52 removed them two sessions later — the invariant now lives at the
+producer in `run_tts`, so do not expect them in the code.)
 Verified after the deletion: preflight + all four archive regressions PASS; measure ×3 — avatar rows the best
 of the day (lead-hold 0.56/0.65/1.76s, lips start +0.44s, end drift ±0.04s); two ~3.8s LLM rows in the middle
 were Groq congestion (cleared on the third run, 1.19s) — that hop is upstream of the avatar client.
@@ -2214,6 +2184,21 @@ happened yet. The cheapest fix for a heuristic is a protocol field.
 the P34 trim crash were all the same defect surfacing at different consumers: `TTSAudioRawFrame`s with **odd
 byte counts** — half a sample — flowing through a pipeline whose every consumer assumes whole int16 samples.
 Each incident was patched where it bled. Nobody had asked where the odd bytes come FROM.
+
+**What a dropped odd byte DID — the P40 "generic mouth" bug, the worst of the three (kept here because P40
+is now archived).** The avatar-bound consumer (`_to_16k_mono_pcm`) originally *dropped* the dangling byte
+(`if len(audio)&1: audio = audio[:-1]`) instead of carrying it. Drop one byte and the next buffer begins half
+a sample late: every int16 after it is assembled from the **low byte of one sample and the high byte of the
+next** → loud, constant, full-band noise. MuseTalk lip-syncs off a **Whisper of the waveform** (not the text,
+cf. P18/P33), so Whisper heard static — no words, no consonants, **no pauses** → the UNet produced a
+continuous generic flap that never closed. **The voice stayed perfectly clean** (its consumer carried the
+byte), so it read as "A/V sync is bad" / "the same mouth pattern regardless of what's said," and was
+independent of fps, `MUSETALK_SIZE`, GPU contention and sync mode — which is why every earlier theory failed
+against it for three sessions. **The metrology trap that hid it (the paper's §7 lesson):** a test whose
+reference *shares the suspect input* can never fail — the "good" offline render had been fed a voice captured
+off **WebRTC**, i.e. the already-*repaired* downstream copy, so it bypassed the broken path and always looked
+great. Always ask what the reference is actually fed. Full incident, evidence tables and the five dead
+theories: **P40 in `PROBLEMS-AND-FIXES-ARCHIVE.md`**.
 
 **Root cause (traced, then measured live).** The CosyVoice server only ever writes whole int16 samples
 (`pcm.tobytes()` of an int16 array — always even; probe: total stream bytes even). But raw PCM over HTTP is a
@@ -2251,7 +2236,7 @@ frames owns re-establishing them.
 
 ---
 
-## P53 — BotStopped never fired under steady sync (the P11 root cause) ✅ FIXED (2026-07-15, probe-verified; echo-guard live test pending)
+## P53 — BotStopped never fired under steady sync (the P11 root cause) ✅ FIXED (2026-07-15, probe-verified; **echo-guard live test DONE 2026-07-17 — mute/unmute clean, see P11**)
 
 **Symptom.** Under `steady` sync, pipecat's `BotStoppedSpeakingFrame` fired **mid-turn** and then never
 again: the log showed `Bot stopped speaking based on TTSStoppedFrame` → `Bot started speaking` **1 ms
@@ -2285,9 +2270,13 @@ audio frame; interrupt drops the held stop; dead-server flushes it before the ne
 unchanged (2.48 s OK). Pre-fix pathology captured in the same log 20 min earlier for contrast.
 
 **Consequences.** `ECHO_GUARD=1` (half-duplex mute) is no longer mechanically broken under steady — the
-mute strategy's unmute signal now exists. Default stays `0` (barge-in is the P44 baseline, and headphones
-remain the norm); **flip it only after a live echo-guard session confirms the mute/unmute cycle by ear**
-(the probe can't judge a stuck mic). The `BOT_VAD_STOP_FALLBACK_SECS=600` raise **STAYS** — it still
+mute strategy's unmute signal now exists. **That live session has since been run (2026-07-17): 3/3
+mute→unmute cycles, unmute 1–2 ms after bot-stopped, later turns still triggering — the stuck mic is
+measured gone (details + method in P11).** A stuck mic turned out to be exactly what a *driven* run CAN
+judge (stuck ⇒ no later turn fires); the earlier "the probe can't judge a stuck mic" was too pessimistic
+— what needs the ear is whether half-duplex is *wanted*, not whether it works. Default stays `0` (barge-in
+is the P44 baseline, headphones remain the norm): `=1` costs barge-in for the bot's whole reply, and
+replies run 40–66 s. The `BOT_VAD_STOP_FALLBACK_SECS=600` raise **STAYS** — it still
 guards the buffered voice against a mid-turn render-stall discard (see P3/P52); this fix removes its
 last cost, not its purpose. sherpa's echo-guard gating (`sherpa_stt.py`) is unchanged but its blocker
 is gone if wanted later.
@@ -2423,3 +2412,99 @@ passes what the eye rejects"; P33 ran it backwards (a measured delta -> a predic
 check it against its physics floor. Cheap decomposition that needs no new code: `--no-browser` (probe) vs the
 browser path splits browser-side from upstream; `MEASURE_SEND_TRACE=1` splits pipecat from the wire.
 Matrix: `docs/LATENCY-MATRIX.md` §Correction · next target: `docs/TTS-FIRST-CHUNK-HANDOFF.md`.
+
+## P56 — the TTS "0.93s row with headroom" is ~70% fixed FLOOR; the tool measuring it self-poisoned; the documented mechanism is wrong ✅ TOOL FIXED + reframed (2026-07-16, 29th session)
+
+**Context.** `docs/TTS-FIRST-CHUNK-HANDOFF.md` called TTS first-chunk (0.93s) "the one row left with real
+headroom" and pointed at three levers, all resting on ONE premise the handoff states as fact: *"CosyVoice's
+first-chunk TTFB scales with the INPUT sentence length — it prefills the whole sentence before the first audio
+token."* Applied the handoff's own §4 rule #1 — **check the physics floor of a row BEFORE optimising it** — to
+the target row itself. Nobody had. Three things fell out.
+
+**Finding 1 — the row is mostly a floor no text lever can touch.** Swept /tts/stream TTFB against input
+length on the live WSL server, isolated (no MuseTalk/pipeline). Linear fit:
+
+| language | FLOOR (0 chars) | slope | live row |
+|---|---|---|---|
+| **zh** (live `LANGUAGE`) | **0.648s** | 25.9 ms/char | **0.93s** |
+| en | 0.631s | 8.9 ms/char | — |
+
+~0.65s is **fixed startup** paid on any input, even one character. Only ~0.28s of the live 0.93s is
+length-dependent, and the live first piece is already short (~10 chars), so the realistic remaining headroom
+for the whole §3 lever family is **~0.13s, not "real headroom".** Every §3 lever (first-piece tuning, v2->v3,
+even the closed vllm-omni path) is fighting over that sliver. **The row is near its floor; reframe accordingly.**
+
+**Finding 2 — the probe (and the house tool) self-poisoned; abandoning a stream costs the NEXT request +1.0s.**
+First two floor measurements read *short inputs as SLOWER than long ones* (zh_01 1.45s vs zh_02 0.61s) —
+impossible, and it would have been false-finding #6. Two confounds, controlled one at a time:
+- **order:** fixed ascending length aliased "shortest text" with "first request of the round". Shuffling
+  killed most of it.
+- **residue (the big one):** the probe did `resp.read(1); return` — but that does NOT stop the server.
+  `app.py::tts_stream(req)` never receives FastAPI's `Request`, so it cannot check `is_disconnected`; and
+  `CosyVoice/.../model.py` runs the autoregressive LLM on its own `threading.Thread` (`llm_job`) that finishes
+  the WHOLE utterance regardless of the consumer. So an abandoned request keeps burning the shared GPU and the
+  next request pays for it. Measured with an IDENTICAL short request, varying only its predecessor:
+
+  | predecessor | TTFB of the same `你好` |
+  |---|---|
+  | long request **abandoned** at first byte | **1.593s** |
+  | long request **fully drained** | **0.597s** |
+  | drained + 2s settle | 0.628s |
+
+  **+1.0s of residue, and the settle arm rules out cold GPU clocks.** This was also the *variance* the house
+  tool exists to report: it made whichever opener followed the longest text flag as a "COLD SPIKE" (spreads
+  collapsed ~1.1s -> ~0.1s once drained). **Fix:** `tts/cosyvoice-server/_ttfb_variance.py::ttfb` now drains
+  the whole stream (what `cosyvoice_tts.py::run_tts` does live). Verified: COLD PENALTY +0.35s -> **+0.004s**,
+  zero spike flags, cleanly monotonic in length.
+
+**Finding 3 — the documented mechanism is wrong (operational advice still right).** Held sentence 1 IDENTICAL
+and grew a tail after it: first-audio latency rose **+0.75s at one tail, saturating at +0.98s (~47 chars)**,
+though the first audio is byte-identical. If the cost were "prefill of the first sentence," a tail could not
+matter. Root cause `CosyVoice/.../frontend.py:151`: `split_paragraph(..., token_min_n=60, token_max_n=80,
+merge_len=20)` **MERGES** short text with what follows, up to an 80-token segment cap. So TTFB tracks the first
+*segment*, not the first *sentence* — and `COSYVOICE_FIRST_PIECE` works by **denying that merge** (a separate
+HTTP request), not by shortening a prefill. The saturation at ~47 chars = the 80-token cap. **The lever is
+sound; only the "why" in the docs was wrong.** (Corollary trap: trimming the 9.2s leo ref looks like a floor
+lever via `prompt_token_pad`, but `_base=25,pad=0` and hop=5,pad=20 both give `this_token_hop_len=25` — it is
+arithmetically the hop=5 that P22 already rejected by the live eye.)
+
+**Barge-in leaks Finding-2 residue onto the shared GPU — CONFIRMED live; a clean fix ATTEMPTED and REVERTED.**
+`run_tts` wraps the stream in `async with session.post(...)`, so a pipecat `InterruptionFrame` cancels the
+generator and ABANDONS the server mid-generation — exactly the poisoned arm above. A faithful aiohttp repro
+(same cancel semantics as `run_tts`, hitting the live server) measured a barge-in costing the NEXT turn
+**+0.9–1.1s** (short-turn TTFB 0.46s after a drained request vs ~1.4s after an abandoned one). A discriminator
+proved it **scales with the abandoned generation** (abandon a LONG request → +0.9s; abandon a SHORT one → 0.0s),
+i.e. it IS leftover speech-token generation on the shared GPU, not a fixed per-abandon cost. **Reconciles with
+P55's "barge-in costs NOTHING":** P55 measured the *current* turn's first frame (+0ms) — correct; the leak lands
+on the *next* turn's TTS, which P55 did not measure.
+
+**Why the fix was reverted (do not repeat these 4 attempts blindly).** The intended fix: on abandon, signal
+`llm_job` to stop and `abort` the vLLM request so a later `step()` stops advancing it. Implemented across the
+vendored `model.py` (a `tts_stop_dict` flag + `try/except GeneratorExit` around the streaming yields) and
+`llm.py` (an `abort()` calling `self.vllm.abort_request`). Findings, each caught by instrumentation, not argument:
+1. **GeneratorExit DOES fire** on an aiohttp abandon (logged), and `llm_job` DID break early (353 tokens vs the
+   full utterance). So the trigger + stop worked. **Residue unchanged.**
+2. `abort_request(uuid)` **silently no-ops**: its signature is `abort_request(request_ids: list[str])` (vllm
+   0.23), so a bare `uuid` string is iterated into single characters, matches nothing, and raises nothing.
+3. Fixing it to `abort_request([uuid])` made it fire — and **broke the NEXT turn (empty audio)**. CosyVoice's
+   vLLM integration drives `step()` MANUALLY and routes ALL active requests' outputs through one shared
+   `vllm_output_queue`; aborting mid-batch destabilises that shared loop (also needs a KeyError guard at the
+   router). The abandoned request is entangled with the next request's `step()`, so a clean mid-batch abort is
+   not a small patch — it is real vLLM-lifecycle surgery on a manually-driven engine.
+4. Per the systematic-debugging rule (3+ fixes each revealing new coupling = wrong altitude), **STOPPED and
+   reverted** both vendored files to pristine; server restarted clean and re-verified (normal synthesis + the
+   next turn intact; residue back to its original ~0.93s — i.e. nothing left broken).
+
+**Severity caveat (why reverting is defensible).** In production `run_tts` is called PER SENTENCE, so a real
+barge-in abandons ONE sentence's remaining tokens, not a 90-char paragraph (the repro's worst case). And the
+NEXT turn only starts after the user speaks (VAD+STT+LLM), by which time a single sentence's leftover has often
+finished. So the felt cost is likely well under the 0.9s synthetic worst case. Fits P55's open ~1-in-7 +1.7s
+first-frame spike and compounds with uncapped replies (`OPENROUTER_MAX_TOKENS` never read). **If pursued later,
+the tractable angle is NOT mid-batch abort** — it is either capping reply length (bounds every residue AND fixes
+the ~50s ramble, pure-pipeline, no vendored risk) or giving the vLLM integration a proper per-request lifecycle;
+both are deliberate efforts, not quick patches.
+
+**Lesson.** The handoff's §4 rule #1 ("check the physics floor FIRST") applies to the row you are TOLD to
+optimise, not only to suspicious ones — it demoted "the big remaining win" to a sliver and surfaced a better
+lead. And P55's residual-row discipline generalises past the harness: the TTS TTFB probe is a residual too
+(it measures its own wake). Handoff: `docs/TTS-FIRST-CHUNK-HANDOFF.md` · matrix: `docs/LATENCY-MATRIX.md`.
