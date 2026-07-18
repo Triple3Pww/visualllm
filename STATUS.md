@@ -1358,10 +1358,6 @@ the near-empty card → then `scripts/run.ps1` (MuseTalk + pipeline). Healthy VR
 
 ## ⭐ Session 2026-06-29: MOSS TTS option, web config panel, local-LLM mode, real NCU found
 
-> **SUPERSEDED (2026-07-18):** the MOSS TTS provider (`TTS_PROVIDER=moss`, `moss_server/`) was **removed
-> 2026-07-14** — never selected; the stack is Deepgram/sherpa → OpenRouter → CosyVoice → MuseTalk. Its
-> problem writeup (P13) is retired to `docs/PROBLEMS-AND-FIXES-ARCHIVE.md`. Log kept below as history.
-
 > **⚠️ HONEST CAVEAT (end of session).** The features below were ADDED and work in isolation, but the
 > live experience **regressed**: the MOSS between-sentence delay was **not** resolved and overall latency
 > got **worse** (P13). Leading hypothesis: **CPU contention** — this session ran the LLM on a CPU-pinned

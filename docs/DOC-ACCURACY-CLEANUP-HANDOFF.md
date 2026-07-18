@@ -258,6 +258,27 @@ a removal banner). **Method reminder this reinforced:** the stale claims were al
 (a moved path, a removed guard, a changed default) — grep the pointer, don't trust the prose. Files touched:
 `docs/PROBLEMS-AND-FIXES.md` only.
 
+## 4f. REVERSED 2026-07-18 (same day) — the §4d ARCHIVING was un-done; the approach changed to a separate clean file
+
+The user **created `docs/PROBLEMS-AND-FIXES-CLEAN.md`** — a current-only "why the code is this way" map,
+organised by subsystem, that states each truth once at its final resolution (reversals/dead-ends dropped).
+That is the clean read now. So **`PROBLEMS-AND-FIXES.md` reverts to being the full, messy, lossless history**
+and no longer needs in-place cleaning ("this can be messy"). Concretely, this session's §4d archiving was
+**un-retired**:
+
+- **P11/P13/P40 moved back into `PROBLEMS-AND-FIXES.md`** at their original slots (verbatim);
+  `PROBLEMS-AND-FIXES-ARCHIVE.md` **deleted**.
+- The three archiving-support edits were reverted: the P52-merge paragraph, the main-doc header pointer to
+  the archive, and the STATUS.md MOSS "superseded → archive" marker (all referenced a file that no longer
+  exists). Prior-session P15/P16/STATUS work was preserved (not touched).
+- **KEPT:** the §4e staleness fixes (7 stale pointers-to-live-code) stay in `PROBLEMS-AND-FIXES.md` — those
+  are accuracy corrections, not archiving.
+
+**Lesson for the corpus:** the multi-session "retire/mark-superseded in place" method (30th–33rd sessions)
+was retired in favour of **one clean current-state file + the raw P-log left messy**. Don't re-open the
+archive idea. If you touch the clean map, the source of live truth is `PROBLEMS-AND-FIXES-CLEAN.md`; the
+P-log and its `(full story: P##)` pointers are lossless history.
+
 ## 5. LEFT FOR NEXT SESSION (the user's call on each)
 
 1. **~~`.env` lines ~126–130~~ — DONE (§4d), user-approved rewrite.**
