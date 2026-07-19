@@ -68,22 +68,25 @@ class Config:
     ttfo_target_s: float = _get_float("TTFO_TARGET_SECONDS", "3")
 
     # --- product mode ---
-    # ECHO_GUARD=1 mutes the mic while the bot is speaking (half-duplex). DEFAULT IS NOW 0
-    # (barge-in, mic always live) because the half-duplex mute is BROKEN under the default
-    # steady sync mode: steady delays the audio, so a 2nd BotStartedSpeaking fires after
-    # TTSStopped and -- with BOT_VAD_STOP_FALLBACK_SECS raised to 600 by the screech fix --
-    # no BotStopped follows, leaving the mic STUCK MUTED after a turn (voice never triggers;
-    # see docs/PROBLEMS-AND-FIXES.md P11). With 0 the mic stays live -> use headphones (or OS
-    # echo cancellation) so the avatar's voice doesn't barge in on itself. Set 1 only with
-    # MUSETALK_SYNC_MODE=live, where the mute strategy still tracks bot speech correctly.
+    # ECHO_GUARD=1 mutes the mic while the bot is speaking (half-duplex). DEFAULT IS 0
+    # (barge-in, mic always live; the P44 baseline) -> use headphones (or OS echo cancellation)
+    # so the avatar's voice doesn't barge in on itself. The old steady-sync blocker is FIXED
+    # (P53, 2026-07-15): the avatar client now holds TTSStoppedFrame until the turn's voice
+    # fully drains, so BotStoppedSpeaking fires at true end of speech and the P11 stuck-mute
+    # (mic dead after the first turn) can no longer arise. VERIFIED LIVE 2026-07-17 (the first
+    # time =1 has ever run here): 3 driven turns under steady gave 3/3 mute->unmute cycles,
+    # each unmute 1-2ms after BotStopped, and later turns still triggered -- the mic does not
+    # stick. What is still UNJUDGED is whether half-duplex is WANTED: =1 kills barge-in for
+    # the bot's whole reply, and replies here run 40-66s. Default stays 0 for that reason, not
+    # because it's broken. docs/PROBLEMS-AND-FIXES.md P11/P53.
     echo_guard: bool = (_get("ECHO_GUARD", "0") or "0").lower() in ("1", "true", "yes", "on")
 
     # ALLOW_INTERRUPTIONS=1 (default) = the user can barge in and cut the bot off mid-reply
     # (pipecat broadcasts an interruption when the user starts speaking). =0 = the bot ALWAYS
     # finishes its turn; user speech during playback never cancels it ("can't interrupt").
     # This is the turn-start strategy's `enable_interruptions` flag -- NOT the mic mute
-    # (that's echo_guard, which is broken under steady sync, P11); this has no mute state
-    # machine so it's safe under the default steady mode. See main.py.
+    # (that's echo_guard); this has no mute state machine at all, so the P11-era mute
+    # concerns never applied to it. See main.py.
     allow_interruptions: bool = (_get("ALLOW_INTERRUPTIONS", "1") or "1").lower() in ("1", "true", "yes", "on")
 
     # --- VAD (Silero, local, always-on) — turn-taking feel vs. perceived latency ---
@@ -117,6 +120,19 @@ class Config:
     # How long a pause (seconds) ends your turn and FIRES the query to the LLM. Lower = snappier
     # (fires sooner after you stop), but too low can cut you off mid-sentence. Default 0.5.
     sherpa_endpoint_silence: float = _get_float("SHERPA_ENDPOINT_SILENCE", "0.5")
+    # sensevoice: offline SenseVoice-Small (segmented via VAD + Smart Turn, GPU) -- a big
+    # accuracy + noise-robustness upgrade over the 2023 zipformer. See sensevoice_stt.py.
+    sensevoice_model_dir: str = _get(
+        "SENSEVOICE_MODEL_DIR",
+        "models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17",
+    ) or "models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17"
+    # cuda = run the ~0.5GB model on the GPU headroom (RTF ~0.016); cpu = 0 GPU (also real-time).
+    sensevoice_provider: str = (_get("SENSEVOICE_PROVIDER", "cuda") or "cuda").lower()
+    sensevoice_traditional: bool = (_get("SENSEVOICE_TRADITIONAL", "1") or "1").lower() in ("1", "true", "yes", "on")
+    # Endpoint trailing-silence (s) for SenseVoice's self-segmentation. LONGER than sherpa's 0.5
+    # because SenseVoice is accurate on WHOLE utterances but garbles short fragments -- a short
+    # value chops sentences at micro-pauses. 0.8 merges mid-sentence pauses into one segment.
+    sensevoice_endpoint_silence: float = _get_float("SENSEVOICE_ENDPOINT_SILENCE", "0.8")
 
     # --- LLM (OpenRouter: one key, any model via OPENROUTER_MODEL) ---
     openrouter_api_key: str | None = _get("OPENROUTER_API_KEY")
@@ -177,7 +193,13 @@ class Config:
     jaitts_sample_rate: int = _get_int("JAITTS_SAMPLE_RATE", "24000")
 
     # --- Avatar (local MuseTalk talking-head server on port 8002) ---
-    avatar_url: str = _get("AVATAR_URL", "http://localhost:8002")
+    # Force IPv4: the :8002 server binds 0.0.0.0 (IPv4 only), and on Windows a `localhost`
+    # connect tries IPv6 ::1 FIRST and wastes ~2s failing over to IPv4 on every request. That
+    # hit BOTH the build_avatar /health check AND the websockets.connect at connect time --
+    # a flat ~2s+2s of Connect latency (measured 2026-07-18: urllib localhost 2031ms vs
+    # 127.0.0.1 0ms). Normalizing here fixes it regardless of what AVATAR_URL says.
+    avatar_url: str = _get("AVATAR_URL", "http://localhost:8002").replace(
+        "//localhost:", "//127.0.0.1:")
 
     @property
     def is_mandarin(self) -> bool:

@@ -22,7 +22,7 @@ render through **TensorRT**, and the Whisper/VAE feature extractors (torch CUDA)
 | Requirement | Floor | Why |
 |---|---|---|
 | Vendor | NVIDIA | vLLM + TensorRT + torch-CUDA paths; no ROCm/oneAPI ports here. (Sherpa STT is CPU — irrelevant.) |
-| Compute capability | ≥ 7.5 (TRT 10's hard floor; Volta deprecated in TRT 10.0). vLLM: ≥ 7.0, but bfloat16/FP8 need ≥ 8.0 | Below 7.5 the TRT engines don't run at all → PyTorch fallback, which we already measured too slow to hold sync (P16). |
+| Compute capability | ≥ 7.5 (TRT 10's hard floor; Volta deprecated in TRT 10.0). vLLM: ≥ 7.0, but bfloat16/FP8 need ≥ 8.0 | Below 7.5 the TRT engines don't run at all → PyTorch fallback. On *this* 5060 Ti that fallback still clears the 12 fps budget, but by only **4 %** under contention (1.04×, vs TRT's 2.05× — re-measured 2026-07-17, P16); a card slower than this one has no margin left, so treat the fallback as non-viable rather than "slow but OK". |
 | VRAM | ≥ 8GB | P50 squeeze: vLLM 2.3GB (`COSYVOICE_VLLM_GPU_UTIL=0.07` on 16GB; use **~0.14 on an 8GB card** — the knob is fraction-of-card) + avatar ~3.3GB (`MUSETALK_FREE_TORCH=1`) ≈ 6.9GB project share. |
 | Compute throughput | ~RTX 5060 Ti class for the single-GPU 512px config | MuseTalk must render ≥ 12fps at 512px **under live CosyVoice contention** or steady-mode voice lags (P36: 768/1024 profiled fine in isolation, collapsed to ~10fps live). Slower cards likely need `MUSETALK_SIZE=256`. |
 | OS | Windows + WSL2 (or Linux) | vLLM is Linux-only; we run it in WSL2. Any card with current drivers works under WSL2 CUDA. |

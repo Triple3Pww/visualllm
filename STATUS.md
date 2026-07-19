@@ -1,5 +1,66 @@
 # VisualLLm — Project Status & Next Steps
 
+_Last updated: 2026-07-18 (**32nd session — REPLACED the local STT + trimmed the avatar to fit 8GB.**
+The old `STT_PROVIDER=sherpa` (2023 streaming zipformer) was poor on real speech; the new
+**`STT_PROVIDER=sensevoice`** (SenseVoice-Small int8, FunAudioLLM/Alibaba — CosyVoice's ASR sibling)
+is a big accuracy + noise-robustness jump (A/B: identical clean, but held the opener at 5dB SNR where
+the zipformer garbled 台北→还被; adds punctuation; CPU/0 GPU, RTF ~0.016). **8GB target verified**: full
+system idles ~5.7GB; `MUSETALK_SIZE=256` (in split mode this only sizes the composite canvas — mouth is
+model-native 256, bg is BASE_MAX 768 — so it's lighter with NO visible loss, user-confirmed).
+
+**SenseVoice is SELF-SEGMENTING** (like sherpa): a streaming-zipformer endpoint detector drives
+`VADUserStarted/Stopped` + robustness to a quiet mic, SenseVoice transcribes each buffered segment. It
+had to be — a plain `SegmentedSTTService` never fires here (the transport doesn't push VAD user frames
+to the STT; turn-taking is Smart-Turn-downstream). Emits **clean non-overlapping segments** and lets the
+LLM aggregator concatenate them; a text-`_pending_prefix` "coalesce" merge was tried and **REMOVED** —
+it duplicated (`什麼是？…什麼是？…`) whenever the aggregator also stacked the finals, and the updated
+**measure harness caught it**. Also fixed: 1.0s pre-roll (short words like 你好 no longer clip to 好),
+`ttfs_p99_latency=0.1` (killed the P54 1s dead-wait for the new STT), SenseVoice-quality live-preview
+interims. Knobs: `SENSEVOICE_ENDPOINT_SILENCE` (0.5), `SENSEVOICE_PROVIDER`, `SENSEVOICE_TRADITIONAL`.
+**GPU-STT rejected with data**: STT is 18–43ms live (already CPU); the only Blackwell-viable GPU route
+(a WSL server) adds a bigger network hop than the whole transcription. **measure harness updated** for
+the new STT (Capture-row lever → `SENSEVOICE_ENDPOINT_SILENCE`; STT labels describe self-segmenting).
+**All UNCOMMITTED. Not yet ear-tested on the user's real mic — probe-verified only** (clean transcript
+`什麼是人工智慧？請詳細說明。`, TTFO ~2.3–2.8s). Docs (CLAUDE.md stack row + note) updated.**_
+
+_Prior: 2026-07-18 (**31st session — built the CLEAN NCU HANDOFF REPO at
+`E:\Claude\VisualLLm-NCU` (a NEW sibling repo, fresh `git init`, 9 commits, 78 tracked files,
+~19MB source, no weights/vendor/models tracked). The prof wants the project handed to NCU so
+others can use + future-implement it; this is the thorough handoff (the 2026-06-30 public one was
+the light version). Ran the full superpowers flow — spec+plan at
+`docs/superpowers/{specs,plans}/2026-07-18-ncu-handoff-repo*` (in THIS repo, UNCOMMITTED).**
+
+**Scope (user chose via AskUserQuestion):** base "core + weather/memory path" BUT keep the measure
+harness, mouth-crop split, and the avatar PRESET system; **weather_chain kept as the worked EXAMPLE
+of "connect your own LLM"**, NOT as the NCU bot; REMOVE the growing-memory harness (`avatar_memory.py`),
+Thai JaiTTS, the `/nimbus` client, the dev trees (archive/learn/research/paper/output/scratchpad), and
+the session-log docs (STATUS/PROBLEMS-AND-FIXES/WORKFLOW). Fresh clean history; distilled
+ENGINEERING-NOTES instead of the raw P-log.
+
+**Code was READ + cleaned, not copied verbatim** (user: "read the code also and clean it"): stripped
+every `avatar_memory`/`jaitts`/`nimbus`/Thai orphan across `pipeline/` + `local_services/`;
+`weather_chain_llm.py` DECOUPLED from `MemoryStore` to stand alone as the example; dead knobs +
+config-panel cards (AVATAR_MEMORY/MEMORY_LLM_*) removed; every `VisualLLm/` path re-pointed to
+`VisualLLm-NCU/`; in-code `PROBLEMS-AND-FIXES` refs -> `docs/ENGINEERING-NOTES.md` (which carries a
+P-tag index so they resolve); `.env.example`/`.gitignore`/`requirements.txt` trimmed; orphaned assets
+(moss ref clip, superseded portraits) deleted; `assets/README.md` de-Simli'd. **Load-bearing why-comments
++ P-guards PRESERVED** (P52 producer byte-carry, `cudnn.benchmark=False`, proto-2, sync coupling).
+
+**5 outside-reader docs** in the new repo's `docs/`: ARCHITECTURE, SETUP (from-zero WSL2+vLLM+conda+
+weights+troubleshooting), USAGE (curated knob table + measure harness), EXTENDING (the
+connect-your-own-LLM walkthrough + add-a-preset), ENGINEERING-NOTES (distilled gotchas + P-index),
+plus a README front door.
+
+**VERIFIED:** `scripts.preflight` PASS (no drift, `pipeline.main` constructs), `compileall` clean,
+ZERO orphan refs on final grep, and the new repo's WebRTC probe CONNECTED to a live pipeline +
+received both audio+video tracks. Caught + fixed a fresh-clone bug — the harness needs `output/`+`logs/`
+present, now shipped via `.gitkeep`. **UNVERIFIED (the one gap):** a full waterfall / live-eye run of
+the NEW repo's OWN 3-process stack — it needs the GPU+ports the SOURCE stack was holding, and I did not
+tear down the running system unprompted. **TO FINISH:** stop the source stack -> launch from
+`VisualLLm-NCU` (launcher or the 3 manual cmds in its `docs/SETUP.md §8`) -> drive a turn + eyeball sync.
+**ALSO OPEN:** the new repo has NO git remote yet, and this repo's spec+plan are uncommitted (commit-on-ask).
+Memory: `project_visualllm_ncu_handoff_repo`.)_
+<!-- prior handoff -->
 _Last updated: 2026-07-16 (**30th session — doc-accuracy cleanup: retired what later root-cause fixes
 superseded (P7/P8/P10 REMOVED), re-verified P1/P9 as load-bearing by measurement, reframed P6 as a TTFB
 fix. Full handoff: `docs/DOC-ACCURACY-CLEANUP-HANDOFF.md` — the user continues next session.**
@@ -392,8 +453,11 @@ comment), `docs/PROBLEMS-AND-FIXES.md` (P45–P47). `python -m scripts.preflight
 
 _Last updated: 2026-07-11 (**PUBLIC LINK anyone can use — no Tailscale, no signup. VERIFIED LIVE.**
 The front door moved from Tailscale Funnel (stopped working) to a **Cloudflare quick tunnel**
-(`scripts/tunnel.ps1`, auto-started by `launch.ps1` step [4/5]; random `trycloudflare.com` URL). `.env`
-**`WEBRTC_PUBLIC=1`** now baseline. The media leg that STUN-only couldn't reach for symmetric-NAT /
+(`scripts/tunnel.ps1`, auto-started by `launch.ps1` step [4/5]; random `trycloudflare.com` URL).
+**`WEBRTC_PUBLIC=0` is baseline since 2026-07-18 (P57)** — was `1`, but advertising STUN + Cloudflare TURN made
+ICE WAIT on those servers to gather (~3.5s client + ~5s server), the bulk of a remote "~20s to connect", while a
+tailnet/local peer connects direct `host/host` and needs neither. Flip to `1` (config panel) only for a genuine
+public non-Tailscale link. The rest of this note describes that `=1` public path. The media leg that STUN-only couldn't reach for symmetric-NAT /
 UDP-restricted visitors (symptom: page loads but avatar stuck "connecting") is fixed by a **zero-signup
 Cloudflare TURN relay** — `main.py::_cloudflare_turn()` fetches fresh creds per connection from
 `speed.cloudflare.com/turn-creds`, gated by **`TURN_CLOUDFLARE`** (default ON with `WEBRTC_PUBLIC=1`,

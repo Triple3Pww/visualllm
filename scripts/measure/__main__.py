@@ -94,7 +94,7 @@ def main():
     ap.add_argument("--compare", nargs=2, type=int, metavar=("A", "B"),
                     help="diff two run-history rows by index (e.g. -2 -1)")
     ap.add_argument("--machine", default="this box (RTX 5060 Ti, Blackwell)")
-    ap.add_argument("--stack", default="Deepgram/Sherpa STT - OpenRouter LLM - CosyVoice (vLLM/WSL) TTS - MuseTalk avatar")
+    ap.add_argument("--stack", default="Deepgram/Sherpa/SenseVoice STT - OpenRouter LLM - CosyVoice (vLLM/WSL) TTS - MuseTalk avatar")
     args = ap.parse_args()
 
     if args.compare:

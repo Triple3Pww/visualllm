@@ -277,6 +277,10 @@ candidate pollution (hyper-v/radmin interfaces). Pinning ICE to the Tailscale 10
 `(full story: P4.)`
 
 ### 6.2 Public link + TURN for strangers
+**Default is now `WEBRTC_PUBLIC=0`** (2026-07-18, P57): =1 advertises STUN + Cloudflare TURN, and ICE
+then WAITS on those servers to gather relay candidates (~3.5s client cap + ~5s server answer gather) —
+pure waste for a tailnet/local/LAN peer, which connects direct `host/host`. Flip to =1 only for a genuine
+public non-Tailscale internet link. See §6.6.
 `WEBRTC_PUBLIC=1` advertises STUN so an off-tailnet browser reaches the media; the front door is a
 Cloudflare quick tunnel (`scripts/tunnel.ps1`, auto-started by `launch.ps1`) carrying only the page +
 `/api/offer` signaling, never the media. For a visitor behind symmetric-NAT/UDP-restricted networks a
@@ -305,6 +309,27 @@ Transport + encode + network is **at its physical floor (~0.13 s)** — the meas
 ~0.2 s of phantom "network" that was never on the wire, and its listed lever (`WEBRTC_VIDEO_BITRATE_MAX`)
 caps VP8 *video* while the voice is a separate OPUS track, so it could never have moved it. Don't
 optimise this row. `(full story: P55.)`
+
+### 6.6 Connect latency — four costs, none the pipeline
+"/studio takes ~20s to Connect" was four independent things, found with the always-on **`[connect-timing]`
+beacon** (`/studio` POSTs `{cfgMs,overlayMs,micMs,gatherMs,gatherCapped,offerMs,connectMs,pair,rttMs}` to
+`POST /client/connect-timing` on 'connected' → one log line, readable from a phone). Local ICE/DTLS is ~30ms,
+so the "~5s handshake" folklore was NOT it. The four:
+1. **Per-connect pipeline rebuild** — pipecat rebuilds the pipeline every connection, reloading the STT
+   models from disk (~1.6–2.7s). Cached process-wide (`sensevoice_stt.py` `_MODEL_CACHE`): build#2 = 0ms.
+2. **`localhost` IPv6 trap on :8002** — the avatar server is IPv4-only (`0.0.0.0`); on Windows `localhost`
+   tries `::1` first and wastes ~2s per request (hit the `/health` check AND the ws connect). `config.py`
+   normalizes `avatar_url`→`127.0.0.1`. urllib/websockets to `localhost:8002` = 2031ms vs 0ms. **#1+#2:
+   build→ready ~5.9s → ~0.2s warm.**
+3. **STUN/TURN gather wait** — see §6.2; `WEBRTC_PUBLIC=0` removes it (was ~3.5s client + ~5s server).
+4. **The 594KB overlay on the connect path** — split-mode's background PNG was `await`ed before the offer
+   and re-downloaded every connect; over a ~570 kbps DERP-relayed tailnet it took ~8s AND saturated the link
+   so the offer POST stalled ~7s. Now **prefetched once at page load, cached in memory, applied in `ontrack`
+   — off the connect path** (`studio_client/index.html` `fetchOverlayData()`). Reconnects are instant.
+
+Result: local instant, Tailscale reconnect ~0.2–0.6s (was ~20s). Note: a ~570 kbps `host/host` link means the
+tailnet is likely **DERP-relayed, not direct** — that also makes the avatar *video* choppy (separate from
+connect; check `tailscale status` for "relay"). `(full story: P57.)`
 
 ---
 

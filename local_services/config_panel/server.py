@@ -377,7 +377,8 @@ def restart_cosyvoice() -> dict:
         if _cosy_health_ok():
             return {"ok": True, "message": "CosyVoice restarted (model=%s)" % model}
     return {"ok": False, "message": "relaunched, but :8001 not healthy in ~150s -- check "
-            "logs/cosyvoice_wsl.log (VRAM/load-order: start CosyVoice before MuseTalk, P15)"}
+            "logs/cosyvoice_wsl.log: 'Available KV cache memory' must be positive (P15; load order "
+            "is NOT the likely cause -- re-measured 2026-07-17, vLLM loads fine second)"}
 
 
 def read_cosy_model() -> str:
@@ -444,16 +445,20 @@ def _kill_port(port: int) -> None:
 
 def apply_preset(name: str) -> dict:
     """Swap the whole avatar backend to a preset: portrait, cloned voice, language -> then relaunch
-    the three GPU services in the SAFE ORDER. LOAD ORDER MATTERS (P15): vLLM CosyVoice needs the card
-    mostly free, so free MuseTalk's VRAM FIRST, then start CosyVoice, THEN MuseTalk, THEN the
-    pipeline. Long (model reload + TRT + warmup ~2-4 min); the panel warns before calling."""
+    the three GPU services in the SAFE ORDER: free MuseTalk's VRAM first, then CosyVoice, THEN
+    MuseTalk, THEN the pipeline. The order is INSURANCE, not a requirement -- P15's "vLLM needs the
+    card mostly free" crash was re-measured 2026-07-17 and does NOT reproduce (vLLM budgets
+    total_card * util and ignores other processes; it loads fine second at util 0.07 and 0.30, wall
+    ~0.79). Kept because it costs nothing and MuseTalk must restart here anyway to pick up the new
+    portrait. Long (model reload + TRT + warmup ~2-4 min); the panel warns before calling."""
     name = (name or "").strip().lower()
     if name not in PRESETS:
         return {"ok": False, "message": "unknown preset %r" % name}
     preset = PRESETS[name]
     write_env({**preset["env"], "AVATAR_PRESET": name})
     _write_voice_env(preset)
-    _kill_port(8002)          # free MuseTalk's ~5GB so vLLM can claim the KV cache (P15)
+    _kill_port(8002)          # MuseTalk must restart anyway for the new portrait; freeing it first is
+                              # also VRAM insurance (not required since P15 was re-measured 2026-07-17)
     steps, oks = [], []
     for label, fn in (("cosyvoice", restart_cosyvoice), ("avatar", restart_avatar),
                       ("pipeline", restart_pipeline)):

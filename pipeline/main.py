@@ -704,6 +704,23 @@ def _ensure_client_patch_middleware() -> bool:
             return HTMLResponse(
                 _json.dumps({"serverEpochMs": _time.time() * 1000.0}),
                 media_type="application/json", headers={"Cache-Control": "no-store"})
+        # Connect-timing beacon (ALWAYS on, unlike the ?measure=1 playout beacon above). The
+        # /studio client POSTs one line at the moment it goes 'connected' with the breakdown of
+        # the WebRTC negotiation it just did -- ICE candidate gather (and whether it hit the 3.5s
+        # cap), offer round-trip, DTLS-to-connected, and the winning candidate PAIR type
+        # (host/srflx/relay) + its RTT. On the local box these are ~0; the whole point is that
+        # when you connect from a PHONE or a remote browser it lands here in pipeline.log, so the
+        # remote seconds are visible without a devtools console on the remote device.
+        if request.method == "POST" and request.url.path == "/client/connect-timing":
+            import json as _json
+            try:
+                from log_setup import ensure_file_sink
+                ensure_file_sink("pipeline")
+                body = _json.loads((await request.body())[:2000] or b"{}")
+            except Exception:  # noqa: BLE001
+                body = {}
+            logger.info(f"[connect-timing] {_json.dumps(body)}")
+            return HTMLResponse('{"ok":true}', media_type="application/json")
         # Client bootstrap config for the STATIC custom client (/studio). It is served as a
         # plain file, so it can't get a <head> RTCPeerConnection wrapper the way the prebuilt
         # /client page can -- it fetches this instead, before building the peer connection.

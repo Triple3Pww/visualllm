@@ -254,22 +254,34 @@ the **OS env only** (no python-dotenv in its env) — `scripts/run.ps1` propagat
 Default STT is **Deepgram** (cloud). For a fully-offline STT (CPU, ~0 VRAM, no GPU
 contention):
 
-**Option A — `sherpa` (streaming, in-process — RECOMMENDED).** sherpa-onnx zipformer,
-bilingual zh-en, runs **in the pipeline** (system Python, no server). Drives turn-taking
-from its **own ASR endpoint detector**, so a quiet/remote mic still flushes the turn (the
-failure mode that breaks segmented STT). Deps are already in `requirements.txt`; download
-the model (~330 MB) into `models/` (git-ignored):
+**Option A — `sensevoice` (RECOMMENDED, 2026-07-18).** SenseVoice-Small int8 (FunAudioLLM/Alibaba,
+CosyVoice's ASR sibling) — a large accuracy + noise-robustness jump over the old zipformer (held the
+opener at 5 dB SNR where the zipformer garbled 台北→还被; adds punctuation). Runs **in the pipeline**
+(system Python, no server), CPU / ~0 GPU. It is **self-segmenting**: a lightweight streaming zipformer
+runs only as the endpoint detector (drives turn-taking from its **own ASR endpoint**, robust to a quiet
+mic), and SenseVoice transcribes each segment. So it needs **both** models in `models/` — the SenseVoice
+model AND the zipformer (used only for endpointing):
 ```bash
-curl -L -o models/m.tar.bz2 \
+# SenseVoice-Small int8 (the transcriber, ~160 MB)
+curl -L -o models/sv.tar.bz2 \
+  https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2
+cd models && tar xjf sv.tar.bz2 && cd ..
+# zipformer (the endpoint detector, ~330 MB) -- same download as Option B below
+curl -L -o models/zip.tar.bz2 \
   https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20.tar.bz2
-cd models && tar xjf m.tar.bz2 && cd ..
+cd models && tar xjf zip.tar.bz2 && cd ..
 ```
-Then `.env`: `STT_PROVIDER=sherpa` (knobs `SHERPA_ENDPOINT_SILENCE=0.5`, `SHERPA_TRADITIONAL=1`).
-> **Already done here:** the sherpa model is unpacked under `models/`.
+Then `.env`: `STT_PROVIDER=sensevoice` (knobs `SENSEVOICE_ENDPOINT_SILENCE=0.5`, `SENSEVOICE_PROVIDER=cuda`
+[falls back to CPU on the pip wheel — fine, STT is only ~20–40 ms], `SENSEVOICE_TRADITIONAL=1`).
+> **Already done here:** both models are unpacked under `models/`.
 
-> The `funasr` (SenseVoice, `:8004`) and MOSS-TTS (`:8003`) servers were **removed 2026-07-14** —
-> neither was ever selected in `.env`, and an untried fallback is not a safety net. They are in git
-> history if you ever want them back. `sherpa` above is the offline STT path.
+**Option B — `sherpa` (the older streaming zipformer).** Same in-process, self-endpointing design,
+but the 2023 model is less accurate on real speech (superseded by Option A). Download the zipformer
+(the second curl above) and set `.env`: `STT_PROVIDER=sherpa` (`SHERPA_ENDPOINT_SILENCE=0.5`,
+`SHERPA_TRADITIONAL=1`).
+
+> The `funasr` (`:8004`) and MOSS-TTS (`:8003`) servers were **removed 2026-07-14** — neither was ever
+> selected. They are in git history. (SenseVoice now runs IN-PROCESS via sherp-onnx, not the old server.)
 
 ---
 
@@ -285,7 +297,7 @@ DEEPGRAM_API_KEY=...
 OPENROUTER_API_KEY=...
 OPENROUTER_MODEL=google/gemini-2.5-flash-lite   # cloud (the baseline). Local Ollama: base_url->:11434/v1 + a NON-reasoning model (qwen2.5:3b). Do NOT use a thinking model (qwen3.5:4b): it returns empty `content` -> avatar silent, (OPENROUTER_REASONING_EFFORT was a dead knob and is now deleted from .env). See WORKFLOW.md §8.
 
-STT_PROVIDER=deepgram                    # or sherpa (offline, in-process)
+STT_PROVIDER=deepgram                    # or sensevoice (offline, in-process, RECOMMENDED local) / sherpa (older)
 TTS_PROVIDER=cosyvoice                   # or jaitts (Thai -- CosyVoice cannot speak Thai)
 COSYVOICE_URL=http://172.24.44.238:8001  # Path A: the WSL IP (wsl hostname -I). Path B: http://localhost:8001
 MUSETALK_SYNC_MODE=steady                # steady = video-master, synced start (default) | live = voice-instant, lips trail
@@ -321,7 +333,8 @@ up WSL CosyVoice (waits on `/health`), then avatar+pipeline, then the config pan
 opens the client. The launcher window is the on/off switch — press **Enter** (or close it)
 to stop everything.
 
-**Manual — the load order MATTERS (start CosyVoice BEFORE MuseTalk; §10):**
+**Manual — start CosyVoice BEFORE MuseTalk (§10). This order is *insurance*, not a hard requirement:
+re-measured 2026-07-17, vLLM loads fine second onto a MuseTalk-occupied card (P15 §2):**
 ```powershell
 # 1. CosyVoice TTS (Path A: in WSL)
 wsl -d Ubuntu -e bash -c "bash /mnt/e/Claude/VisualLLm/tts/cosyvoice-server/run_vllm_server.sh"
@@ -359,9 +372,10 @@ appear**, then talk.
 3. **Audio lags ~2 s on Path A:** `COSYVOICE_URL` is `localhost`, not the WSL IP.
 4. **White screen at the client:** you opened `/client` without the trailing slash. Use `/client/`.
 5. **Conda env "fails to download" weights at startup:** the broken cert store — §5.4.
-6. **Chinese voice starts ~1 s later than English:** known, unfixable on one GPU
-   (CosyVoice's zh first-chunk TTFB; `COSYVOICE_FIRST_HOP` fixes it but starves the avatar).
-   Don't enable it. `docs/PROBLEMS-AND-FIXES.md` P15.
+6. **Chinese voice starts ~1 s later than English:** no longer true — refuted by measurement
+   2026-07-17 (at matched input zh ≈ en; TTFB tracks input *length*, not language). Don't enable
+   `COSYVOICE_FIRST_HOP` to "fix" it: that verdict still stands, for the reason in P22 (a small
+   opening chunk fills the avatar's lead cushion slowly). `docs/PROBLEMS-AND-FIXES.md` P15 §1.
 7. **Avatar choppy/desynced over RDP/WAN:** RDP adds its own choppiness — judge sync with
    the offline capture tools, not the remote window. Remote viewing is best over Tailscale
    (`tailscale serve` HTTPS) in a native browser.

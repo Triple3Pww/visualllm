@@ -101,7 +101,21 @@ class CosyVoiceTTSService(TTSService):
                 first = True
                 # Server streams raw PCM; read fixed-size chunks (~20ms frames).
                 chunk_bytes = int(self.sample_rate * 2 * 0.02)
+                # SAMPLE-ALIGNMENT AT THE SOURCE (the P3/P34/P40 root cause): the server writes
+                # whole int16 samples, but HTTP-chunk/TCP boundaries land mid-sample and
+                # iter_chunked() propagates them (measured live: several odd-length chunks per
+                # utterance, mid-stream). TTSAudioRawFrame promises whole samples, so carry the
+                # dangling byte to the next chunk HERE -- every frame this service yields is
+                # even, and no downstream consumer has to repair alignment. A final dangling
+                # byte at stream end is sub-sample (inaudible) and dropped.
+                carry = b""
                 async for chunk in resp.content.iter_chunked(chunk_bytes):
+                    if not chunk:
+                        continue
+                    chunk = carry + chunk
+                    cut = len(chunk) & ~1
+                    carry = chunk[cut:]
+                    chunk = chunk[:cut]
                     if not chunk:
                         continue
                     if first:

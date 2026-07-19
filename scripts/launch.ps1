@@ -16,8 +16,10 @@
 
 .NOTES
   TTS lives in WSL and is reached over the WSL IP in .env COSYVOICE_URL (NOT
-  localhost -- WSL2's localhost relay buffers the audio stream). If the WSL IP
-  changed after a `wsl --shutdown`, update COSYVOICE_URL (get it via `wsl hostname -I`).
+  localhost -- WSL2's localhost relay buffers the audio stream). The WSL NAT IP
+  changes on `wsl --shutdown`/reboot, so the launcher RECONCILES the .env value
+  against the live `wsl hostname -I` on every start (Sync-CosyVoiceUrl) -- a stale
+  IP used to mean a silently mute bot until someone updated it by hand.
 #>
 param(
     [string]$MusetalkPython = "E:\miniconda3\envs\musetalk\python.exe",
@@ -45,6 +47,37 @@ function Get-EnvVal([string]$key) {
     $m = Select-String -Path $envFile -Pattern ("^\s*{0}\s*=\s*(.+?)\s*(?:#.*)?$" -f [regex]::Escape($key)) -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($m) { return $m.Matches[0].Groups[1].Value.Trim() }
     return $null
+}
+
+# Reconcile a stale WSL IP in .env COSYVOICE_URL against the LIVE `wsl hostname -I`.
+# Root cause this closes: the URL must carry WSL's NAT IP (localhost is deliberate only for
+# the Windows fallback server -- the WSL2 localhost relay buffers the audio stream ~2s), but
+# that IP is DHCP-assigned and changes on `wsl --shutdown`/reboot; a stale value fails as a
+# silently mute bot (":8001 unreachable" in pipeline.log). Rewrites ONLY the IP inside the
+# COSYVOICE_URL line (comment + the rest of .env untouched, UTF-8 no BOM preserved for the
+# CJK comments) and returns the URL to use. Best-effort: any failure returns the original
+# unchanged -- never blocks the launch. Non-IP hosts (localhost / a hostname) are left alone.
+function Sync-CosyVoiceUrl([string]$url) {
+    if (-not $url -or $url -notmatch '^http://(\d{1,3}(?:\.\d{1,3}){3}):(\d+)') { return $url }
+    $oldIp = $Matches[1]
+    $port  = $Matches[2]
+    try {
+        $env:WSL_UTF8 = "1"   # wsl.exe otherwise emits UTF-16 into a redirected pipe
+        $live = (& wsl.exe -d $WslDistro -e hostname -I 2>$null | Out-String)
+        $liveIp = (($live -replace "`0", "").Trim() -split '\s+')[0]
+        if ($liveIp -notmatch '^\d{1,3}(?:\.\d{1,3}){3}$' -or $liveIp -eq $oldIp) { return $url }
+        $enc = New-Object System.Text.UTF8Encoding($false)
+        $lines = [System.IO.File]::ReadAllLines($envFile, $enc)
+        for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match '^\s*COSYVOICE_URL\s*=') {
+                $lines[$i] = $lines[$i].Replace(("http://{0}:{1}" -f $oldIp, $port),
+                                                ("http://{0}:{1}" -f $liveIp, $port))
+            }
+        }
+        [System.IO.File]::WriteAllLines($envFile, $lines, $enc)
+        Write-Host ("  COSYVOICE_URL: WSL IP drifted {0} -> {1}; .env updated." -f $oldIp, $liveIp) -ForegroundColor Yellow
+        return $url.Replace(("http://{0}:{1}" -f $oldIp, $port), ("http://{0}:{1}" -f $liveIp, $port))
+    } catch { return $url }
 }
 
 # True when an HTTP GET returns 200 (health probes). A 503/refused throws -> $false.
@@ -97,6 +130,7 @@ $startedWsl = $null
 $ttsProvider = Get-EnvVal "TTS_PROVIDER"
 $cosyUrl     = Get-EnvVal "COSYVOICE_URL"
 if ($ttsProvider -eq "cosyvoice" -and $cosyUrl) {
+    $cosyUrl = Sync-CosyVoiceUrl $cosyUrl   # heal a stale WSL IP before any health check
     $health = "$cosyUrl/health"
     Write-Host "[1/5] CosyVoice TTS ($cosyUrl)" -ForegroundColor Cyan
     if (Test-Url $health) {
@@ -141,8 +175,19 @@ Write-Host ""
 # ---------------------------------------------------------------------------
 Write-Host "[2/5] Avatar server + pipeline (via run.ps1)" -ForegroundColor Cyan
 & (Join-Path $PSScriptRoot "run.ps1") -MusetalkPython $MusetalkPython
-if (-not (Test-Url "http://127.0.0.1:7860/client/")) {
-    Write-Host "  WARNING: pipeline client did not come up -- check logs\pipeline.err.log" -ForegroundColor Yellow
+# The pipeline IS the system: with :7860 dead there is no client and nothing for the tunnel to
+# serve. HEALTH-PROBE it rather than trust run.ps1's exit code -- run.ps1 returns 0 even when the
+# pipeline fails to bind (it only warns), so the probe is the honest signal and the exit code
+# alone would miss it. This used to be a WARNING that steps 4/5 sailed straight past: on
+# 2026-07-17 a stale :8002 listener made run.ps1 quit before starting the pipeline, and the
+# launcher went on to publish a public trycloudflare URL over the dead origin and print
+# "RUNNING" -- the visitor got a 502 whose cause appeared in no log. Never fail the whole launch
+# on it: the config panel below is the REPAIR tool (edits .env + restarts the pipeline), and this
+# window stays the off switch that cleans up whatever run.ps1 did start.
+$pipelineUp = Test-Url "http://127.0.0.1:7860/client/"
+if (-not $pipelineUp) {
+    Write-Host "  PIPELINE DID NOT START (:7860 not serving) -- check logs\pipeline.err.log" -ForegroundColor Red
+    Write-Host "  and logs\musetalk.err.log. The config panel still comes up so you can fix .env." -ForegroundColor Red
 }
 Write-Host ""
 
@@ -177,13 +222,19 @@ Write-Host ""
 # ---------------------------------------------------------------------------
 Write-Host "[4/5] Cloudflare public tunnel" -ForegroundColor Cyan
 $tunnel = $null
-try {
-    $tunnel = & (Join-Path $PSScriptRoot "tunnel.ps1") -Port 7860
-    if (-not ($tunnel -and $tunnel.Url)) {
-        Write-Host "  no public URL yet -- see logs\cloudflared.log; the local stack is still up." -ForegroundColor Yellow
+if (-not $pipelineUp) {
+    # A link over a dead origin is worse than no link: it hands out a URL that 502s on every
+    # request, and the 502 says nothing about the pipeline being down (see step 2).
+    Write-Host "  SKIPPED -- no pipeline to publish; a public link would only 502." -ForegroundColor Yellow
+} else {
+    try {
+        $tunnel = & (Join-Path $PSScriptRoot "tunnel.ps1") -Port 7860
+        if (-not ($tunnel -and $tunnel.Url)) {
+            Write-Host "  no public URL yet -- see logs\cloudflared.log; the local stack is still up." -ForegroundColor Yellow
+        }
+    } catch {
+        Write-Host "  tunnel failed to start ($($_.Exception.Message)) -- local stack is still up." -ForegroundColor Yellow
     }
-} catch {
-    Write-Host "  tunnel failed to start ($($_.Exception.Message)) -- local stack is still up." -ForegroundColor Yellow
 }
 Write-Host ""
 
@@ -195,14 +246,27 @@ Write-Host ""
 #    broken page on every one-click launch. /client stays the unsupported fallback.
 # ---------------------------------------------------------------------------
 $clientPath = "/studio/"
-Write-Host "[5/5] Opening the client in your browser ($clientPath)..." -ForegroundColor Cyan
-Start-Process ("http://localhost:7860{0}" -f $clientPath)
+if ($pipelineUp) {
+    Write-Host "[5/5] Opening the client in your browser ($clientPath)..." -ForegroundColor Cyan
+    Start-Process ("http://localhost:7860{0}" -f $clientPath)
+} else {
+    Write-Host "[5/5] NOT opening the client -- the pipeline is down (it would not load)." -ForegroundColor Yellow
+}
 Write-Host ""
 
-Write-Host "===============================================" -ForegroundColor Green
-Write-Host "   VisualLLm is RUNNING"                          -ForegroundColor Green
-Write-Host "===============================================" -ForegroundColor Green
-Write-Host ("  Client      : http://localhost:7860{0}" -f $clientPath)
+$bannerColor = if ($pipelineUp) { "Green" } else { "Red" }
+Write-Host "===============================================" -ForegroundColor $bannerColor
+if ($pipelineUp) {
+    Write-Host "   VisualLLm is RUNNING"                      -ForegroundColor Green
+} else {
+    Write-Host "   VisualLLm is NOT RUNNING -- pipeline down"  -ForegroundColor Red
+}
+Write-Host "===============================================" -ForegroundColor $bannerColor
+if ($pipelineUp) {
+    Write-Host ("  Client      : http://localhost:7860{0}" -f $clientPath)
+} else {
+    Write-Host "  Client      : DOWN -- see logs\pipeline.err.log" -ForegroundColor Yellow
+}
 Write-Host "  Config panel: http://localhost:7870"
 # Tailnet URL for the config panel (tailscale serve :8444 -> 7870). Tailnet-only by design: the
 # panel is UNAUTHENTICATED and can rewrite .env + restart/run processes, so it is deliberately NOT

@@ -97,9 +97,11 @@ the disconnect log prints the median/p95 summary.
 Set `LANGUAGE=zh` in `.env` (and optionally an `OPENROUTER_MODEL` strong at
 Chinese). Deepgram switches to `zh-TW` and CosyVoice speaks zh — no code changes.
 
-> **Known limitation:** the Chinese voice starts ~1s later than English — CosyVoice's
-> zh first-chunk TTFB is ~2.3s vs ~1.1s for en. It's fixable in TTS but the fix starves
-> the shared-GPU avatar render, so it's left as-is. See `docs/PROBLEMS-AND-FIXES.md` P15.
+> **Resolved (2026-07-17):** this used to read "the Chinese voice starts ~1s later than
+> English — CosyVoice's zh first-chunk TTFB is ~2.3s vs ~1.1s for en." **Re-measurement
+> refuted it:** at matched input zh ≈ en (zh ≤1.8s, and the slowest cases are English), because
+> TTFB scales with input *length*, not language. The zh comma-split (`COSYVOICE_FIRST_PIECE_ZH`)
+> plus vLLM CUDA graphs closed it. See `docs/PROBLEMS-AND-FIXES.md` P15.
 
 ---
 

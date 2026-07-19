@@ -3,6 +3,17 @@
 **Written 2026-07-16 (28th session).** Everything else in the mic-to-ear waterfall is at its known
 limit or closed. This is the one row left with real headroom, and it costs **every turn**.
 
+> **UPDATE 2026-07-16 (29th session, P56) — this framing is now KNOWN-OVERSTATED. Read first.**
+> Measured the row's physics floor (the §4 rule this handoff itself preaches, applied to the target):
+> TTFB = **0.648s + 25.9 ms/char** (zh, isolated). **~0.65s is a FIXED FLOOR** no text lever touches;
+> only ~0.28s is length-dependent, and the live first piece is already ~10 chars → realistic remaining
+> win for the whole §3 family is **~0.13s**, not "real headroom". **§3.1 is ANSWERED (the en split fires,
+> 6/7).** The stated mechanism ("prefills the whole sentence") is **wrong** — TTFB tracks the first
+> *segment*, and CosyVoice MERGES short text up to an 80-token cap; FIRST_PIECE wins by denying the merge.
+> **The higher-value lead is now barge-in residue** (an abandoned TTS stream keeps synthesizing the whole
+> ~50s reply on the shared GPU → +1.0s on the next request). Full write-up: `docs/PROBLEMS-AND-FIXES.md`
+> **P56**. The rest of this doc is preserved as the 28th-session record.
+
 > **Read `docs/LATENCY-MATRIX.md` §Correction and `docs/PROBLEMS-AND-FIXES.md` P55 BEFORE measuring
 > anything here.** A full session was just burned on rows that turned out to be instrument artifacts.
 > The discipline in §4 below is not ceremony — it is what caught all five of them.
@@ -36,13 +47,14 @@ first chunk either way, so it is NOT a lever in either direction).
 > **Status 2026-07-16: §3.2 (vLLM-Omni) is DEAD — tested and refuted, do not re-open.** That leaves
 > **§3.1 the cheapest LIVE lead, and it has still never been checked.** Start there.
 
-### 3.1 Confirm `COSYVOICE_FIRST_PIECE` actually fires on ENGLISH (~free, untested)
+### 3.1 Confirm `COSYVOICE_FIRST_PIECE` fires on ENGLISH — ✅ ANSWERED 2026-07-16 (P56): IT FIRES.
 
-The matrix has recommended this for two sessions and **nobody has checked it**. The zh path needed its own
-`_ZH` splitter precisely because the en splitter keys on **ASCII comma/space**, which zh text never contains.
-Verify the reverse is not also true — that the en path still fires, and that 18/32 MIN/MAX is still the
-sweet spot. `local_services/first_piece_aggregator.py`; knobs read via `os.getenv` inside the aggregator.
-Cheapest possible test, and it is the row's own designated lever.
+Pure text-logic probe at the live 18/32 (no GPU needed — the aggregator is just text): the split fired on
+**6/7** realistic openers; the 7th was `"Yes."`, a complete short sentence with nothing to split. The en path
+is NOT silently inert the way the zh path once was. **Caveat found:** the MAX cap only guarantees it never cuts
+mid-*word*, not mid-*phrase* — it overshoots to the next space, so `"Machine learning is a subset of artificial"`
+splits `artificial | intelligence`. That is a prosody/ear question, not a firing question; 18/32 was NOT
+re-swept by ear (the ~0.13s at stake makes it low-value). `local_services/first_piece_aggregator.py`.
 
 ### 3.2 vLLM-Omni via the REGISTERED-VOICE cache — ❌ DEAD, TESTED 2026-07-16. Do not re-open.
 
@@ -148,6 +160,17 @@ python -m scripts.measure --compare -2 -1        # did it help?
 
 ## 6. Open, unclaimed
 
+- **Barge-in TTS residue on the shared GPU (P56 — CONFIRMED live; clean fix ATTEMPTED + REVERTED).** A
+  barge-in abandons `/tts/stream`; the server keeps generating the abandoned utterance's speech tokens, costing
+  the NEXT turn **+0.9–1.1s** (verified with a production-faithful aiohttp repro; residue SCALES with the
+  abandoned generation). The stop-flag + `vllm.abort_request` fix was implemented in the vendored `model.py`/
+  `llm.py`, and REVERTED: the trigger worked, but CosyVoice drives vLLM's `step()` manually through one shared
+  output queue, so a mid-batch abort broke the next turn (empty audio). **Do NOT re-attempt mid-batch abort as
+  a quick patch** (full write-up: `docs/PROBLEMS-AND-FIXES.md` P56). Tractable angles instead: **cap reply
+  length** (`OPENROUTER_MAX_TOKENS`, unread since the 2026-07-14 audit — bounds every residue AND fixes the ~50s
+  ramble, pure-pipeline, no vendored risk), or a proper per-request lifecycle in the vLLM integration (a real
+  effort). Severity is likely < the 0.9s worst case: production abandons ONE sentence, and the next turn only
+  starts after the user speaks.
 - **The intermittent ~1-in-7 +1.7s first-frame spike.** Not compute (GPU flat), not the flush window
   (identical on spiked vs clean turns), not the feed (first PCM on the wire in +0ms). Not yet caught with
   `[barge]` armed — it needs ~10+ turns to hit. Worth ~1.7s on ~13% of turns, vs TTS's 0.9s on 100%.

@@ -36,18 +36,34 @@ OPENERS = [
 
 
 def ttfb(host, text, sr=16000, speed=1.0):
-    """POST /tts/stream, return seconds until the first PCM byte arrives."""
+    """POST /tts/stream, return seconds until the first PCM byte arrives.
+
+    MUST DRAIN THE WHOLE STREAM (2026-07-16). Returning at the first byte does NOT stop the
+    server: app.py::tts_stream never sees FastAPI's Request (so it cannot check is_disconnected),
+    and model.py runs the LLM in its own threading.Thread that finishes the entire utterance
+    regardless of the consumer. So an abandoned request keeps burning the shared GPU, and the
+    NEXT request pays for it -- measured on the live server with an identical short probe:
+    after an ABANDONED long request 1.593s vs after a DRAINED one 0.597s (+1.0s), and a 2s
+    settle did NOT help (0.628s), which rules out cold clocks and pins it on leftover work.
+    That residue was ALSO the variance this probe exists to report: it made whichever opener
+    followed the longest text read as a "COLD SPIKE" (spreads collapsed ~1.1s -> ~0.1s once
+    drained), i.e. the instrument was measuring its own wake. Draining = what the live pipeline
+    does (cosyvoice_tts.py::run_tts consumes the stream to the end).
+    """
     body = json.dumps({"text": text, "sample_rate": sr, "speed": speed}).encode()
     req = urllib.request.Request(
         f"http://{host}:8001/tts/stream", data=body,
         headers={"Content-Type": "application/json"}, method="POST")
     t0 = time.perf_counter()
-    with urllib.request.urlopen(req, timeout=60) as resp:
+    first = None
+    with urllib.request.urlopen(req, timeout=120) as resp:
         while True:
-            chunk = resp.read(1)  # first byte = first audio out
-            if chunk:
-                return time.perf_counter() - t0
-            # empty read w/o EOF is unusual; loop guards against 0-length keep-alives
+            chunk = resp.read(65536)
+            if not chunk:  # EOF: server done, GPU free for the next request
+                break
+            if first is None:
+                first = time.perf_counter() - t0  # first byte = first audio out
+    return first
 
 
 def main():

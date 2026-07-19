@@ -176,8 +176,9 @@ memory) replaces the default multi-gigabyte reservation with ~0.16 GiB, without 
 speed cost. Second, once the renderer's TensorRT engines are loaded, the PyTorch copies of its
 UNet and VAE are freed (−1.8 GB): the TRT-vs-PyTorch fallback decision happens at load time,
 after which the originals are dead weight. The project's processes hold ~5.6 GB, leaving most
-of the card free (Table 4); load order matters (TTS server before renderer) and is enforced by
-the launcher.
+of the card free (Table 4). The launcher starts the TTS server before the renderer; with the
+reduced pool this ordering is defensive rather than required, as the inference server's memory
+budget is a fixed fraction of the card and is not charged for other processes' allocations.
 
 ## 3.5 Client
 
@@ -260,7 +261,7 @@ report it as such rather than tuning it away on instrument evidence (§7).
 | First-clause flush, en (18–32 char window) | TTFO ~4.6 → ~3.2 s |
 | First-clause flush, zh (full-width punctuation only) | long-opener turns 4.78 → 3.08 s |
 | LLM provider pin | LLM hop 1.64 → 0.80 s median (zh), tail eliminated |
-| TensorRT render path (enables §5's video-master sync) | per-segment render 389 → 255 ms |
+| TensorRT render path (enables §5's video-master sync) | per-segment render 455 → 171 ms (contended headroom 1.04× → 2.05×) |
 
 # 5. Audio–Visual Synchronization
 
@@ -311,9 +312,19 @@ instant voice, best-effort lips).
 
 Video-master sync is only viable if stalls are rare, which on a shared GPU means the render
 path must hold its budget *under TTS contention*. Porting MuseTalk's UNet and VAE to TensorRT
-[@tensorrt] cut the per-segment render cost from ~389 ms to ~255 ms (8-frame segments), the
-difference between drifting seconds behind on long turns and holding ≥12 fps under load. Two
-non-obvious details mattered: cuDNN autotuning (`cudnn.benchmark`) had to be disabled because
+[@tensorrt] cut the per-segment render cost from ~455 ms to ~171 ms (8-frame segments) at the
+deployed 512 px configuration, raising headroom against the 667 ms real-time budget from 1.5×
+to 3.9×, and from 1.04× to 2.05× under sustained TTS contention.
+
+What the port buys is *margin*, and how that margin must be measured is itself a result. At the
+deployed 12 fps the PyTorch path also clears the budget — by 4 % — so both paths report the
+same flat +0.36 s offset, and an ablation run at the deployed frame rate alone would wrongly
+conclude the port was inert. Tightening the budget to 25 fps separates them immediately: 13.6 s
+of speech accumulates 4.04 s of held-frame padding on the PyTorch path (101 held frames) versus
+0.32 s on TensorRT (8), which video-master would surface as seconds of paused voice. The
+general point, developed in §7: an ablation that holds the operating point fixed measures
+whether a component is *currently binding*, not whether it is load-bearing. Two non-obvious
+details mattered: cuDNN autotuning (`cudnn.benchmark`) had to be disabled because
 the turn-start segment's distinct tensor shape triggered a ~16 s re-autotune spike on the first
 segment of *every* turn; and per-segment frame counts use ceiling (not floor) sizing so a frame
 rate that does not divide the audio rate cannot systematically shorten the video against the

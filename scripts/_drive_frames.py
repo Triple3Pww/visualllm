@@ -19,6 +19,17 @@ Findings this produced (2026-07-01, prod config fps=12, SIZE=256; docs/PROBLEMS-
   - With MUSETALK_TRT=1 the render holds ~12fps under the SAME contention -> drift stays flat
     at +0.36s (held frames 50->4). That is the shared-GPU long-turn drift fix.
 
+STALE (re-measured 2026-07-17 at the live SIZE=512/SPLIT=1/fps=12): the contention line above no
+longer reproduces. The hog CANNOT starve the render any more (WDDM caps the steal at ~50%, and
+N=8192 == N=4096), so at fps=12 even PyTorch lands ~643ms/seg -- inside the 667ms budget -- and
+drift stays flat at +0.357s with TRT=0, TRT=1, a 100% hog, or real CosyVoice generating. That is
+MARGIN, not a fix: P16's mechanism is intact and TRT is what buys the margin (2.05x vs 1.04x).
+To reproduce the drift, tighten the BUDGET rather than raise the load -- drive at fps=25:
+    python -m scripts._drive_frames output/reply_concise.wav 25
+  TRT=0 (455ms/seg vs the 320ms budget) -> +0.64s(2.9s)/+1.95s(5.7s)/+4.04s(13.6s), 101 held
+  TRT=1 (171ms/seg)                     -> +0.36s/+0.35s/+0.32s flat, 8 held
+The server honours the drive fps from the `config` message (P47.3), so this needs no restart.
+
 NOTE ON PACING: uses ABSOLUTE-deadline sleeps, not cumulative asyncio.sleep(0.02) -- on Windows
 the ~15ms timer granularity otherwise makes the feed ~40% slower than real-time and FAKES drift
 (cost an hour of wrong-root-cause before the profile caught it). Keep the absolute deadline.

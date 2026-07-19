@@ -53,6 +53,9 @@ was ever selected in `.env` — an untried fallback is not a safety net. Both ar
 
 ## VRAM reality (16 GB, shared)
 
-CosyVoice on vLLM (~4 GB) and MuseTalk (~5 GB) share the one card. **Load order matters: start CosyVoice
-BEFORE MuseTalk** — vLLM needs the card mostly free to claim its KV cache, or it dies with "No available
-memory for the cache blocks" (`docs/PROBLEMS-AND-FIXES.md` P15). `scripts/launch.ps1` already does this.
+CosyVoice on vLLM (~2 GB at the 0.07 util default) and MuseTalk (~3.3 GB since `MUSETALK_FREE_TORCH=1`)
+share the one card; all three services up leaves **~9.5 GB free**. **Load order is insurance, not a
+requirement** (re-measured 2026-07-17): vLLM loads fine SECOND onto a MuseTalk-occupied card — the old
+"No available memory for the cache blocks" crash does not reproduce at util 0.07 *or* 0.30, because vLLM
+budgets `total_card x util` without charging other processes against it (wall ~0.79).
+`scripts/launch.ps1` still starts CosyVoice first, which is free to keep. `docs/PROBLEMS-AND-FIXES.md` P15 §2.

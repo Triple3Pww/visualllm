@@ -59,8 +59,9 @@ own GPU/Python setup, and isolating them stops one crash from taking down the ot
 **MuseTalk (Windows) and CosyVoice's vLLM (WSL) share ONE 16 GB card.** This single fact drives most
 of the system's hard decisions:
 
-- **Load order matters:** start CosyVoice (vLLM) **before** MuseTalk — vLLM needs the card mostly
-  free at load; bringing it up while MuseTalk already holds VRAM fails. (P15)
+- **Load order used to matter:** start CosyVoice (vLLM) **before** MuseTalk. Re-measured 2026-07-17 —
+  bringing it up second **no longer fails** (vLLM budgets a fixed fraction of the card and ignores other
+  processes); the order is kept as free insurance, not a requirement. (P15)
 - **Turn-start contention:** at turn start CosyVoice's opening vocoder burst and MuseTalk's first
   render segment collide on the GPU — historically the root of "the mouth moves before the voice" and
   long-turn lip drift. (P16, P20)
@@ -363,10 +364,13 @@ silence (the avatar kept moving through it). Fix: reinstate RAS as a vLLM logits
 
 ### F. Avatar render — TensorRT (P16) ✅ merged to `main`
 Long-turn lip drift was **shared-GPU contention**, not frame math. Fix: **TensorRT** UNet+VAE render
-(`MUSETALK_TRT=1`, default): per-segment 389 → ~255 ms, holding ~12 fps under contention. **Under the
-same 100 % contention that drifted PyTorch +3.94 s on a 13.6 s reply, TRT holds drift flat at +0.36 s
-at every length.** Engines are GPU/driver-specific (~1.75 GB, gitignored); any load failure falls back
-to PyTorch.
+(`MUSETALK_TRT=1`, default): per-segment **455 → 171 ms** at the live 512 px config, lifting headroom
+against the 667 ms budget **1.5× → 3.9×** — and **1.04× → 2.05×** under contention. **What it buys is
+margin, not a visible drift fix** (re-measured 2026-07-17): at the live 12 fps the PyTorch path *also*
+fits, by 4 %, so both measure the same flat +0.36 s. Tighten the budget to 25 fps and PyTorch collapses
+to **+4.04 s** on a 13.6 s reply vs TRT's **+0.32 s** — the ablation only separates them off the
+deployed operating point. Engines are GPU/driver-specific (~1.75 GB, gitignored); any load failure falls
+back to PyTorch.
 
 ### G. Avatar render — GPU composite (P17) ✅ opt-in
 `MUSETALK_GPU_COMPOSITE=1` moves the per-frame mask-blend + downscale onto the GPU (the VAE output is
@@ -384,10 +388,10 @@ Real-time-paced feeding starves the renderer at turn start. `MUSETALK_FEED_BURST
 **first 1 s** of each turn's audio un-paced (then resumes pacing). Cut lip-start lag **~1.9 s →
 ~0.8 s**.
 
-### J. Frame math — ceil-sized segments (P9/P10) ✅
+### J. Frame math — ceil-sized segments (P9) ✅
 `samples_for_frames(n) = ceil(n·16000/fps)` sizes each render segment to the frame's upper sample
 boundary, so the renderer yields exactly `SEG_FRAMES` per batch for **any** fps. Fixes "lips finish
-~1–2 s before the voice," plus a companion `ceil` on the audio-cap that removes the end-of-turn blip.
+~1–2 s before the voice."
 
 ### K. Removing a cloud hop entirely — local sherpa STT (P29) ✅ opt-in
 `STT_PROVIDER=sherpa` runs STT fully offline on the CPU (~0 VRAM), removing the Deepgram round-trip.
@@ -416,7 +420,7 @@ the wins.** Every one was measured, not guessed.
 | **Flow-matching TensorRT** (P28) | ❌ rejected | Builds/runs but **zero TTFB win + 26–40 % slower** — the flow isn't the first-chunk bottleneck; TRT's per-chunk hard-syncs swamp the fusion. |
 | **GPU stream priority** (`MUSETALK_HP_STREAM`, P25) | ❌ rejected | Catastrophic live (TTFO ~12 s) — cross-process CUDA priority needs Linux MPS; Windows **WDDM thrashes** across the WSL/Windows boundary. |
 | **CosyVoice turn-start throttle** (`COSYVOICE_PACE_RATE`, P25) | ❌ rejected | Useless — the TRT render is **not** GPU-starved at turn start; both P20 levers chased a non-bottleneck. |
-| **`MUSETALK_SYNC_MODE=live`** (P7) | ❌ rejected by user | Voice leads the lips ~1–2 s — worse than steady's occasional pause. |
+| **`MUSETALK_SYNC_MODE=live`** | ❌ rejected by user | Voice leads the lips ~1–2 s — worse than steady's occasional pause. |
 | **zh leading-breath trim** (P34) | ❌ reverted | Offline-clean but **crashed live** (`np.frombuffer` on aiohttp's odd chunks). Any re-attempt must trim **server-side in CosyVoice**, not the byte-stream client. |
 | **Local CPU-pinned Ollama LLM** | ❌ reverted to cloud | CPU contention with the memory harness made end-to-end latency **worse** + fragmented zh. |
 

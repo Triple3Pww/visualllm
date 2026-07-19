@@ -70,14 +70,17 @@ poll. The `COMPLETE -> t0` gap is the **P54 fix** live (was a flat ~1.0s; now = 
 
 ## What to attack next (ranked by measured cost)
 
-1. **TTS first chunk — 0.93s. THE only row left with real headroom** — full plan +
-   measurement discipline + do-not-re-open list: **`docs/TTS-FIRST-CHUNK-HANDOFF.md`**.
-   CosyVoice's first-chunk TTFB scales with the INPUT sentence length (it prefills the whole sentence before
-   the first audio token). Cheapest lead: **confirm `COSYVOICE_FIRST_PIECE` actually fires on English turns**
-   (the zh path needed its own `_ZH` splitter because the en splitter keys on ASCII comma/space — verify the
-   en path is live and 18/32 is still the sweet spot). Strongest lead: **vLLM-Omni via the REGISTERED-VOICE
-   cache** (`SpeakerEmbeddingCache`, PR #2630) — the 2026-07-15 spike's "not a win" verdict only held for its
-   inline-ref path, and ~**0.83s FLAT** may be reachable today.
+1. **TTS first chunk — 0.93s, but ~70% is a FIXED FLOOR (P56, 2026-07-16). Reframed: NOT "real headroom".**
+   Measured isolated on the live server: TTFB = **0.648s + 25.9 ms/char** (zh) — ~0.65s is fixed startup paid
+   on ANY input, even 1 char; only ~0.28s is length-dependent and the live first piece is already ~10 chars,
+   so the realistic remaining win for the whole §3 lever family is **~0.13s**. **§3.1 is ANSWERED: the English
+   split fires** (6/7 openers at the live 18/32; the 7th is a complete short sentence). Mechanism CORRECTED:
+   TTFB tracks the first *segment*, not the sentence — CosyVoice's frontend MERGES short text up to an 80-token
+   cap (`frontend.py` `token_min_n=60/max=80`), and `COSYVOICE_FIRST_PIECE` wins by DENYING that merge, not by
+   shortening a prefill. vLLM-Omni is CLOSED (handoff §3.2, retested). Full plan + do-not-re-open list:
+   **`docs/TTS-FIRST-CHUNK-HANDOFF.md`**; floor + residue + mechanism: `docs/PROBLEMS-AND-FIXES.md` **P56**.
+   **Higher-value lead surfaced by P56: barge-in leaks TTS residue onto the shared GPU** (an abandoned stream
+   keeps synthesizing the whole ~50s reply — +1.0s on the next request; fits the ~1-in-7 +1.7s spike below).
 2. **LLM first token — 0.69s.** Already Groq-pinned (`OPENROUTER_PROVIDER_ONLY=Groq`, P21) which killed the
    7-8s tail. Remaining ~0.7s is mostly the cloud hop; a local Ollama would trade it for GPU contention on
    an already-shared card. Low ceiling.

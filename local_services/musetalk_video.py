@@ -180,9 +180,11 @@ class MuseTalkVideoService(FrameProcessor):
         # MuseTalk can't ease the mouth shut itself (silence renders a PARTED mouth, not closed
         # lips -- measured), so at end of turn we cross-dissolve the last spoken frame -> the rest
         # pose over K frames. Those frames are pushed FREE-RUN (untagged, like the idle loop) by
-        # _play_close_fade, NOT paired with silence through _emit_pair -- the audio-cap in _advance
-        # would strand them whenever the render fell behind the voice. Gated by
-        # MUSETALK_CLOSE_FADE_FRAMES (0 = off, the old clean snap). Use with
+        # _play_close_fade, never through _emit_pair: a client-synthesized blend has no audio_pos
+        # to pair to, and the turn's voice is drained by then, so a tagged frame would have no
+        # audio left to clock it out of the non-live transport (P12). Gated by
+        # MUSETALK_CLOSE_FADE_FRAMES (0 = off, the old clean snap -- measured: removing the fade
+        # puts 77% of the close in ONE frame vs 16% with it). Use with
         # MUSETALK_END_TAIL_FRAMES=0 so the last buffered frame is the last SPOKEN frame, not a
         # neutral tail copy.
         self._close_fade = int(os.getenv("MUSETALK_CLOSE_FADE_FRAMES", "0") or "0")
@@ -274,9 +276,13 @@ class MuseTalkVideoService(FrameProcessor):
     async def _open_ws(self):
         logger.info(f"Connecting to MuseTalk server at {self._ws_url} "
                     f"(sync={'on:'+self._mode if self._sync else 'off'})")
+        _t0 = asyncio.get_running_loop().time()
         self._ws = await websockets.connect(
             self._ws_url, max_size=None, ping_interval=None, close_timeout=1
         )
+        # This connect blocks StartFrame propagation (the service opens the ws in start()), so
+        # if it is slow the whole pipeline-ready is gated on it -- time it to see the true cost.
+        logger.info(f"MuseTalk ws connected in {(asyncio.get_running_loop().time()-_t0)*1000:.0f}ms")
         # Request proto 2 (self-describing frames). _proto2 flips on the server's ack
         # marker only, and resets here per connection. Synced mode REQUIRES proto 2 now
         # (the index/fps pairing was deleted, P51): an older server that never acks trips
@@ -508,9 +514,9 @@ class MuseTalkVideoService(FrameProcessor):
                 self._write_deliv_dump()
             self._video_active = False
             if self._close_fade > 0 and close_start is not None and self._rest_frame is not None:
-                # Ease the mouth shut: FREE-RUN the crossfade (untagged, like the idle loop) so it
-                # is NOT gated by the audio-cap in _advance -- that cap strands trailing frames when
-                # the render ran behind (video > audio). Suppress server idle frames during the
+                # Ease the mouth shut: FREE-RUN the crossfade (untagged, like the idle loop) --
+                # _drain_audio just released the turn's last voice, so a tagged frame would have
+                # nothing left to clock it out. Suppress server idle frames during the
                 # playout so they can't preempt it; the fade lands on the rest pose, so the neutral
                 # the server then holds is seamless. ("Live during the close" within steady.)
                 self._suppress_until = (asyncio.get_running_loop().time()
@@ -519,11 +525,13 @@ class MuseTalkVideoService(FrameProcessor):
 
     async def _advance(self):
         """Release received frames, each paired (in order) with the audio due by its audio_pos
-        and tagged sync_with_audio so the transport pins it. No audio-cap is needed (the old
-        P10 ceil-cap guarded the index/fps pairing): a real frame's audio_pos can never exceed
+        and tagged sync_with_audio so the transport pins it. No audio-cap is needed (a cap only
+        ever guarded the retired index/fps pairing): a real frame's audio_pos can never exceed
         voice the client already buffered -- _abuf.append happens in the same process_frame call
         that queues the server feed, and the server renders only from audio it was fed -- so a
-        pos-paired release can't run ahead of the voice by construction (P51)."""
+        pos-paired release can't run ahead of the voice by construction (P51). Do NOT add one
+        back: a floor()'d cap strands the turn's final audio sub-frame to the delayed video_end
+        drain, which played it back ~1-2s late as a blip."""
         async with self._lock:
             while self._released_idx < len(self._vbuf):
                 await self._emit_pair(self._released_idx)
@@ -575,8 +583,9 @@ class MuseTalkVideoService(FrameProcessor):
     async def _play_close_fade(self, last_bytes: bytes, rest_bytes: bytes):
         """Free-run a pixel cross-dissolve (last spoken frame -> rest pose) at fps so the mouth
         eases shut at end of turn. Untagged frames (like the idle loop) so the non-live transport
-        draws them on its own clock -- NOT audio-paired, so the _advance audio-cap can't strand
-        them when the render fell behind (video > audio). We blend PIXELS because MuseTalk renders
+        draws them on its own clock. They CANNOT be audio-paired: a synthesized blend carries no
+        audio_pos for _emit_pair, and the voice is drained, so a tagged frame would never be
+        clocked out (P12's three failed delivery attempts). We blend PIXELS because MuseTalk renders
         silence as a PARTED mouth, not closed (measured), so feeding it can't close the mouth. The
         final blended frame == the rest pose, so the neutral the server holds afterwards is seamless.
         Best-effort: any failure just leaves the prior clean snap."""

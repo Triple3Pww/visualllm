@@ -625,20 +625,37 @@
     // video always decodes.) _split stays null when off -> the plain <video> shows the full frame.
     let _split = null;      // {bbox, bgW, bgH} once loaded, else null (full-frame fallback)
 
-    async function loadOverlay() {
-      try {
-        const r = await fetch('/client/avatar-overlay', { cache: 'no-store' });
-        if (!r.ok) return false;
-        const d = await r.json();
-        if (!d || !d.split) return false;
-        await new Promise((res, rej) => {
-          avatarBg.onload = res; avatarBg.onerror = rej;
-          avatarBg.src = 'data:image/png;base64,' + d.bg_png;
-        });
-        _split = { bbox: d.bbox, bgW: d.bg_size[0], bgH: d.bg_size[1] };
-        return true;
-      } catch (e) { console.warn('overlay load failed', e); return false; }
+    // Fetch the split-overlay data ONCE and cache the promise. The background is a static ~600KB
+    // base64 PNG; on a slow tunnel (measured ~70KB/s over a DERP-relayed tailnet) re-downloading it
+    // on every connect took ~8s AND, running alongside the offer POST, saturated the link so the
+    // POST itself stalled ~7s -- the whole remaining "connect takes 10s". So: fetch it exactly once,
+    // PREFETCHED at page load (idle time before Connect), and reuse the in-memory copy forever after.
+    // The connect path never touches the network for it again.
+    let _overlayFetch = null;
+    function fetchOverlayData() {
+      if (!_overlayFetch) {
+        _overlayFetch = (async () => {
+          try {
+            const r = await fetch('/client/avatar-overlay', { cache: 'force-cache' });
+            if (!r.ok) return false;
+            const d = await r.json();
+            return (d && d.split) ? d : false;
+          } catch (e) { console.warn('overlay fetch failed', e); return false; }
+        })();
+      }
+      return _overlayFetch;
     }
+    async function loadOverlay() {
+      const d = await fetchOverlayData();          // network only on the first (prefetch) call
+      if (!d) return false;
+      await new Promise((res, rej) => {
+        avatarBg.onload = res; avatarBg.onerror = rej;
+        avatarBg.src = 'data:image/png;base64,' + d.bg_png;
+      });
+      _split = { bbox: d.bbox, bgW: d.bg_size[0], bgH: d.bg_size[1] };
+      return true;
+    }
+    fetchOverlayData();     // prefetch at page load so Connect never waits on the ~600KB download
 
     function layoutSplitVideo() {
       // Position the mouth-crop <video> over the bbox, matching the background <img>'s
@@ -832,16 +849,49 @@
     function stopPolling()  { if (pollTimer) { clearInterval(pollTimer); pollTimer = 0; } }
 
     function iceComplete(pc) {
+      // Resolves FALSE when gathering finished naturally, TRUE when it hit the 3.5s cap -- the
+      // slow remote case (TURN relay gather stalling) worth seeing in [connect-timing].
       return new Promise((res) => {
-        if (pc.iceGatheringState === 'complete') return res();
+        if (pc.iceGatheringState === 'complete') return res(false);
         const chk = () => {
           if (pc.iceGatheringState === 'complete') {
-            pc.removeEventListener('icegatheringstatechange', chk); res();
+            pc.removeEventListener('icegatheringstatechange', chk); res(false);
           }
         };
         pc.addEventListener('icegatheringstatechange', chk);
-        setTimeout(res, 3500);
+        setTimeout(() => res(true), 3500);
       });
+    }
+
+    // Post the WebRTC connect breakdown to the server so it lands in pipeline.log as one
+    // [connect-timing] line -- visible from a phone/remote browser with no devtools. The winning
+    // candidate PAIR type is the headline: host/* = direct local, srflx/srflx = direct via STUN,
+    // relay/* or */relay = a TURN relay won (the slow, extra-hop path).
+    async function postConnectTiming(ct, pc) {
+      let pair = '?', rttMs = 0;
+      try {
+        const s = await pc.getStats(), cand = {};
+        s.forEach(r => { if (r.type === 'local-candidate' || r.type === 'remote-candidate') cand[r.id] = r; });
+        s.forEach(r => {
+          if (r.type === 'candidate-pair' && r.nominated && r.state === 'succeeded') {
+            const L = cand[r.localCandidateId], R = cand[r.remoteCandidateId];
+            pair = ((L && L.candidateType) || '?') + '/' + ((R && R.candidateType) || '?');
+            if (r.currentRoundTripTime != null) rttMs = Math.round(r.currentRoundTripTime * 1000);
+          }
+        });
+      } catch (_) {}
+      try {
+        fetch('/client/connect-timing', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            cfgMs: Math.round(ct.cfgMs || 0), overlayMs: Math.round(ct.overlayMs || 0),
+            micMs: Math.round(ct.micMs || 0),
+            gatherMs: Math.round(ct.gatherMs || 0), gatherCapped: !!ct.gatherCapped,
+            offerMs: Math.round(ct.offerMs || 0), connectMs: Math.round(ct.connectMs || 0),
+            pair, rttMs, ua: navigator.userAgent.slice(0, 90),
+          }),
+        });
+      } catch (_) {}
     }
 
     // PHONE LOUDSPEAKER. When a WebRTC page holds a live mic, Android Chrome flips the phone into
@@ -959,6 +1009,7 @@
     async function connect() {
       if (connecting || connected) return;
       connecting = true;
+      const _ct = { t0: performance.now() };   // WebRTC connect stopwatch (see postConnectTiming)
       transcriptSeq = 0;
       removeLiveBubble();
       setMuted(false);
@@ -971,6 +1022,7 @@
         // the prebuilt /client page only -- which MUSETALK_SPLIT=1 makes unsupported -- so they
         // never ran here. Fetched now so CLIENT_JITTER_BUFFER_MS / CLIENT_FORCE_SPEAKER are real.
         let iceCfg = {}, jitterMs = 0, forceSpeaker = true;
+        const _cfg0 = performance.now();
         try {
           const r = await fetch('/client/ice-config');
           if (r.ok) {
@@ -982,7 +1034,11 @@
             if (MEASURE) syncClock();                            // min-RTT clock offset (remote only)
           }
         } catch (_) {}
-        await loadOverlay();   // sets _split if MUSETALK_SPLIT is on; else full-frame <video> fallback
+        _ct.cfgMs = performance.now() - _cfg0;
+        // The overlay (~600KB) is prefetched at page load and APPLIED in ontrack when video arrives
+        // -- entirely off the connect path, so the offer POST never waits on it OR competes with its
+        // download for the slow link's bandwidth. _ct.overlayMs stays 0 here on purpose.
+        _ct.overlayMs = 0;
         pc = new RTCPeerConnection(iceCfg);
         pc.ontrack = (e) => {
           const stream = e.streams[0] || new MediaStream([e.track]);
@@ -996,7 +1052,7 @@
           }
           if (e.track.kind === 'video') {
             avatar.srcObject = stream; avatar.play().catch(()=>{});
-            if (_split) startCompositor();
+            loadOverlay().then(ok => { if (ok) startCompositor(); });   // uses the prefetched data
           } else if (e.track.kind === 'audio') {
             botAudio.srcObject = stream; botAudio.play().catch(()=>{});
             if (forceSpeaker) routeToLoudspeaker(botAudio);
@@ -1008,6 +1064,7 @@
           if (s === 'connected') {
             if (disconnectTimer) { clearTimeout(disconnectTimer); disconnectTimer = null; }
             connected = true; connecting = false;
+            if (!_ct.posted) { _ct.posted = true; _ct.connectMs = performance.now() - _ct.t0; postConnectTiming(_ct, pc); }
             micBtn.classList.remove('connecting'); micBtn.classList.add('active');
             setState('live', idleLabel());
             setOverlay('live');
@@ -1031,6 +1088,7 @@
         };
 
         noMic = false;
+        const _mic0 = performance.now();
         try {
           micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
         } catch (err) {
@@ -1040,18 +1098,23 @@
           micStream = null; noMic = true;
           addSystem('No microphone found — connecting anyway; use the chat box to talk (voice input off)');
         }
+        _ct.micMs = performance.now() - _mic0;
         if (micStream) micStream.getTracks().forEach(t => pc.addTrack(t, micStream));
         else pc.addTransceiver('audio', { direction: 'recvonly' });  // still RECEIVE the bot's voice
         pc.addTransceiver('video', { direction: 'recvonly' });
 
         await pc.setLocalDescription(await pc.createOffer());
-        await iceComplete(pc);
+        const _g0 = performance.now();
+        _ct.gatherCapped = await iceComplete(pc);        // true = hit the 3.5s cap
+        _ct.gatherMs = performance.now() - _g0;
+        const _o0 = performance.now();
         const resp = await fetch('/api/offer', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type })
         });
         if (!resp.ok) throw new Error('offer HTTP ' + resp.status);
         await pc.setRemoteDescription(await resp.json());
+        _ct.offerMs = performance.now() - _o0;           // offer POST round-trip (over the tunnel)
       } catch (e) {
         console.error('[leo] connect failed', e);
         addSystem('Could not connect: ' + (e && e.message || e));

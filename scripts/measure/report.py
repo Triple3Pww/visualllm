@@ -35,11 +35,15 @@ def build_events(turn):
     ev.append(dict(stage="capture", t=us, end=0, kind="span", label="User speaking",
                    why="Browser mic -> WebRTC -> Silero VAD listens for the end of the utterance.",
                    src="log user-turn-started"))
-    ev.append(dict(stage="stt", t=us, end=0, kind="span", label="Deepgram/Sherpa streaming (receives mic)",
-                   why="STT's input is the live mic the whole time the user talks; partials refine into one final transcript.",
+    ev.append(dict(stage="stt", t=us, end=0, kind="span", label="STT receives mic (Deepgram/Sherpa/SenseVoice)",
+                   why="STT's input is the live mic the whole time the user talks. Deepgram/Sherpa stream partials; "
+                       "SenseVoice self-segments (a zipformer endpoint detector) and transcribes the whole buffered "
+                       "utterance at end-of-speech -- so its transcript is already in hand when the endpoint fires.",
                    src="log STT stream"))
     ev.append(dict(stage="capture", t=0, kind="turn", label="User STOPPED speaking - t0",
-                   why="VAD + turn-analyzer agree the turn ended. This instant starts the <3s TTFO stopwatch.",
+                   why="The STT endpoint (self-seg) or Silero VAD, plus the turn-analyzer, agree the turn ended. "
+                       "This instant starts the <3s TTFO stopwatch. For SenseVoice the pre-t0 cost is dominated by "
+                       "SENSEVOICE_ENDPOINT_SILENCE (trailing-silence before the endpoint fires).",
                    src="log user-turn-stopped"))
     ev.append(dict(stage="stt", t=0, kind="emit", label="STT emits final transcript",
                    why=(f"\"{turn['question']}\" " if turn.get("question") else "") + "pushed into the LLM context aggregator.",

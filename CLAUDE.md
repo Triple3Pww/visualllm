@@ -20,15 +20,16 @@ A/V-sync architecture decision (read it before touching sync).**
 | Stage | Service | Where |
 |-------|---------|-------|
 | VAD | Silero (local) | pipeline |
-| STT | Deepgram nova-2 (`en-US`/`zh-TW`/`th` by `LANGUAGE`) default; **local OFFLINE alt `STT_PROVIDER=sherpa`** (sherpa-onnx streaming zipformer, bilingual zh-en, in-process CPU/~0 VRAM, zh→Traditional via OpenCC) | cloud / **local CPU** |
+| STT | Deepgram nova-2 (`en-US`/`zh-TW`/`th` by `LANGUAGE`) default; **local OFFLINE alt `STT_PROVIDER=sensevoice`** (RECOMMENDED local: SenseVoice-Small int8, FunAudioLLM/Alibaba — CosyVoice's ASR sibling; self-segments via a streaming-zipformer endpoint detector, transcribes the whole utterance per segment; **far more accurate + noise-robust than the old zipformer** — A/B 2026-07-18: held at 5dB SNR where the zipformer garbled 台北→还被; adds punctuation; CPU/~0 VRAM, RTF ~0.016; zh→Traditional via OpenCC) or **`STT_PROVIDER=sherpa`** (the older streaming zipformer, bilingual zh-en, in-process CPU) | cloud / **local CPU** |
 | LLM | `LLM_PROVIDER=openrouter` — OpenAI-compatible, so **cloud OR local Ollama** by `OPENROUTER_BASE_URL` (any model via `OPENROUTER_MODEL`); or `weather_chain` (Chinese weather bot) | cloud / local / remote |
 | TTS | **CosyVoice** local streaming on vLLM in WSL — **now IN THIS REPO at `tts/cosyvoice-server/`** (2026-07-14; it used to be a separate repo). `COSYVOICE_MODEL=v2` (CosyVoice2-0.5B, **what `.env` actually runs**) or `v3` (Fun-CosyVoice3-0.5B, +flow-TRT). CUDA graphs are **ON for all languages incl. zh** (2026-07-14, reverses P33 — see below). Thai only: `TTS_PROVIDER=jaitts` (`:8004`) | **`:8001`, WSL** |
 | Avatar | **MuseTalk** local mouth-region talking-head (**switchable preset**: `nimbus` female / `leo` his face+voice — `AVATAR_PRESET`), **TensorRT render by default** (`MUSETALK_TRT=1`) | **`:8002`, `musetalk` conda env** |
 | Config | **Web config panel** — edit `.env` + restart the pipeline from a browser | **`:7870` (`:8444` over Tailscale)** |
 
 **TTS note:** CosyVoice runs its autoregressive LLM on **vLLM inside WSL Ubuntu**
-(`cosyvllm` conda env on the Blackwell 5060 Ti) — this cut first-chunk latency ~3.4s→~1.1s, the root
-cause of the avatar lip-lag. The pipeline reaches it via `COSYVOICE_URL` set to the **WSL IP**, NOT
+(`cosyvllm` conda env on the Blackwell 5060 Ti) — this cut TTS first-chunk **TTFB ~3.4s→~1.1s**, a
+TTFB/TTFO win (under the current `steady` mode the sync mode owns lip-lag, so read P6 as a TTFB
+fix). The pipeline reaches it via `COSYVOICE_URL` set to the **WSL IP**, NOT
 `localhost` (WSL2's localhost relay buffers the streaming audio ~2s). That IP changes on
 `wsl --shutdown`, so **`launch.ps1` auto-heals a stale `.env` value against the live `wsl hostname -I`
 on every start** (`Sync-CosyVoiceUrl`, 2026-07-15); only manual non-launcher starts still need a
@@ -88,14 +89,23 @@ verified clean (24s zh paragraph, /tts + /tts/stream, gen speed unchanged; whole
 The old "~4GB footprint / 0.3 default" text described the UNCAPPED max_len era. If the avatar shows but
 the bot is silent, first check `:8001` is actually up — the pipeline log shows "Cannot connect to host
 …:8001". The "Available KV cache memory" log line must be positive.
-**LOAD ORDER STILL MATTERS: start CosyVoice (vLLM) BEFORE MuseTalk** (the low util makes vLLM far
-friendlier to a busy card, but keep the order). Clean recovery = stop all three → start cosyvoice
-(`run_vllm_server.sh`) → then `scripts/run.ps1` (MuseTalk + pipeline). The launcher already does this
-order. (`docs/PROBLEMS-AND-FIXES.md` P15.)
+**LOAD ORDER IS NO LONGER REQUIRED — it is insurance, not a rule (re-measured 2026-07-17, P15).** vLLM
+starts fine SECOND onto a MuseTalk-occupied card: verified at the live `util=0.07` **and** at `0.30` (the
+config that originally crashed) — the crash does not reproduce. On vLLM 0.23.0 the budget is
+`total_card × util` and **other processes are not charged against it**; the only gate is
+`total × util ≤ free_at_startup`, so the wall sits at **util ≈ 0.79** (`0.9` does fail — that is the
+positive control) and `0.07` clears it by ~11x. Healthy VRAM with all three up is **~9.5GB free**, not the
+"300–400MB" the old text claimed. Keep the ordered restart anyway (stop all three → cosyvoice
+`run_vllm_server.sh` → `scripts/run.ps1`; the launcher already does it) — it costs nothing — but **do not
+diagnose a silent bot as a load-order problem**: check `:8001` is up and "Available KV cache memory" is
+positive. Order becomes genuinely required again only above `COSYVOICE_VLLM_GPU_UTIL` ~0.75.
+(`docs/PROBLEMS-AND-FIXES.md` P15.)
 
-**Chinese first-chunk is slower than English, and each language has its own TTFO lever (updated
-2026-07-04 — the 2026-07-03 hop_zh=5 verdict is REVERSED, see P22).** CosyVoice's first-chunk TTFB
-scales with the INPUT sentence length (it prefills the whole sentence before the first audio token). The levers:
+**Each language has its own TTFO lever, because the SPLITTERS differ — not because zh is slower (updated
+2026-07-04 — the 2026-07-03 hop_zh=5 verdict is REVERSED, see P22; the "zh first-chunk is slower" claim is
+REFUTED by measurement 2026-07-17, P15 §1: at matched input zh ≈ en and the slowest cases are English).**
+CosyVoice's first-chunk TTFB scales with the INPUT sentence length (it prefills the whole sentence before
+the first audio token) — **length, not language** (P56: `0.648s + 25.9ms/char`). The levers:
 - **`COSYVOICE_FIRST_HOP_ZH=0` (baseline since 2026-07-04, default `:-0` in the cosyvoice repo's
   `run_vllm_server.sh`).** hop=5 (a smaller opening TTS chunk) was the 2026-07-03 zh lever, but a live A/B
   proved it HURTS live zh TTFO: the small chunk fills the `MUSETALK_LEAD_FRAMES=14` synced-start cushion
@@ -185,6 +195,28 @@ Fixed by `kwargs.setdefault("ttfs_p99_latency", 0.1)` in `sherpa_stt.py` (non-ze
 path): `COMPLETE→t0` **1.0s → 0.09s**; content unaffected (the wait is entirely POST-transcript, so it delays only WHEN
 the turn fires, never WHAT it contains). If you swap STT, declare its REAL measured value — the default is a guess about
 someone else's service, billed to you every turn. `docs/PROBLEMS-AND-FIXES.md` P54 · matrix: `docs/LATENCY-MATRIX.md`.
+(`sensevoice_stt.py` sets the same `ttfs_p99_latency=0.1` for the same reason.)
+
+**Local STT = `STT_PROVIDER=sensevoice` (2026-07-18, the recommended local path; replaces the poor 2023 zipformer).**
+The old `sherpa` streaming-zipformer model (`...zipformer-bilingual-zh-en-2023-02-20`) was dated and error-prone on
+real speech; **SenseVoice-Small int8** (same FunAudioLLM/Alibaba lab as CosyVoice) is a large accuracy + noise-robustness
+jump (A/B `scratchpad` 2026-07-18: identical on clean audio, but held the opener at 5dB SNR where the zipformer garbled
+台北→还被; adds ？。 punctuation; ~2× faster, RTF ~0.016). CPU / **0 GPU** (the pip `sherpa_onnx` wheel is CPU-only, so
+`SENSEVOICE_PROVIDER=cuda` silently falls back to CPU — and that's *correct* for the 8GB deploy target: STT is only
+18–43ms live, so a GPU offload buys nothing and the only Blackwell-viable GPU route, a WSL server, would add a bigger
+network hop than the whole transcription). **Design (matters — it cost a session):** SenseVoice is an OFFLINE model, but
+this pipeline's transport never pushes VAD user-start/stop frames to the STT (turn-taking runs through Smart Turn
+downstream), so a plain `SegmentedSTTService` gets audio but no "user stopped" cue and NEVER fires. So `sensevoice_stt.py`
+is **self-segmenting** like `sherpa_stt.py`: a lightweight streaming zipformer runs ONLY as the endpoint detector (drives
+`VADUserStarted/Stopped` + is robust to a quiet mic on this box) and SenseVoice transcribes each buffered segment. It
+emits **clean, non-overlapping segments** and lets the LLM aggregator concatenate them within a turn — it does NOT stitch
+text itself (a `_pending_prefix` "coalesce" merge was tried and REMOVED 2026-07-18: it duplicated whenever the aggregator
+ALSO stacked the finals — `什麼是？...什麼是？...`; the measure system caught it). Knobs: `SENSEVOICE_ENDPOINT_SILENCE`
+(**0.5**, trailing-silence before a segment fires; higher = fewer mid-sentence splits but less snappy, SenseVoice garbles
+tiny fragments), `SENSEVOICE_PROVIDER` (`cuda`→CPU-fallback), `SENSEVOICE_TRADITIONAL` (**1**, zh→zh-TW via OpenCC).
+Model at `models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17`. The mic-to-ear measure harness
+(`scripts/measure`) was updated for it (Capture-row lever now names `SENSEVOICE_ENDPOINT_SILENCE`; STT labels name
+SenseVoice's self-segmenting behavior).
 
 **Removed 2026-07-14 (dead-code audit): the `moss` / `elevenlabs` / `deepgram` TTS branches and the
 `funasr` STT branch.** None had ever been selected -- the stack has always been Deepgram STT ->
@@ -215,15 +247,20 @@ tradeoff: under a long render stall the voice briefly **pauses** then resumes cl
 of 16000 (8/10/16/20/25) makes frame count = audio length exactly, but the server's `samples_for_frames`
 ceil sizing makes a non-divisor like 14 correct anyway; the old `int(16000/fps)` truncation lost ~1 frame/segment → lips
 finished ~1–2s early, `docs/PROBLEMS-AND-FIXES.md` P9. NOTE: the end-of-turn leftover-audio blip
-(P10) is **FIXED** — `int()`→`math.ceil` on the `audio_cap` in `musetalk_video.py::_advance` so the
-final audio sub-frame releases in step instead of waiting for the delayed `video_end` drain),
+is **FIXED at the root by P51** — the `audio_cap` ceil patch it used to need is GONE (deleted
+2026-07-15 with the proto-1 pairing layer); proto 2 pairs audio to each frame's own `audio_pos`, so
+there is no cursor cap to floor and no sub-frame to strand. Do NOT re-add `audio_cap`),
 `MUSETALK_FEED_BURST_S` (1.0 — bursts the first 1s of a turn's audio un-paced so the renderer
 isn't starved at turn start; cut lip-start lag ~1.9s→~0.8s), `MUSETALK_END_TAIL_FRAMES` (**0** now —
 the client close-crossfade replaces the neutral tail; `>0` = static neutral frames after speech, the
 old clean snap), `MUSETALK_CLOSE_FADE_FRAMES` (**5** — eases the mouth shut at end of turn: the client
 cross-dissolves the last spoken frame→rest pose over N frames, delivered **free-run/untagged** ("live
-during the close") so it survives steady's non-live transport without the audio-cap stranding it; `0`
-= clean snap; needs `END_TAIL=0`; `docs/PROBLEMS-AND-FIXES.md` P12), `MUSETALK_IDLE_MOTION` (**0** = no breathing idle; the face
+during the close") because a client-synthesized blend has no `audio_pos` to pair to and the voice is
+already drained — a tagged frame would never be clocked out of steady's non-live transport; `0`
+= clean snap. **Re-verified on the delivery path 2026-07-17 — LOAD-BEARING, do not remove:** `0` puts
+**77%** of the close in ONE frame (snap-index 0.77) vs **0.16** at `5`, and a 30-frame probe ramps for a
+full 2.5 s, so the free-run frames really do reach the wire. Needs `END_TAIL=0`;
+`docs/PROBLEMS-AND-FIXES.md` P12), `MUSETALK_IDLE_MOTION` (**0** = no breathing idle; the face
 holds the static neutral portrait between turns — the user's pick. `1` = the synthesized breathing
 loop. Server reads it from the OS env, so `run.ps1` propagates it), `MUSETALK_SIZE` (**512** now — the delivered
 frame px, couples server+client+`video_out`. Bumped from 256 for a crisper studio/hair (the model still generates
@@ -249,9 +286,15 @@ offline (seamless composite, sharper bg A/B) + live in a real browser (WebRTC tr
 bg, no seam). `MUSETALK_SPLIT_SIZE` (**256** — the square px of the streamed crop; MUST match server + pipeline,
 un-stretched into the bbox rect client-side). `docs/superpowers/specs/2026-07-11-mouth-crop-overlay-design.md` +
 `docs/superpowers/plans/2026-07-11-mouth-crop-overlay.md`),
-`MUSETALK_TRT` (**1 = default, load-bearing for A/V sync**: TensorRT UNet+VAE render path,
-per-segment render ~389ms→~255ms so the avatar keeps ~12fps under CosyVoice's shared-GPU
-contention — where the PyTorch path drifts seconds behind the voice on long turns. Engines live in
+`MUSETALK_TRT` (**1 = default, load-bearing — but it buys MARGIN, not a visible drift fix; re-measured
+2026-07-17**: TensorRT UNet+VAE render path, per-segment render **455→171ms** at the live SIZE=512 config,
+lifting headroom against the 667ms@12fps budget 1.5×→3.9× clean and **1.04×→2.05× under contention**.
+**DO NOT "prove it dead" by flipping it to 0 at fps=12 and seeing no change** — that is exactly what
+happens (same flat +0.357s drift with TRT=0/1, under a 100% hog OR real CosyVoice), because PyTorch now
+also clears the 12fps budget, by 4%. Tighten the budget instead (`_drive_frames … 25`) and PyTorch
+collapses to **+4.04s** on a 13.6s reply vs TRT's **+0.32s** flat. Related trap: the old symptom "lips
+drift behind the voice" is `live`-mode language — under the `steady` baseline the same underflow is a
+**voice pause**, not drift (`musetalk_video.py:459`). Engines live in
 `musetalk_server/trt_cache/` (~1.75GB, gitignored, GPU/driver-specific — rebuild with `trt_build.py`);
 any load failure silently falls back to PyTorch. `0` = PyTorch. `docs/PROBLEMS-AND-FIXES.md` P16.
 **`MUSETALK_FREE_TORCH` (1 = default, 2026-07-15 VRAM trim):** once the engines load, the torch
@@ -314,7 +357,13 @@ The public **front door is a Cloudflare quick tunnel** (2026-07-11; `scripts/tun
 by `launch.ps1` step [4/5], prints a random `https://<random>.trycloudflare.com` URL) — it replaced
 Tailscale Funnel (which stopped working: a login-gated admin toggle, and `funnel reset` wipes serve).
 Like Funnel, the tunnel carries only the page + `/api/offer` signaling, NEVER the WebRTC media, so the
-media is enabled separately by `WEBRTC_PUBLIC` (**now `1` = baseline**; `0` = tailnet-only. `1` advertises
+media is enabled separately by `WEBRTC_PUBLIC` (**now `0` = baseline since 2026-07-18, P57** — was `1`; `0`
+= tailnet-only. **Why the flip:** `1` advertises STUN + Cloudflare TURN, and ICE then WAITS on those servers
+to gather relay candidates (~3.5s client cap + ~5s server-side aiortc answer gather) — pure dead weight for a
+tailnet/local/LAN peer, which connects direct `host/host` and was the bulk of the remote "~20s to connect".
+`0` removes both waits; flip to `1` (config panel) ONLY for a genuine public non-Tailscale internet link. Also
+the correct default for a Tailscale-free deploy like NCU, which additionally wants `WEBRTC_ICE_SUBNET=0` since
+the `100.64/10` pin assumes a Tailscale interface. `1` advertises
 STUN so an off-tailnet browser reaches the media. This box's NAT is port-preserving (cone), so STUN-only
 reaches many networks. When on, `_restrict_ice_to_subnet` keeps a SET = {Tailscale 100.64/10 for
 tailnet/same-LAN pairs + the internet-facing default-route `/32` for the public srflx}, dropping
@@ -385,7 +434,13 @@ python -m scripts.measure --compare -2 -1                          # diff the la
 #   PRE-t0 vs POST-t0: TTFO's stopwatch STARTS at t0 (user-stopped), so it can NEVER see the cost of
 #   DECIDING t0. Felt delay = pre-t0 + post-t0. That blind spot hid a full second (P54). The measured
 #   real-turn matrix + what-to-attack-next lives in `docs/LATENCY-MATRIX.md` (median mic-to-ear 2.91s).
-#   *** NEXT TARGET + THE ONLY ROW LEFT WITH HEADROOM: `docs/TTS-FIRST-CHUNK-HANDOFF.md` (TTS 0.93s). ***
+#   *** TTS first chunk (0.93s) is ~70% a FIXED FLOOR, not "real headroom" (P56): TTFB=0.648s+25.9ms/char(zh),
+#       only ~0.28s length-dependent, real remaining win ~0.13s. §3.1 ANSWERED (en split FIRES); mechanism was
+#       wrong (TTFB tracks the first SEGMENT -- frontend MERGES to an 80-tok cap; FIRST_PIECE denies it).
+#       HIGHER-VALUE LEAD: barge-in leaks TTS residue onto the shared GPU (+0.9-1.1s next turn) -- CONFIRMED
+#       live, clean fix ATTEMPTED + REVERTED (mid-batch vllm abort destabilises the manual step() loop; do NOT
+#       re-try it -- cap OPENROUTER_MAX_TOKENS instead). See `docs/BARGEIN-RESIDUE-HANDOFF.md` +
+#       `docs/TTS-FIRST-CHUNK-HANDOFF.md` + P56. ***
 #   THE HARNESS LIES -- read `docs/PROBLEMS-AND-FIXES.md` P55 BEFORE trusting any row. It invented ~0.2s of
 #   "network" that was never on the wire (transport is CLOSED: ~0.13s real, at its floor -- and its listed
 #   lever WEBRTC_VIDEO_BITRATE_MAX caps VP8 VIDEO while the voice is a separate OPUS track, so it could never
@@ -426,7 +481,7 @@ E:\miniconda3\envs\musetalk\python.exe scripts\_capture_synced.py output/q_ai.wa
 #    for per-8-frame-segment cost (logs feat/whisper/gpu/composite ms -> is render >= the fps budget?).
 # 2) drive a WAV and read the THREE distinct counts + effective render fps:
 python -m scripts._drive_frames output/reply_concise.wav 12          # paced (default) | burst (pure render)
-#    - REAL rendered (server video_clock) = audio_sec*fps (+/-1)  <- lips are never short (P9/P10)
+#    - REAL rendered (server video_clock) = audio_sec*fps (+/-1)  <- lips are never short (P9)
 #    - DELIVERED > that by the pump's HELD/duplicate frames (frozen frame kept when render < fps)
 #    - drift ~= audio_len * (1 - render_fps/fps); it only SCALES with turn length once render < fps
 # 3) reproduce the shared-GPU drift offline (CosyVoice stand-in) — prove MUSETALK_TRT=1 holds >=fps:
@@ -532,6 +587,15 @@ the values equal — this closed the silent-failure mode, it did not make a mism
 - **onnxruntime / torch CUDA DLLs:** the avatar server adds torch's `lib/` dir to the DLL search
   path before importing onnxruntime, or onnxruntime silently falls back to CPU (~5× too slow,
   laggy/desynced avatar). Keep that.
+- **`127.0.0.1` NOT `localhost` for the :8002 avatar server** (`docs/PROBLEMS-AND-FIXES.md` **P57**). :8002
+  binds `0.0.0.0` (IPv4 only); on Windows `localhost` resolves to `::1` (IPv6) FIRST and wastes **~2s per
+  request** failing over to IPv4 — it hit BOTH `build_avatar`'s `/health` check AND `websockets.connect`, a
+  flat ~4s of Connect latency. `config.py` normalizes `avatar_url`→127.0.0.1; keep it. (`curl` hides this via
+  happy-eyeballs; `urllib`/`websockets` don't. Same trap `tunnel.ps1` already dodges for cloudflared.) **Connect
+  latency in general** is documented in P57: the whole pipeline rebuilds per connect (STT models cached
+  process-wide in `sensevoice_stt.py` so build#2 = 0ms), and the always-on **`[connect-timing]` beacon**
+  (`/studio` → `POST /client/connect-timing` → one log line with `gatherMs/offerMs/connectMs/pair`) is the
+  instrument for remote-connect debugging — read `pair` (`host/*`=direct, `relay/*`=TURN relay, slow).
 - **`conda run` buffers stdout** — a running server's log looks empty; use the `-u` env-python
   invocation above for live logs.
 - **NEVER do blocking I/O on the pipeline's event loop** (`docs/PROBLEMS-AND-FIXES.md` **P47.2**). One asyncio loop carries
@@ -634,8 +698,11 @@ the values equal — this closed the silent-failure mode, it did not make a mism
   ever fired) is **FIXED at the root (P53, 2026-07-15)**: the avatar client holds the per-turn
   `TTSStoppedFrame` until the voice fully drains, so BotStoppedSpeaking fires at true end of speech
   under steady (probe + log verified; `archive/_tts_stop_order_test.py` is the regression proof).
-  `=1` under steady is now mechanically sound but **not yet live-ear-verified** — test a real
-  echo-guard session before relying on it. **`ALLOW_INTERRUPTIONS` (default `1` = BASELINE since P44, was live `.env`
+  **`=1` under steady is now LIVE-VERIFIED (2026-07-17, the first time it had ever been run): 3 driven
+  turns, 3/3 mute→unmute cycles, each unmute 1–2 ms after bot-stopped, later turns still triggering —
+  the stuck mic is measured gone.** The default stays `0` because barge-in is the P44 baseline, **not**
+  because `=1` is broken; what remains unjudged is whether half-duplex is *wanted* (`=1` kills barge-in
+  for the bot's entire reply, and replies run 40–66 s). P11's banner has the method + the harness trap. **`ALLOW_INTERRUPTIONS` (default `1` = BASELINE since P44, was live `.env`
   `0` under P37):** `0` = the bot always finishes its reply (user speech during playback never cancels
   it; typed turns queue politely). `1` = a mid-reply interruption **flushes the current turn clean**.
   This flips the turn-START strategies' `enable_interruptions` (the barge-in broadcast) — NOT the

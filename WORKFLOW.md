@@ -88,8 +88,11 @@ local Ollama** (`OPENROUTER_BASE_URL=http://localhost:11434/v1`, `OPENROUTER_API
 `pipeline/config.py`, zh/th/en variants) keeps replies spoken-style. `LLM_PROVIDER=weather_chain` swaps
 in the NCU zh weather bot instead (see `§3` weather note + STATUS.md). **Current default = cloud
 `google/gemini-2.5-flash-lite`** (2026-06-30): the local CPU Ollama caused a latency regression and
-fragmented Chinese; cloud frees the CPU and gives coherent zh. NOTE: the LLM is **not** the reason
-Chinese voice starts later than English — that's CosyVoice's zh first-chunk TTFB (`docs/PROBLEMS-AND-FIXES.md` P15).
+fragmented Chinese; cloud frees the CPU and gives coherent zh. NOTE: the old claim that "Chinese voice
+starts later than English because of CosyVoice's zh first-chunk TTFB" is **REFUTED** (measured 2026-07-17:
+at matched input zh ≈ en, and the slowest first chunks are English — TTFB tracks input *length*, not
+language). If you still see a zh-vs-en gap end-to-end, **measure it — it is not the TTS first chunk**
+(`docs/PROBLEMS-AND-FIXES.md` P15 §1).
 
 ### TTS — CosyVoice2 on vLLM (default) / JaiTTS (Thai)
 `pipeline/stages/tts.py`. Converts the LLM text to voice audio chunks, streamed.
@@ -98,8 +101,12 @@ Chinese voice starts later than English — that's CosyVoice's zh first-chunk TT
   first-chunk latency ~3.4s → **~1.1s**. The server lives **in this repo** at
   `tts/cosyvoice-server/` (`run_vllm_server.sh`); before 2026-07-14 it was a separate repo.
   **`COSYVOICE_URL` must be the WSL IP, NOT localhost** (WSL2's localhost relay buffers the
-  streaming audio ~2s). The Windows `tts`-env PyTorch server is the fallback (set
-  `COSYVOICE_URL=http://localhost:8001` + start it).
+  streaming audio ~2s). That IP is DHCP-assigned and changes on `wsl --shutdown`, so
+  **`launch.ps1` auto-reconciles the `.env` value against the live `wsl hostname -I` on every
+  start** (`Sync-CosyVoiceUrl`, 2026-07-15) — a stale IP used to mean a silently mute bot. Only a
+  manual (non-launcher) start still needs a hand-update. The Windows `tts`-env PyTorch server is
+  the fallback (set `COSYVOICE_URL=http://localhost:8001` + start it; localhost forms are left
+  alone by the reconciler).
 - **Thai**: `TTS_PROVIDER=jaitts` → the local JaiTTS-F5TTS server (`:8004`). CosyVoice **cannot
   speak Thai**. It speaks the same `/tts/stream` raw-PCM contract, so the CosyVoice client is
   reused pointed at `JAITTS_URL`.
@@ -115,7 +122,8 @@ transport. It:
    **`audio_pos`** — the server's own account of the audio it consumed rendering that frame
    (proto 2, P51) — so audio never runs ahead of the lips, tagging frames for A/V sync in
    `steady` mode (see §5).
-3. Keeps every downstream audio frame whole-sample (`_align_even`) — the anti-screech guard.
+3. (Sample alignment is guaranteed upstream: `cosyvoice_tts.py::run_tts` carries the dangling
+   byte across HTTP reads, so every audio frame is already whole-sample — P52.)
 
 ### Avatar (server side) — MuseTalk on the GPU
 `local_services/musetalk_server/app.py` (FastAPI websocket). See §4.
@@ -164,9 +172,9 @@ To understand either side you must read both (`musetalk_video.py` + `musetalk_se
   (`floor(len/sr*fps)`) yields exactly `SEG_FRAMES` per batch. The old `int(16000/fps)*SEG_FRAMES`
   sizing truncated at fps that don't divide 16000 (e.g. 12 → 7 frames/8-frame batch), losing ~12.5%
   of frames over a turn so the lips finished ~1–2s before the voice. See `docs/PROBLEMS-AND-FIXES.md`
-  P9. (The end-of-turn leftover-audio blip was the separate P10 — fixed by a ceil on the client's
+  P9. (The end-of-turn leftover-audio blip was a separate bug — once fixed by a ceil on the client's
   audio-cap, and that whole cap is gone since proto 2: the voice pairs to each frame's `audio_pos`,
-  so the trailing sub-frame releases in step by construction.)
+  so the trailing sub-frame releases in step by construction. See P51.)
 - **OS env only.** The server reads `AVATAR_REF` / `MUSETALK_SIZE` / `MUSETALK_FPS` from the OS
   environment (no `python-dotenv` in its conda env); `scripts/run.ps1` propagates them from `.env`.
 
@@ -196,8 +204,9 @@ CosyVoice bursts the GPU while streaming a reply and slows the render unpredicta
 **The screech (fixed).** In steady, a >3s render stall used to starve pipecat's audio queue → its
 3s `_bot_stopped_speaking` timeout fired mid-turn → it discarded the odd partial audio buffer →
 odd-byte misalignment = screech. Fixed two ways: `main.py::_relax_bot_vad_stop_timeout()` raises the
-timeout (we drive an explicit `TTSStoppedFrame` per turn anyway) AND `musetalk_video.py::_align_even`
-keeps the downstream PCM whole-sample. See `docs/PROBLEMS-AND-FIXES.md` P3.
+timeout (we drive an explicit `TTSStoppedFrame` per turn anyway) AND the PCM is kept whole-sample at
+the producer (`cosyvoice_tts.py::run_tts` odd-byte carry, P52 — replaced the old `_align_even`
+consumer patch). See `docs/PROBLEMS-AND-FIXES.md` P3.
 
 ---
 
@@ -217,9 +226,10 @@ wsl -d Ubuntu -e bash -c "bash /mnt/e/Claude/VisualLLm/tts/cosyvoice-server/run_
 #   activations) or it crashes "No available memory for the cache blocks"; the wall is ~0.062 on
 #   16GB, and util is a FRACTION OF THE CARD (~0.14 on an 8GB card for the same absolute). The log
 #   line "Available KV cache memory" must be positive. Whole WSL server ~2.3GB at 0.07 (P50).
-#   ORDER IS REQUIRED: start CosyVoice (this step) BEFORE MuseTalk (P15). The low util makes vLLM
-#   far friendlier to a busy card, but keep the order. If you must recover, stop all three, start
-#   cosyvoice here first, THEN run.ps1.
+#   ORDER IS *NOT* REQUIRED ANYMORE (re-measured 2026-07-17, P15 §2): vLLM loads fine SECOND onto a
+#   MuseTalk-occupied card at util 0.07 AND at 0.30 (the config that once crashed). The wall is
+#   util ~0.79, so 0.07 clears it ~11x. Keep this order anyway as free insurance, but do NOT blame
+#   a silent bot on it. If you must recover, stop all three, start cosyvoice here first, THEN run.ps1.
 
 # 2 + 3. MuseTalk avatar server + pipeline (one script: starts both, propagates the MuseTalk knobs)
 .\scripts\run.ps1
@@ -278,7 +288,7 @@ in order of effectiveness:
 | Variable | Default | Purpose |
 |---|---|---|
 | `LANGUAGE` | `en` | `en` / `zh` / `th` (STT + voice) |
-| `ECHO_GUARD` | `0` | barge-in (mic always live -- use headphones). `1` = half-duplex mute, but it's BROKEN under steady (mic stuck-muted after a turn, P11); only use `1` with `MUSETALK_SYNC_MODE=live` |
+| `ECHO_GUARD` | `0` | barge-in (mic always live -- use headphones; the baseline). `1` = half-duplex mute. The old steady-sync blocker (P11 stuck-mute) is FIXED at the root (P53, 2026-07-15: the avatar client holds TTSStopped until the voice drains, so BotStopped fires at true end of speech) -- `1` under steady is mechanically sound now but ear-test a live session before trusting it |
 | `TTS_PROVIDER` | `cosyvoice` | `jaitts` (local Thai server, `:8004`). Anything else raises |
 | `COSYVOICE_URL` | `http://localhost:8001` | the CosyVoice server — set to the **WSL IP** for the vLLM server (NOT localhost; the relay buffers the stream), localhost for the Windows fallback |
 | `COSYVOICE_VOICE` / `COSYVOICE_PACE_RATE` | `weather` / `1.3` | zero-shot speaker id / GPU-pacing cap (server-side) |
@@ -291,9 +301,9 @@ in order of effectiveness:
 | `MEMORY_LLM_MODEL` / `MEMORY_LLM_URL` | `qwen2.5:3b-cpu` / `http://localhost:11434/v1` | local Ollama model that rewrites the query + distills the chat. **CPU-pinned** (0.77s/rewrite) so MuseTalk + CosyVoice keep the GPU; set `qwen2.5:3b` to use the GPU |
 | `MEMORY_LLM_GATED` / `AVATAR_MEMORY_DIR` | `1` / `state/avatar_memory` | gate the rewrite to context-dependent turns (0 = always) / where profile.json + summary.txt + session.jsonl live (gitignored) |
 | `AVATAR_REF` | `assets/avatar_female.png` | portrait (image or video) the MuseTalk server animates |
-| `MUSETALK_SYNC_MODE` | `steady` | video-master, synced start (user's pick + default). The old steady "screech" is FIXED (`_align_even` whole-sample guard + `BOT_VAD_STOP_FALLBACK_SECS` raise, `docs/PROBLEMS-AND-FIXES.md` P3). Tradeoff: under a long render stall the voice briefly pauses then resumes clean. `live` = audio-master (voice never pauses, lips trail ~0.75s) is the alternative |
+| `MUSETALK_SYNC_MODE` | `steady` | video-master, synced start (user's pick + default). The old steady "screech" is FIXED (producer-side whole-sample carry in `run_tts` (P52) + `BOT_VAD_STOP_FALLBACK_SECS` raise, `docs/PROBLEMS-AND-FIXES.md` P3). Tradeoff: under a long render stall the voice briefly pauses then resumes clean. `live` = audio-master (voice never pauses, lips trail ~0.75s) is the alternative |
 | `MUSETALK_FPS` / `MUSETALK_SIZE` | `20` / `512` | avatar output fps / frame px (shrinking SIZE does NOT cut MuseTalk compute). **Keep FPS a divisor of 16000** (8/10/16/20/25) so frame count = audio length; the `samples_for_frames` fix makes the current `12` correct too (P9) |
-| `MUSETALK_TRT` | `1` (default) | **TensorRT render path** (UNet+VAE engines in `musetalk_server/trt_cache/`): per-segment render ~389ms→~255ms, so the avatar holds ~12fps under CosyVoice's shared-GPU contention where the PyTorch path drifts seconds behind the voice on long turns (`docs/PROBLEMS-AND-FIXES.md` P16). Engines are ~1.75GB, gitignored, GPU/driver-specific — build with `local_services/musetalk_server/trt_build.py` (`python -m local_services.musetalk_server.trt_build`); any load failure falls back to PyTorch. `0` = PyTorch |
+| `MUSETALK_TRT` | `1` (default) | **TensorRT render path** (UNet+VAE engines in `musetalk_server/trt_cache/`): per-segment render **455ms→171ms** at the live SIZE=512 config, buying render margin (contended headroom **1.04×→2.05×**). It holds ~12fps under CosyVoice's shared-GPU contention; the PyTorch fallback still fits the 12fps budget too (by 4%), so at fps=12 you will see no drift difference — the win only shows off the deployed operating point (drive fps=25: PyTorch +4.04s vs TRT +0.32s on a 13.6s reply). Re-measured 2026-07-17, `docs/PROBLEMS-AND-FIXES.md` P16. Engines are ~1.75GB, gitignored, GPU/driver-specific — build with `local_services/musetalk_server/trt_build.py` (`python -m local_services.musetalk_server.trt_build`); any load failure falls back to PyTorch. `0` = PyTorch |
 | `MUSETALK_GPU_COMPOSITE` | `1` | **GPU per-frame composite**: runs the mask-blend + downscale on the GPU (torch) instead of CPU PIL/cv2 — composite ~73ms→~11ms per 8-frame seg → total render 246→182ms (−26%, ceiling ~33→44fps) (`docs/PROBLEMS-AND-FIXES.md` P17). **Only active with `MUSETALK_TRT=1`** (VAE output is already a GPU tensor); the PyTorch path keeps the CPU composite. Output pixel-identical (SSIM 1.0, ≤1 LSB). Benchmarked: at 12fps it does NOT change A/V drift (TRT already holds ≥12fps even under 100% contention) — the win is reserve headroom + a freed CPU. Falls back to CPU if a crop_box runs off-frame. Code default off (opt-in). `0` = CPU composite |
 | `COSYVOICE_VLLM_GPU_UTIL` | `0.07` | *(set in **`tts/cosyvoice-server/run_vllm_server.sh`**, not this `.env` — the launcher forwards only `COSYVOICE_MODEL`)* fraction of the card vLLM may use. Must clear the ~0.98GiB non-KV floor; wall ~0.062 on 16GB; ~0.14 on an 8GB card for the same absolute. 0.07 verified (24s zh paragraph, gen speed unchanged; WSL server ~2.3GB). If a vLLM/driver bump crashes "No available memory for the cache blocks", raise to 0.08+ (P50) |
 | `MUSETALK_FREE_TORCH` | `1` (default) | free the torch UNet+VAE once the TRT engines load — they were dead weight kept resident (−1.8GB; avatar server ~5.2→~3.3GB). Only fires when `MUSETALK_TRT=1` engines actually loaded (the load-failure fallback still works). `0` = keep them resident (pre-2026-07-15 behavior). Render verified: `_drive_frames` = audio×fps ±1 after the free (P50) |
@@ -340,7 +350,7 @@ TTS/avatar servers are managed separately (the status dots tell you if the provi
 | `pipeline/config.py` | All `.env`-driven config + system prompts |
 | `pipeline/stages/*.py` | Per-stage single-provider factories (vad/stt/llm/tts/avatar) |
 | `pipeline/metrics.py` | `TtfoMeter` (the < 3 s metric) |
-| `local_services/musetalk_video.py` | Client-side avatar processor + frame-clocked A/V sync + `_align_even` |
+| `local_services/musetalk_video.py` | Client-side avatar processor + frame-clocked A/V sync |
 | `local_services/musetalk_server/app.py` | MuseTalk GPU server (ws, frame pump, sync markers, session guard) |
 | `local_services/cosyvoice_tts.py` | CosyVoice streaming TTS client (reused by `TTS_PROVIDER=jaitts`) |
 | `tts/cosyvoice-server/` | **The CosyVoice TTS server itself** (vLLM in WSL, `:8001`) — merged into this repo 2026-07-14 |
@@ -356,12 +366,12 @@ TTS/avatar servers are managed separately (the status dots tell you if the provi
 |---|---|---|
 | Avatar shows but **won't talk** (voice + chat) | TTS server down — most often CosyVoice crashed on the **shared GPU** (vLLM "No available memory for the cache blocks") | Check `:8001` is up (`wsl ... ss -ltn`); if it crashed, free VRAM and/or raise `COSYVOICE_VLLM_GPU_UTIL`. The pipeline log shows "Cannot connect to host …:8001". Or swap `TTS_PROVIDER` |
 | Lips **finish ~1–2s before the voice** on long replies | per-segment frame deficit when `MUSETALK_FPS` doesn't divide 16000 | Fixed (P9, `samples_for_frames`); keep FPS a divisor of 16000. Verify warmup logs `8 frames/segment`, not 7 |
-| **Leftover-audio blip** ~1–2s after the turn ends | steady's floor-cap strands the final sub-frame to the delayed `video_end` drain | **Known issue, fix reverted by preference** (P10). Re-apply = `int()`→`ceil()` in `musetalk_video.py::_advance` |
+| **Leftover-audio blip** ~1–2s after the turn ends | *(historical)* steady's floor-cap stranded the final sub-frame to the delayed `video_end` drain | **FIXED at the root by P51** (2026-07-15) — proto 2 pairs audio to each frame's own `audio_pos`, so there is no cursor cap to floor. `audio_cap` no longer exists; do NOT "re-apply" a ceil cap. If a blip reappears, suspect the proto-2 pairing path |
 | **Avatar not showing** at all | MuseTalk server (:8002) down | Start the avatar server (the pipeline needs it) |
 | Lips start **~5s late** + render falls behind on long replies | `cudnn.benchmark=True` (per-turn re-autotune spike) | Keep it `False` in `musetalk_server/app.py` |
-| Voice **screeches** mid-reply in steady mode | pipecat discarding the odd partial audio buffer on a render-stall gap | Keep `BOT_VAD_STOP_FALLBACK_SECS` high + `_align_even` (both already in) |
+| Voice **screeches** mid-reply in steady mode | pipecat discarding the odd partial audio buffer on a render-stall gap | Keep `BOT_VAD_STOP_FALLBACK_SECS` high + the `run_tts` producer-side odd-byte carry (both already in; P3/P52) |
 | Lips **drift / out of sync** in browser | `video_out_is_live=True` dropping synced frames | Use `steady` mode (couples is_live off); one `MUSETALK_FPS` everywhere |
-| Lips **fall progressively behind** the voice, worse the longer the reply | render can't hold `MUSETALK_FPS` under CosyVoice's shared-GPU contention; the deficit accumulates over the turn | Keep `MUSETALK_TRT=1` (~1.5× faster render → holds ~12fps; drift flat vs +3.9s/13.6s on PyTorch, P16). Real fix = dedicated avatar GPU. Do NOT re-lock the voice to video |
+| Voice **pauses / holds** mid-reply, worse the longer the reply (under `steady`, the baseline) — or, in `live` mode only, lips **fall progressively behind** | render can't hold `MUSETALK_FPS`; under `steady` the voice waits for the frames (pauses), under `live` the lips trail. Same underflow, two faces (P16) | Keep `MUSETALK_TRT=1` — it buys the render margin (2.05× vs PyTorch's 1.04× under contention; at fps=12 PyTorch clears the budget by only 4%, measured 2026-07-17). Real fix = dedicated avatar GPU. Do NOT re-lock the voice to video |
 | Video **lags / stutters** remotely, audio fine | oversized WebRTC stream on a WAN link | Fit the stream: smaller `MUSETALK_SIZE` + `WEBRTC_VIDEO_BITRATE_MAX`; tune `CLIENT_JITTER_BUFFER_MS` |
 | **Remote mic dies** mid-call ("works sometimes") | WebRTC ICE candidate pollution | `WEBRTC_ICE_SUBNET=100.64.0.0/10` pins ICE to Tailscale |
 | Avatar **laggy on the GPU box itself** | onnxruntime fell back to CPU, or fps mismatch | Verify CUDA DLLs on path; keep one `MUSETALK_FPS` everywhere |

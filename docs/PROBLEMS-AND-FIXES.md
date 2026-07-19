@@ -2666,3 +2666,60 @@ both are deliberate efforts, not quick patches.
 optimise, not only to suspicious ones — it demoted "the big remaining win" to a sliver and surfaced a better
 lead. And P55's residual-row discipline generalises past the harness: the TTS TTFB probe is a residual too
 (it measures its own wake). Handoff: `docs/TTS-FIRST-CHUNK-HANDOFF.md` · matrix: `docs/LATENCY-MATRIX.md`.
+
+---
+
+## P57 — "/studio takes ~20s to Connect" — four independent costs, none of them the pipeline ✅ FIXED (2026-07-18)
+
+**Symptom.** Clicking Connect on `/studio` took ~7s locally and ~20s over Tailscale before the avatar
+greeted. Felt like "the pipeline is slow to start."
+
+**Investigation.** The connect path is a chain of serial awaits (client `connect()` → `POST /api/offer` →
+`run_bot` builds the whole pipeline per connection → ICE/DTLS → greeting). Instead of guessing, added an
+always-on **`[connect-timing]` beacon**: the `/studio` client POSTs `{cfgMs, overlayMs, micMs, gatherMs,
+gatherCapped, offerMs, connectMs, pair, rttMs}` to `POST /client/connect-timing` on `'connected'`, logged as
+one line — visible from a phone with no devtools. That, plus per-seam timing on the server side, isolated
+**four** separate costs (the "~5s ICE handshake" folklore was NOT one of them — local ICE/DTLS is ~30ms):
+
+1. **The whole pipeline rebuilds on EVERY connect** (pipecat's dev runner calls the bot entrypoint per
+   connection — 28 STT loads in one log). The SenseVoice + zipformer models reloaded from disk every time
+   (~1.6–2.7s). → **Fix:** cache the sherpa-onnx recognizers process-wide (`sensevoice_stt.py` `_MODEL_CACHE`
+   + `_get_opencc`), keyed by paths+provider+silence; the per-instance `create_stream()` stays per-connection.
+   Verified build#1 2359ms → build#2 0ms (`reusing cached models`). First connect/process still loads once.
+2. **The Windows `localhost` IPv6 trap on :8002.** The avatar server binds `0.0.0.0` (IPv4 ONLY). On Windows
+   `localhost` resolves to `::1` FIRST and wastes ~2s failing over to IPv4 on EVERY request — hit BOTH
+   `build_avatar`'s `/health` urlopen AND `websockets.connect("ws://localhost:8002/stream")`. Proven:
+   urllib/websockets to `localhost:8002` = **2031ms**, to `127.0.0.1:8002` = **0ms** (`curl` hides it with
+   happy-eyeballs; urllib/websockets don't). Same bug the Cloudflare tunnel already fixed (`tunnel.ps1:62-66`);
+   :8002 was the missed spot. :7860 never had it (dual-stack). → **Fix:** `config.py` normalizes `avatar_url`
+   `//localhost:`→`//127.0.0.1:` (durable); `.env:103` set to 127.0.0.1. Health 2.0s→0.17s, ws 2.0s→0–16ms.
+   **Result of #1+#2: build→pipeline-ready ~5.9s → ~1.8s (first connect) → ~0.2s (every warm connect).**
+3. **STUN/TURN gather waiting (remote only).** With `WEBRTC_PUBLIC=1`, ICE advertises STUN + Cloudflare TURN,
+   and gathering WAITS on those servers: client `gatherCapped:true` at the 3.5s cap + server `aiortc` answer
+   gather **5.0s** (`Creating answer`→`gathering complete`). But the winning pair is `host/host` (direct
+   tailnet) — STUN/TURN are pure dead weight for a tailnet/local/LAN peer. → **Fix:** `WEBRTC_PUBLIC=0` is now
+   the **default** (`.env`); flip to 1 (config panel) only for a genuine public non-Tailscale internet link.
+   Removes both waits: `gatherCapped:false`, offer server-gather 5000ms→1ms. (Also the right default for a
+   Tailscale-free deploy like NCU: browser on the box/LAN, zero external dependency. NCU also wants
+   `WEBRTC_ICE_SUBNET=0` — the `100.64/10` pin assumes a Tailscale interface.)
+4. **The 594KB overlay background, downloaded on the connect path over a slow link.** In split mode
+   (`MUSETALK_SPLIT=1`) `/studio` fetches a ~600KB base64 PNG background. It was `await`ed BEFORE the offer
+   (and `cache:'no-store'` re-downloaded it every connect). Over a ~570 kbps DERP-relayed Tailscale link it
+   took ~8s AND — even after being made "parallel" — **saturated the link so the offer POST itself stalled
+   ~7s** (`overlayMs:8338 offerMs:7406`). Bandwidth contention, not an await. → **Fix:** the overlay is a
+   static asset, so fetch it **once, prefetched at page load**, cache the promise in memory, and apply it in
+   `ontrack` (when video arrives) — **entirely off the connect path**. Reconnects reuse the in-memory copy
+   (instant); the 594KB crosses the link once per page load. `studio_client/index.html` `fetchOverlayData()`.
+
+**Result.** Local connect **instant**; Tailscale reconnects **~0.2–0.6s** (was ~20s). The `[connect-timing]`
+beacon stays in as the permanent instrument for the remote path.
+
+**Lessons.** (a) One symptom ("20s to connect") hid four unrelated causes across three layers (per-connect
+build, a Windows name-resolution quirk, ICE negotiation, and link bandwidth) — the beacon that broke connect
+into named seams is what let each be fixed in turn instead of guessed. (b) The `localhost`→IPv6 trap is a
+Windows-specific ~2s tax on ANY IPv4-only local server; use `127.0.0.1`. (c) On a bandwidth-starved link,
+"make it parallel" does NOT help a big transfer — it just starves whatever runs alongside it; take the
+transfer off the path entirely (prefetch/cache) instead. (d) `pair` in the beacon is the remote headline:
+`host/*`=direct, `srflx/*`=STUN-direct, `relay/*`=TURN relay won (slow). Files: `pipeline/config.py`, `.env`,
+`pipeline/stages/avatar.py`, `local_services/sensevoice_stt.py`, `local_services/musetalk_video.py` (ws-timing
+log), `pipeline/main.py` + `local_services/studio_client/index.html` (beacon + overlay prefetch).

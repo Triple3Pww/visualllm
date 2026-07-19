@@ -38,7 +38,12 @@ def build_avatar(cfg: Config):
 
 def _warn_if_server_down(base_url: str) -> None:
     """Best-effort pre-flight: warn loudly if the local avatar server isn't up
-    yet, so the failure mode is obvious instead of a cryptic websocket error."""
+    yet, so the failure mode is obvious instead of a cryptic websocket error.
+
+    (Uses a 127.0.0.1 base_url, NOT localhost -- see config.avatar_url: on Windows a
+    `localhost` connect wastes ~2s failing over IPv6 ::1 before the IPv4 fallback, since
+    the server listens on 0.0.0.0 only. With 127.0.0.1 this is ~0ms up / instant-RST down,
+    so a plain blocking check no longer stalls the connect.)"""
     import json
     import urllib.request
 

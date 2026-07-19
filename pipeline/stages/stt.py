@@ -24,9 +24,29 @@ def build_stt(cfg: Config):
             model_dir=cfg.sherpa_model_dir,
             to_traditional=cfg.sherpa_traditional,
             endpoint_silence=cfg.sherpa_endpoint_silence,
-            # Only pause on bot speech when echo-guard is on (valid only with live sync). Under the
-            # default steady sync the resume signal never fires, so pausing would strand the mic
-            # after the greeting (P11); default OFF keeps the mic live (barge-in/headphones).
+            # Only pause on bot speech when echo-guard is on. The resume signal it needs
+            # (BotStopped) fires correctly under steady since P53 -- live-verified 2026-07-17,
+            # so the old "strands the mic after the greeting" blocker (P11) is gone. Default is
+            # still OFF: that's echo-guard's own posture (barge-in/headphones), not a defect.
+            # See local_services/sherpa_stt.py::__init__ for the full why.
+            pause_while_bot_speaks=cfg.echo_guard,
+        )
+
+    if cfg.stt_provider == "sensevoice":
+        # Local OFFLINE SenseVoice-Small (segmented via the pipeline VAD + Smart Turn). Higher
+        # accuracy + far more noise-robust than the streaming zipformer, ~0.5GB on the GPU.
+        # Turn-taking comes from the transport VAD here, NOT an ASR endpoint detector -- if a
+        # quiet mic fails to trip the VAD, fall back to STT_PROVIDER=sherpa (endpoint-driven).
+        from local_services.sensevoice_stt import SenseVoiceSTTService
+
+        return SenseVoiceSTTService(
+            model_dir=cfg.sensevoice_model_dir,
+            provider=cfg.sensevoice_provider,
+            to_traditional=cfg.sensevoice_traditional,
+            # Reuse the streaming zipformer purely as the endpoint detector (proven turn-taking
+            # on this box); SenseVoice does the accurate transcription of each buffered utterance.
+            endpoint_model_dir=cfg.sherpa_model_dir,
+            endpoint_silence=cfg.sensevoice_endpoint_silence,
             pause_while_bot_speaks=cfg.echo_guard,
         )
 
@@ -35,8 +55,8 @@ def build_stt(cfg: Config):
         # STT_PROVIDER used to fall through to Deepgram (a CLOUD service, and a bill) --
         # the same bad default the TTS factory already refuses.
         raise ValueError(
-            f"STT_PROVIDER={cfg.stt_provider!r} is not supported. Use 'deepgram' (default) "
-            f"or 'sherpa' (local offline)."
+            f"STT_PROVIDER={cfg.stt_provider!r} is not supported. Use 'deepgram' (default), "
+            f"'sherpa' (local streaming) or 'sensevoice' (local offline, GPU)."
         )
 
     from pipecat.services.deepgram.stt import DeepgramSTTService

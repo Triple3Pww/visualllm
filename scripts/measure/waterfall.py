@@ -75,15 +75,18 @@ def build_waterfall(anchors, playout_source="est", capture=None):
     rows = []
     if capture is not None and capture >= 0:
         offset = capture
-        rows.append(dict(stage="Capture: speech-end -> t0 (VAD hangover + turn-end)",
+        rows.append(dict(stage="Capture: speech-end -> t0 (endpoint silence + turn-end)",
                          delta=round(capture, 3), cum=round(capture, 3),
-                         source="driver", lever="VAD_STOP_SECS / turn strategy", status="ok"))
+                         source="driver",
+                         lever="SENSEVOICE_ENDPOINT_SILENCE (self-seg STT) / VAD_STOP_SECS / turn strategy",
+                         status="ok"))
         prev = capture
     else:
         offset = 0.0
-        rows.append(dict(stage="Capture: speech-end -> t0 (VAD hangover + turn-end)",
+        rows.append(dict(stage="Capture: speech-end -> t0 (endpoint silence + turn-end)",
                          delta=None, cum=None, source="driver",
-                         lever="VAD_STOP_SECS / turn strategy", status="unknown"))
+                         lever="SENSEVOICE_ENDPOINT_SILENCE (self-seg STT) / VAD_STOP_SECS / turn strategy",
+                         status="unknown"))
         prev = 0.0
 
     for label, key, source, lever in _WATERFALL_STAGES:
